@@ -1673,10 +1673,10 @@ int main(int argc, char **argv)
         if (return_tokens) { // we also *got* tokens
             std::vector<llama_token> prompt_tokens = body["tokens"];
               // do *not* automatically add BOS
-            for (int i = 0; i < prompt_tokens.size(); ++i) {
+            /*for (int i = 0; i < prompt_tokens.size(); ++i) {
               fprintf(stderr, ", %d", prompt_tokens[i]);
             }
-            fprintf(stderr, "\n");
+            fprintf(stderr, "\n");*/
             llama.loadPrompt(prompt_tokens);
         } else {
             std::vector<llama_token> prompt_tokens =
@@ -1723,7 +1723,7 @@ int main(int argc, char **argv)
                 probs = std::vector<completion_token_output>(llama.generated_token_probs.begin(), llama.generated_token_probs.end() - stop_word_toks.size());
             }
 
-            fprintf(stderr, "-> %d\n", probs[0].tok);
+            //fprintf(stderr, "-> %d\n", probs[0].tok);
             const json data = format_final_response(
               llama, llama.generated_text, probs, generated_token,
               return_logits, return_tokens, return_brief);
