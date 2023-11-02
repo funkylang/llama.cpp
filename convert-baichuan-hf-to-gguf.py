@@ -110,7 +110,7 @@ print("gguf: loading model "+dir_model.name)
 with open(dir_model / "config.json", "r", encoding="utf-8") as f:
     hparams = json.load(f)
 print("hello print: ",hparams["architectures"][0])
-if hparams["architectures"][0] != "BaichuanForCausalLM":
+if hparams["architectures"][0] != "BaichuanForCausalLM" and hparams["architectures"][0] != "BaiChuanForCausalLM":
     print("Model architecture not supported: " + hparams["architectures"][0])
 
     sys.exit()
@@ -163,7 +163,8 @@ gguf_writer.add_layer_norm_rms_eps(hparams["rms_norm_eps"])
 if "rope_scaling" in hparams and hparams["rope_scaling"] != None and "factor" in hparams["rope_scaling"]:
     if "type" in hparams["rope_scaling"]:
         if hparams["rope_scaling"]["type"] == "linear":
-            gguf_writer.add_rope_scale_linear(hparams["rope_scaling"]["factor"])
+            gguf_writer.add_rope_scaling_type(gguf.RopeScalingType.LINEAR)
+            gguf_writer.add_rope_scaling_factor(hparams["rope_scaling"]["factor"])
 
 
 # TOKENIZATION
@@ -230,7 +231,7 @@ gguf_writer.add_token_list(tokens)
 gguf_writer.add_token_scores(scores)
 gguf_writer.add_token_types(toktypes)
 
-special_vocab = gguf.SpecialVocab(dir_model)
+special_vocab = gguf.SpecialVocab(dir_model, n_vocab = len(tokens))
 special_vocab.add_to_gguf(gguf_writer)
 
 # TENSORS

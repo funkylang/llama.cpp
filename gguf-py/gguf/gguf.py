@@ -7,7 +7,7 @@ import shutil
 import struct
 import sys
 import tempfile
-from enum import IntEnum, auto
+from enum import Enum, IntEnum, auto
 from io import BufferedWriter
 from pathlib import Path
 from typing import IO, Any, BinaryIO, Callable, Sequence
@@ -53,9 +53,12 @@ KEY_ATTENTION_LAYERNORM_EPS     = "{arch}.attention.layer_norm_epsilon"
 KEY_ATTENTION_LAYERNORM_RMS_EPS = "{arch}.attention.layer_norm_rms_epsilon"
 
 # RoPE
-KEY_ROPE_DIMENSION_COUNT = "{arch}.rope.dimension_count"
-KEY_ROPE_FREQ_BASE       = "{arch}.rope.freq_base"
-KEY_ROPE_SCALE_LINEAR    = "{arch}.rope.scale_linear"
+KEY_ROPE_DIMENSION_COUNT         = "{arch}.rope.dimension_count"
+KEY_ROPE_FREQ_BASE               = "{arch}.rope.freq_base"
+KEY_ROPE_SCALING_TYPE            = "{arch}.rope.scaling.type"
+KEY_ROPE_SCALING_FACTOR          = "{arch}.rope.scaling.factor"
+KEY_ROPE_SCALING_ORIG_CTX_LEN    = "{arch}.rope.scaling.original_context_length"
+KEY_ROPE_SCALING_FINETUNED       = "{arch}.rope.scaling.finetuned"
 
 # tokenization
 KEY_TOKENIZER_MODEL      = "tokenizer.ggml.model"
@@ -577,6 +580,11 @@ class TokenType(IntEnum):
     UNUSED       = 5
     BYTE         = 6
 
+class RopeScalingType(Enum):
+    NONE   = 'none'
+    LINEAR = 'linear'
+    YARN   = 'yarn'
+
 #
 # implementation
 #
@@ -948,8 +956,17 @@ class GGUFWriter:
     def add_rope_freq_base(self, value: float):
         self.add_float32(KEY_ROPE_FREQ_BASE.format(arch=self.arch), value)
 
-    def add_rope_scale_linear(self, value: float):
-        self.add_float32(KEY_ROPE_SCALE_LINEAR.format(arch=self.arch), value)
+    def add_rope_scaling_type(self, value: RopeScalingType):
+        self.add_string(KEY_ROPE_SCALING_TYPE.format(arch=self.arch), value.value)
+
+    def add_rope_scaling_factor(self, value: float):
+        self.add_float32(KEY_ROPE_SCALING_FACTOR.format(arch=self.arch), value)
+
+    def add_rope_scaling_orig_ctx_len(self, value: int):
+        self.add_uint32(KEY_ROPE_SCALING_ORIG_CTX_LEN.format(arch=self.arch), value)
+
+    def add_rope_scaling_finetuned(self, value: bool):
+        self.add_bool(KEY_ROPE_SCALING_FINETUNED.format(arch=self.arch), value)
 
     def add_tokenizer_model(self, model: str):
         self.add_string(KEY_TOKENIZER_MODEL, model)
@@ -987,12 +1004,15 @@ class SpecialVocab:
     merges: list[str] = []
     special_token_types: tuple[str, ...] = ('bos', 'eos', 'unk', 'sep', 'pad')
     special_token_ids: dict[str, int] = {}
+    n_vocab: int | None = None
 
     def __init__(
         self, path: str | os.PathLike[str], load_merges: bool = False,
         special_token_types: tuple[str, ...] | None = None,
+        n_vocab: int | None = None,
     ):
         self.special_token_ids = {}
+        self.n_vocab = n_vocab
         self.load_merges = load_merges
         if special_token_types is not None:
             self.special_token_types = special_token_types
@@ -1001,6 +1021,16 @@ class SpecialVocab:
     def _load(self, path: Path) -> None:
         if not self._try_load_from_tokenizer_json(path):
             self._try_load_from_config_json(path)
+
+    def _set_special_token(self, typ: str, tid: Any):
+        if not isinstance(tid, int) or tid < 0:
+            return
+        if self.n_vocab is None or tid < self.n_vocab:
+            self.special_token_ids[typ] = tid
+            return
+        print(f'gguf: WARNING: Special token type {typ}, id {tid} out of range, must be under {self.n_vocab} - skipping',
+            file = sys.stderr)
+
 
     def _try_load_from_tokenizer_json(self, path: Path) -> bool:
         tokenizer_file = path / 'tokenizer.json'
@@ -1029,10 +1059,11 @@ class SpecialVocab:
                 tc_content = entry_content
             else:
                 continue
-            for maybe_token_id in (atok.get('id') for atok in added_tokens if atok.get('content') == tc_content):
-                if isinstance(maybe_token_id, int) and maybe_token_id >= 0:
-                    self.special_token_ids[typ] = maybe_token_id
-                break
+            # We only need the first match here.
+            maybe_token_id = next((
+                atok.get('id') for atok in added_tokens
+                if atok.get('content') == tc_content), None)
+            self._set_special_token(typ, maybe_token_id)
         return True
 
     def _try_load_from_config_json(self, path: Path) -> bool:
@@ -1042,21 +1073,21 @@ class SpecialVocab:
         with open(config_file, encoding = 'utf-8') as f:
             config = json.load(f)
         for typ in self.special_token_types:
-            maybe_token_id = config.get(f'{typ}_token_id')
-            if isinstance(maybe_token_id, int) and maybe_token_id >= 0:
-                self.special_token_ids[typ] = maybe_token_id
+            self._set_special_token(typ, config.get(f'{typ}_token_id'))
         return True
 
-    def add_to_gguf(self, gw: GGUFWriter) -> None:
+    def add_to_gguf(self, gw: GGUFWriter, quiet: bool = False) -> None:
         if len(self.merges) > 0:
-            print(f'gguf: Adding {len(self.merges)} merge(s).')
+            if not quiet:
+                print(f'gguf: Adding {len(self.merges)} merge(s).')
             gw.add_token_merges(self.merges)
         for typ, tokid in self.special_token_ids.items():
             handler: Callable[[int], None] | None = getattr(gw, f'add_{typ}_token_id', None)
             if handler is None:
-                print(f'gguf: WARNING: No handler for special token type {typ} with id {tokid} - skipping')
+                print(f'gguf: WARNING: No handler for special token type {typ} with id {tokid} - skipping', file = sys.stderr)
                 continue
-            print(f'gguf: Setting special token type {typ} to {tokid}')
+            if not quiet:
+                print(f'gguf: Setting special token type {typ} to {tokid}')
             handler(tokid)
 
     def __repr__(self) -> str:

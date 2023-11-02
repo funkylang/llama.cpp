@@ -1,8 +1,6 @@
 // A basic application simulating a server with multiple clients.
 // The clients submite requests to the server and they are processed in parallel.
 
-#include "build-info.h"
-
 #include "common.h"
 #include "llama.h"
 
@@ -347,7 +345,7 @@ int main(int argc, char ** argv) {
                 //        client.id, client.seq_id, id, client.n_decoded, client.i_batch, token_str.c_str());
 
                 if (client.n_decoded > 2 &&
-                        (id == llama_token_eos(ctx) ||
+                        (id == llama_token_eos(model) ||
                          (params.n_predict > 0 && client.n_decoded + client.n_prompt >= params.n_predict) ||
                          client.response.find("User:") != std::string::npos ||
                          client.response.find('\n') != std::string::npos)) {

@@ -2,7 +2,6 @@
 
 #include "console.h"
 #include "llama.h"
-#include "build-info.h"
 
 #include <cassert>
 #include <cinttypes>
@@ -153,8 +152,8 @@ int main(int argc, char ** argv) {
         LOG_TEE("%s: warning: scaling RoPE frequency by %g.\n", __func__, params.rope_freq_scale);
     }
 
-    LOG_TEE("%s: build = %d (%s)\n", __func__, BUILD_NUMBER, BUILD_COMMIT);
-    LOG_TEE("%s: built with %s for %s\n", __func__, BUILD_COMPILER, BUILD_TARGET);
+    LOG_TEE("%s: build = %d (%s)\n",      __func__, LLAMA_BUILD_NUMBER, LLAMA_COMMIT);
+    LOG_TEE("%s: built with %s for %s\n", __func__, LLAMA_COMPILER, LLAMA_BUILD_TARGET);
 
     if (params.seed == LLAMA_DEFAULT_SEED) {
         params.seed = time(NULL);
@@ -248,7 +247,7 @@ int main(int argc, char ** argv) {
 
     // Should not run without any tokens
     if (embd_inp.empty()) {
-        embd_inp.push_back(llama_token_bos(ctx));
+        embd_inp.push_back(llama_token_bos(model));
         LOG("embd_inp was considered empty and bos was added: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd_inp).c_str());
     }
 
@@ -298,7 +297,7 @@ int main(int argc, char ** argv) {
         }
 
         // remove any "future" tokens that we might have inherited from the previous session
-        llama_kv_cache_tokens_rm(ctx, n_matching_session_tokens, -1);
+        llama_kv_cache_seq_rm(ctx, -1, n_matching_session_tokens, -1);
     }
 
     LOGLN(
@@ -693,7 +692,7 @@ int main(int argc, char ** argv) {
             }
 
             // deal with end of text token in interactive mode
-            if (llama_sampling_last(ctx_sampling) == llama_token_eos(ctx)) {
+            if (llama_sampling_last(ctx_sampling) == llama_token_eos(model)) {
                 LOG("found EOS token\n");
 
                 if (params.interactive) {
@@ -720,7 +719,7 @@ int main(int argc, char ** argv) {
 
                 if (params.input_prefix_bos) {
                     LOG("adding input prefix BOS token\n");
-                    embd_inp.push_back(llama_token_bos(ctx));
+                    embd_inp.push_back(llama_token_bos(model));
                 }
 
                 std::string buffer;
@@ -760,6 +759,9 @@ int main(int argc, char ** argv) {
                         LOG("inserting instruction prefix\n");
                         n_consumed = embd_inp.size();
                         embd_inp.insert(embd_inp.end(), inp_pfx.begin(), inp_pfx.end());
+                    }
+                    if (params.escape) {
+                        process_escapes(buffer);
                     }
 
                     const auto line_pfx = ::llama_tokenize(ctx, params.input_prefix, false, true);
@@ -801,7 +803,7 @@ int main(int argc, char ** argv) {
         }
 
         // end of text token
-        if (!embd.empty() && embd.back() == llama_token_eos(ctx) && !(params.instruct || params.interactive)) {
+        if (!embd.empty() && embd.back() == llama_token_eos(model) && !(params.instruct || params.interactive)) {
             LOG_TEE(" [end of text]\n");
             break;
         }
