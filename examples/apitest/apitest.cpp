@@ -258,7 +258,7 @@ int main() {
     }
     fflush(stdout);
 
-    if (!embd.empty() && embd.back() == llama_token_eos(ctx)) {
+    if (!embd.empty() && embd.back() == llama_token_eos(model)) {
 	fprintf(stderr, " [end of text]\n");
 	break;
     }
