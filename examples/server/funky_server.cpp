@@ -2000,12 +2000,23 @@ int main(int argc, char **argv)
 	}
 	fprintf(stderr, "tokenize\n");
 	std::vector<llama_token> tokens;
-	if (body.count("content") != 0)
-	{
+	if (body.count("lines") != 0) {
+	    // we got an array of content lines to tokenize
+	    std::vector<std::string> lines = body["lines"];
+	    std::vector<std::vector<llama_token>> token_lines;
+	    for (unsigned long i = 0; i < lines.size(); ++i) {
+		token_lines.push_back(
+		  llama_tokenize(llama.ctx, lines[i], false));
+	    }
+	    const json data = json{{"tokens", token_lines}};
+	    return res.set_content(data.dump(), "application/json");
+	} else if (body.count("content") != 0) {
 	    tokens = llama.tokenize(body["content"], false);
-	}
-	const json data = format_tokenizer_response(tokens);
-	return res.set_content(data.dump(), "application/json"); });
+	    const json data = format_tokenizer_response(tokens);
+	    return res.set_content(data.dump(), "application/json");
+	} else {
+	  throw std::runtime_error("no text specified for tokenization\n");
+	}});
 
     svr.Post("/detokenize", [&llama](const Request &req, Response &res)
 	     {
