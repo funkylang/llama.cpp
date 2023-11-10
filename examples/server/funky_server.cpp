@@ -1192,6 +1192,10 @@ static void server_params_parse(int argc, char **argv, server_params &sparams,
                 invalid_param = true;
                 break;
             }
+            if (argv[i][strlen(argv[i]) - 1] == '/')
+            {
+                argv[i][strlen(argv[i]) - 1] = '\0';
+            }
             model_path = argv[i];
         }
         else
