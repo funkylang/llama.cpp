@@ -568,6 +568,44 @@ struct llama_server_context
 
 	has_next_token = true;
     }
+
+    void longest_common_part(
+      // original code by "rajsanghavi9"
+      // (https://www.geeksforgeeks.org/longest-common-substring-dp-29/)
+      std::vector<llama_token> &s,
+      std::vector<llama_token> &t,
+      int *len_p,
+      int *i_p,
+      int *j_p
+    ) {
+	int m = s.size();
+	int n = t.size();
+	int dp[2][m + 1];
+	int len = 0;
+	int best_i = 0;
+	int best_j = 0;
+
+	memset(dp, 0, sizeof(dp)); // this is necessary!
+	for (int i = 1; i <= n; i++) {
+	    for (int j = 1; j <= m; j++) {
+		if (s[i - 1] == t[j - 1]) {
+		    int new_len = dp[(i - 1) % 2][j - 1] + 1;
+		    dp[i % 2][j] = new_len;
+		    if (new_len > len) {
+			len = new_len;
+			best_i = i;
+			best_j = j;
+		    }
+		}
+		else
+		    dp[i % 2][j] = 0;
+	    }
+	}
+	*len_p = len;
+	*i_p = best_i-len;
+	*j_p = best_j-len;
+    }
+
     void loadPrompt(std::vector<llama_token> &prompt_tokens)
     {
 	num_prompt_tokens = prompt_tokens.size();
@@ -593,24 +631,52 @@ struct llama_server_context
 	    llama_sampling_accept(ctx_sampling, ctx, token, false);
 	}
 
+	int len, embd_idx, prompt_idx;
+	longest_common_part(embd, prompt_tokens, &len, &embd_idx, &prompt_idx);
+	if (len > ((int)prompt_tokens.size() >> 3)) {
+	  //fprintf(stderr, "prompt_idx = %d\n", prompt_idx);
+	  // threshold for shared context
+	  if (embd_idx > 0) {
+	    // clear the start of the cache
+	    fprintf(stderr, "clear: 0 ... %d\n", embd_idx);
+	    llama_kv_cache_seq_rm(ctx, 0, 0, embd_idx);
+	  }
+	  if (embd_idx+len < embd.size()) {
+	    // clear the rest of the cache
+	    fprintf(stderr, "clear: %d ... %d\n", embd_idx+len, embd.size());
+	    llama_kv_cache_seq_rm(ctx, 0, embd_idx+len, -1);
+	  }
+	  if (embd_idx > 0) {
+	    fprintf(stderr, "shift: %d ... %d by %d\n",
+	      embd_idx, embd_idx+len, -embd_idx);
+	    llama_kv_cache_seq_shift(ctx, 0, embd_idx, embd_idx+len, -embd_idx);
+	  }
+	  n_past = len;
+	} else {
+	  // clear the whole cache
+	  llama_kv_cache_seq_rm(ctx, 0, 0, -1);
+	  n_past = 0;
+	}
+
 	// compare the evaluated prompt with the new prompt
-	n_past = common_part(embd, prompt_tokens);
+	//n_past = common_part(embd, prompt_tokens);
 
 	embd = prompt_tokens;
 	if (n_past == num_prompt_tokens)
 	{
 	    // we have to evaluate at least 1 token to generate logits.
-	    n_past--;
+	    fprintf(stderr, "force reevaluation\n");
+	    --n_past;
+	    llama_kv_cache_seq_rm(ctx, 0, n_past, -1);
 	}
 
 	// since #3228 we now have to manually manage the KV cache
-	llama_kv_cache_seq_rm(ctx, 0, n_past, -1);
 
-	LOG_VERBOSE("prompt ingested", {
+	/*LOG_VERBOSE("prompt ingested", {
 					   {"n_past", n_past},
 					   {"cached", tokens_to_str(ctx, embd.cbegin(), embd.cbegin() + n_past)},
 					   {"to_eval", tokens_to_str(ctx, embd.cbegin() + n_past, embd.cend())},
-				       });
+				       });*/
 
 	has_next_token = true;
     }
