@@ -578,16 +578,16 @@ struct llama_server_context
       int *i_p,
       int *j_p
     ) {
-	int m = s.size();
-	int n = t.size();
+	int n = s.size();
+	int m = t.size();
 	int dp[2][m + 1];
 	int len = 0;
 	int best_i = 0;
 	int best_j = 0;
 
 	memset(dp, 0, sizeof(dp)); // this is necessary!
-	for (int i = 1; i <= n; i++) {
-	    for (int j = 1; j <= m; j++) {
+	for (int i = 1; i <= n; ++i) {
+	    for (int j = 1; j <= m; ++j) {
 		if (s[i - 1] == t[j - 1]) {
 		    int new_len = dp[(i - 1) % 2][j - 1] + 1;
 		    dp[i % 2][j] = new_len;
@@ -634,24 +634,53 @@ struct llama_server_context
 	int len, embd_idx, prompt_idx;
 	longest_common_part(embd, prompt_tokens, &len, &embd_idx, &prompt_idx);
 	if (len > ((int)prompt_tokens.size() >> 3)) {
-	  //fprintf(stderr, "prompt_idx = %d\n", prompt_idx);
-	  // threshold for shared context
-	  if (embd_idx > 0) {
-	    // clear the start of the cache
-	    fprintf(stderr, "clear: 0 ... %d\n", embd_idx);
-	    llama_kv_cache_seq_rm(ctx, 0, 0, embd_idx);
-	  }
-	  if (embd_idx+len < embd.size()) {
-	    // clear the rest of the cache
+	  // threshold to reuse cached keys and values exceeded
+	  if (embd_idx+len < (int)embd.size()) {
+	    // clear the end of the cache
 	    fprintf(stderr, "clear: %d ... %d\n", embd_idx+len, embd.size());
 	    llama_kv_cache_seq_rm(ctx, 0, embd_idx+len, -1);
 	  }
 	  if (embd_idx > 0) {
-	    fprintf(stderr, "shift: %d ... %d by %d\n",
-	      embd_idx, embd_idx+len, -embd_idx);
-	    llama_kv_cache_seq_shift(ctx, 0, embd_idx, embd_idx+len, -embd_idx);
+	    fprintf(stderr, "size = %d, length = %d\n", (int)embd.size(), len);
+	    fprintf(stderr, "embd_idx = %d\n", embd_idx);
+	    fprintf(stderr, "prompt_idx = %d\n", prompt_idx);
+	    if (embd_idx > 1) {
+	      // clear the start of the cache
+	      fprintf(stderr, "clear: 1 ... %d\n", embd_idx);
+	      llama_kv_cache_seq_rm(ctx, 0, 1, embd_idx);
+	    }
+	    if (prompt_idx != embd_idx) {
+	      fprintf(stderr, "shift: %d ... %d by %d\n",
+		embd_idx, embd_idx+len, 1-embd_idx);
+	      llama_kv_cache_seq_shift(
+		ctx, 0, embd_idx, embd_idx+len, prompt_idx-embd_idx);
+	    }
+	    if (prompt_idx > embd_idx) {
+	      // evaluate new prompt start
+	      int max_batch_size = params.n_batch;
+	      int idx = 1;
+	      while (idx < prompt_idx) {
+		llama_batch batch;
+		int batch_size = prompt_idx-idx;
+		if (batch_size > max_batch_size) batch_size = max_batch_size;
+		batch.n_tokens = batch_size;
+		batch.token = &prompt_tokens[idx];
+		batch.embd = nullptr;
+		batch.pos = nullptr;
+		batch.n_seq_id = nullptr;
+		batch.seq_id = nullptr;
+		batch.logits = nullptr;
+		batch.all_pos_0 = idx;
+		batch.all_pos_1 = 1; // the position increment
+		batch.all_seq_id = 0;
+		fprintf(stderr,
+		  "decode %d tokens starting with %d\n", batch_size, idx);
+		llama_decode(ctx, batch);
+		idx += batch_size;
+	      }
+	    }
 	  }
-	  n_past = len;
+	  n_past = prompt_idx+len;
 	} else {
 	  // clear the whole cache
 	  llama_kv_cache_seq_rm(ctx, 0, 0, -1);
@@ -671,6 +700,7 @@ struct llama_server_context
 	}
 
 	// since #3228 we now have to manually manage the KV cache
+	//llama_kv_cache_seq_rm(ctx, 0, n_past, -1);
 
 	/*LOG_VERBOSE("prompt ingested", {
 					   {"n_past", n_past},
@@ -1723,11 +1753,9 @@ int main(int argc, char **argv)
 	int generated_token = -1; // make it invalid
 	if (return_tokens) { // we also *got* tokens
 	    std::vector<llama_token> prompt_tokens = body["tokens"];
-	      // do *not* automatically add BOS
-	    /*for (int i = 0; i < prompt_tokens.size(); ++i) {
-	      fprintf(stderr, ", %d", prompt_tokens[i]);
-	    }
-	    fprintf(stderr, "\n");*/
+	    prompt_tokens.insert(
+	      prompt_tokens.begin(), llama_token_bos(llama.model));
+	      // shifting won't work without a BOS token!!!
 	    llama.loadPrompt(prompt_tokens);
 	} else {
 	    std::vector<llama_token> prompt_tokens =
