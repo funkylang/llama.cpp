@@ -637,16 +637,16 @@ struct llama_server_context
 	  // threshold to reuse cached keys and values exceeded
 	  if (embd_idx+len < (int)embd.size()) {
 	    // clear the end of the cache
-	    fprintf(stderr, "clear: %d ... %d\n", embd_idx+len, embd.size());
+	    //fprintf(stderr, "clear: %d ... %d\n", embd_idx+len, embd.size());
 	    llama_kv_cache_seq_rm(ctx, 0, embd_idx+len, -1);
 	  }
 	  if (embd_idx > 0) {
-	    fprintf(stderr, "size = %d, length = %d\n", (int)embd.size(), len);
-	    fprintf(stderr, "embd_idx = %d\n", embd_idx);
-	    fprintf(stderr, "prompt_idx = %d\n", prompt_idx);
+	    //fprintf(stderr, "size = %d, length = %d\n", (int)embd.size(), len);
+	    //fprintf(stderr, "embd_idx = %d\n", embd_idx);
+	    //fprintf(stderr, "prompt_idx = %d\n", prompt_idx);
 	    if (embd_idx > 1) {
 	      // clear the start of the cache
-	      fprintf(stderr, "clear: 1 ... %d\n", embd_idx);
+	      //fprintf(stderr, "clear: 1 ... %d\n", embd_idx);
 	      llama_kv_cache_seq_rm(ctx, 0, 1, embd_idx);
 	    }
 	    if (prompt_idx != embd_idx) {
@@ -694,7 +694,7 @@ struct llama_server_context
 	if (n_past == num_prompt_tokens)
 	{
 	    // we have to evaluate at least 1 token to generate logits.
-	    fprintf(stderr, "force reevaluation\n");
+	    //fprintf(stderr, "force reevaluation\n");
 	    --n_past;
 	    llama_kv_cache_seq_rm(ctx, 0, n_past, -1);
 	}
