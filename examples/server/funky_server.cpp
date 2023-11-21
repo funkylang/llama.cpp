@@ -2158,6 +2158,14 @@ int main(int argc, char **argv)
 	int suffix = llama_token_suffix(llama.model);
 	int middle = llama_token_middle(llama.model);
 	int eot = llama_token_eot(llama.model);
+	int context_size = llama.params.n_ctx;
+	if (
+	  context_size >
+	  (int)((struct llama_model_header *)llama.model)->params.n_ctx_train
+	) {
+	  context_size =
+	    (int)((struct llama_model_header *)llama.model)->params.n_ctx_train;
+	}
 	json data = json{
 	  {"begin_of_stream", bos},
 	  {"end_of_stream", eos},
@@ -2166,7 +2174,8 @@ int main(int argc, char **argv)
 	  {"suffix", suffix},
 	  {"middle", middle},
 	  {"end_of_text", eot},
-	  {"tokens", tokens}
+	  {"tokens", tokens},
+	  {"context_size", context_size}
 	};
 
 	return res.set_content(data.dump(), "application/json"); });
