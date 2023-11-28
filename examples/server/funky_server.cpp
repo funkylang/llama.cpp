@@ -2140,16 +2140,31 @@ int main(int argc, char **argv)
 	}
 	fprintf(stderr, "get_tokens\n");
 	json tokens = json::array();
-	for (int id = 00; id < llama.n_vocab; ++id) {
+	for (int id = 0; id < llama.n_vocab; ++id) {
 	    auto piece = llama_token_to_piece(llama.ctx, id);
 	    int n = piece.length();
-	    if (
-		((piece[0] & 0xe0) == 0xc0 && n < 2) || // invalid 2 byte code
-		((piece[0] & 0xf0) == 0xe0 && n < 3) || // invalid 3 byte code
-		((piece[0] & 0xf0) == 0xf0 && n < 4) || // invalid code
-		(piece[0] & 0xc0) == 0x80 // continuation byte
-	    ) piece = ""; // invalid
-	    tokens.push_back(json(piece));
+	    int i = 0;
+	    bool send_as_array = false;
+	    while (i < n) {
+		if ((unsigned char)piece[i] < 0x80) ++i;
+		else if (((unsigned char)piece[i] & 0xe0) == 0xc0) i += 2;
+		else if ((unsigned char)(piece[i] & 0xf0) == 0xe0) i += 3;
+		else if ((unsigned char)(piece[i] & 0xf8) == 0xf0) i += 4;
+		else i = n+1;
+		if (i > n) {
+		    send_as_array = true;
+		    break;
+		}
+	    }
+	    if (send_as_array) {
+		json octets = json::array();
+		for (i = 0; i < n; ++i) {
+		  octets.push_back(json((unsigned int)(unsigned char)piece[i]));
+		}
+		tokens.push_back(octets);
+	    } else {
+	      tokens.push_back(json(piece));
+	    }
 	}
 	int bos = llama_token_bos(llama.model);
 	int eos = llama_token_eos(llama.model);
