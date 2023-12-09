@@ -107,8 +107,11 @@ our_llama_init_from_gpt_params(gpt_params & params) {
       ((struct llama_model_header *)model)->params.n_ctx_train;
     unsigned int layer_count =
       ((struct llama_model_header *)model)->params.n_layer;
-    fprintf(stderr, "context_size: %d\n", context_size);
+    unsigned int embeddings_count =
+      ((struct llama_model_header *)model)->params.n_embd;
+    fprintf(stderr, "context size: %d\n", context_size);
     fprintf(stderr, "layers: %d\n", layer_count);
+    fprintf(stderr, "embeddings: %d\n", embeddings_count);
     auto cparams = llama_context_params_from_gpt_params(params);
     if (cparams.n_ctx > context_size) cparams.n_ctx = context_size;
       // do not set a context size greater than the model's trained context size
@@ -609,7 +612,6 @@ struct llama_server_context
     void loadPrompt(std::vector<llama_token> &prompt_tokens)
     {
 	num_prompt_tokens = prompt_tokens.size();
-
 	if (params.n_keep < 0)
 	{
 	    params.n_keep = (int)num_prompt_tokens;
@@ -637,21 +639,18 @@ struct llama_server_context
 	  // threshold to reuse cached keys and values exceeded
 	  if (embd_idx+len < (int)embd.size()) {
 	    // clear the end of the cache
-	    //fprintf(stderr, "clear: %d ... %d\n", embd_idx+len, embd.size());
+	    fprintf(stderr, "[clear tail: %d ... %d]\n", embd_idx+len, embd.size());
 	    llama_kv_cache_seq_rm(ctx, 0, embd_idx+len, -1);
 	  }
 	  if (embd_idx > 0) {
-	    //fprintf(stderr, "size = %d, length = %d\n", (int)embd.size(), len);
-	    //fprintf(stderr, "embd_idx = %d\n", embd_idx);
-	    //fprintf(stderr, "prompt_idx = %d\n", prompt_idx);
 	    if (embd_idx > 1) {
 	      // clear the start of the cache
-	      //fprintf(stderr, "clear: 1 ... %d\n", embd_idx);
+	      fprintf(stderr, "[clear head: 1 ... %d]\n", embd_idx);
 	      llama_kv_cache_seq_rm(ctx, 0, 1, embd_idx);
 	    }
 	    if (prompt_idx != embd_idx) {
-	      fprintf(stderr, "shift: %d ... %d by %d\n",
-		embd_idx, embd_idx+len, 1-embd_idx);
+	      fprintf(stderr, "[shift: %d ... %d >> %d ... %d]\n",
+		embd_idx, embd_idx+len, prompt_idx, prompt_idx+len);
 	      llama_kv_cache_seq_shift(
 		ctx, 0, embd_idx, embd_idx+len, prompt_idx-embd_idx);
 	    }
@@ -674,14 +673,19 @@ struct llama_server_context
 		batch.all_pos_1 = 1; // the position increment
 		batch.all_seq_id = 0;
 		fprintf(stderr,
-		  "decode %d tokens starting with %d\n", batch_size, idx);
+		  "[decode: %d ... %d]\n", idx, idx+batch_size);
 		llama_decode(ctx, batch);
 		idx += batch_size;
 	      }
 	    }
 	  }
 	  n_past = prompt_idx+len;
+	  if (prompt_tokens.size() > n_past) {
+	    fprintf(stderr, "[add: %d ... %d]\n",
+	      n_past, (int)prompt_tokens.size());
+	  }
 	} else {
+	  fprintf(stderr, "[new: 0 ... %d]\n", (int)prompt_tokens.size());
 	  // clear the whole cache
 	  llama_kv_cache_seq_rm(ctx, 0, 0, -1);
 	  n_past = 0;
@@ -694,13 +698,9 @@ struct llama_server_context
 	if (n_past == num_prompt_tokens)
 	{
 	    // we have to evaluate at least 1 token to generate logits.
-	    //fprintf(stderr, "force reevaluation\n");
 	    --n_past;
 	    llama_kv_cache_seq_rm(ctx, 0, n_past, -1);
 	}
-
-	// since #3228 we now have to manually manage the KV cache
-	//llama_kv_cache_seq_rm(ctx, 0, n_past, -1);
 
 	/*LOG_VERBOSE("prompt ingested", {
 					   {"n_past", n_past},
@@ -1753,6 +1753,7 @@ int main(int argc, char **argv)
 	int generated_token = -1; // make it invalid
 	if (return_tokens) { // we also *got* tokens
 	    std::vector<llama_token> prompt_tokens = body["tokens"];
+	    //fprintf(stderr, "prompt length = %d\n", prompt_tokens.size());
 	    prompt_tokens.insert(
 	      prompt_tokens.begin(), llama_token_bos(llama.model));
 	      // shifting won't work without a BOS token!!!
