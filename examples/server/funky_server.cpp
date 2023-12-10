@@ -642,44 +642,40 @@ struct llama_server_context
 	    fprintf(stderr, "[clear tail: %d ... %d]\n", embd_idx+len, embd.size());
 	    llama_kv_cache_seq_rm(ctx, 0, embd_idx+len, -1);
 	  }
+	  n_past = prompt_idx+len;
 	  if (embd_idx > 0) {
-	    if (embd_idx > 1) {
-	      // clear the start of the cache
-	      fprintf(stderr, "[clear head: 1 ... %d]\n", embd_idx);
-	      llama_kv_cache_seq_rm(ctx, 0, 1, embd_idx);
-	    }
+	    // clear the start of the cache
+	    fprintf(stderr, "[clear head: 0 ... %d]\n", embd_idx);
+	    llama_kv_cache_seq_rm(ctx, 0, 0, embd_idx);
 	    if (prompt_idx != embd_idx) {
 	      fprintf(stderr, "[shift: %d ... %d >> %d ... %d]\n",
-		embd_idx, embd_idx+len, prompt_idx, prompt_idx+len);
+		embd_idx, embd_idx+len, prompt_idx, n_past);
 	      llama_kv_cache_seq_shift(
 		ctx, 0, embd_idx, embd_idx+len, prompt_idx-embd_idx);
 	    }
-	    if (prompt_idx > embd_idx) {
-	      // evaluate new prompt start
-	      int max_batch_size = params.n_batch;
-	      int idx = 1;
-	      while (idx < prompt_idx) {
-		llama_batch batch;
-		int batch_size = prompt_idx-idx;
-		if (batch_size > max_batch_size) batch_size = max_batch_size;
-		batch.n_tokens = batch_size;
-		batch.token = &prompt_tokens[idx];
-		batch.embd = nullptr;
-		batch.pos = nullptr;
-		batch.n_seq_id = nullptr;
-		batch.seq_id = nullptr;
-		batch.logits = nullptr;
-		batch.all_pos_0 = idx;
-		batch.all_pos_1 = 1; // the position increment
-		batch.all_seq_id = 0;
-		fprintf(stderr,
-		  "[decode: %d ... %d]\n", idx, idx+batch_size);
-		llama_decode(ctx, batch);
-		idx += batch_size;
-	      }
+	    // evaluate new prompt start
+	    int max_batch_size = params.n_batch;
+	    int idx = 0;
+	    while (idx < prompt_idx) {
+	      llama_batch batch;
+	      int batch_size = prompt_idx-idx;
+	      if (batch_size > max_batch_size) batch_size = max_batch_size;
+	      batch.n_tokens = batch_size;
+	      batch.token = &prompt_tokens[idx];
+	      batch.embd = nullptr;
+	      batch.pos = nullptr;
+	      batch.n_seq_id = nullptr;
+	      batch.seq_id = nullptr;
+	      batch.logits = nullptr;
+	      batch.all_pos_0 = idx;
+	      batch.all_pos_1 = 1; // the position increment
+	      batch.all_seq_id = 0;
+	      fprintf(stderr,
+		"[decode: %d ... %d]\n", idx, idx+batch_size);
+	      llama_decode(ctx, batch);
+	      idx += batch_size;
 	    }
 	  }
-	  n_past = prompt_idx+len;
 	  if (prompt_tokens.size() > n_past) {
 	    fprintf(stderr, "[add: %d ... %d]\n",
 	      n_past, (int)prompt_tokens.size());
@@ -759,6 +755,10 @@ struct llama_server_context
 		n_eval = params.n_batch;
 	    }
 
+	    if (!tg) {
+	      fprintf(stderr, "[batch %d ... %d]\n",
+		(int)n_past, (int)n_past+n_eval);
+	    }
 	    if (llama_decode(ctx, llama_batch_get_one(&embd[n_past], n_eval, n_past, 0)))
 	    {
 		LOG_ERROR("failed to eval", {
@@ -986,7 +986,6 @@ static void server_print_usage(const char *argv0, const gpt_params &params,
     printf("  --rope-freq-base N        RoPE base frequency (default: loaded from model)\n");
     printf("  --rope-freq-scale N       RoPE frequency scaling factor (default: loaded from model)\n");
     printf("  -b N,  --batch-size N     batch size for prompt processing (default: %d)\n", params.n_batch);
-    printf("  --memory-f32              use f32 instead of f16 for memory key+value (default: disabled)\n");
     printf("                            not recommended: doubles context memory required and no measurable increase in quality\n");
     if (llama_mlock_supported())
     {
@@ -1118,10 +1117,6 @@ static void server_params_parse(int argc, char **argv, server_params &sparams,
 		break;
 	    }
 	    params.rope_freq_scale = std::stof(argv[i]);
-	}
-	else if (arg == "--memory-f32" || arg == "--memory_f32")
-	{
-	    params.memory_f16 = false;
 	}
 	else if (arg == "--threads" || arg == "-t")
 	{
