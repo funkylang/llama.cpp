@@ -575,14 +575,12 @@ struct llama_server_context
     void longest_common_part(
       // original code by "rajsanghavi9"
       // (https://www.geeksforgeeks.org/longest-common-substring-dp-29/)
-      std::vector<llama_token> &s,
-      std::vector<llama_token> &t,
+      llama_token *s, int n,
+      llama_token *t, int m,
       int *len_p,
       int *i_p,
       int *j_p
     ) {
-	int n = s.size();
-	int m = t.size();
 	int dp[2][m + 1];
 	int len = 0;
 	int best_i = 0;
@@ -633,20 +631,40 @@ struct llama_server_context
 	    llama_sampling_accept(ctx_sampling, ctx, token, false);
 	}
 
-	int len, embd_idx, prompt_idx;
-	longest_common_part(embd, prompt_tokens, &len, &embd_idx, &prompt_idx);
-	if (len > ((int)prompt_tokens.size() >> 3)) {
-	  // threshold to reuse cached keys and values exceeded
-	  if (embd_idx+len < (int)embd.size()) {
-	    // clear the end of the cache
-	    fprintf(stderr, "[clear tail: %d ... %d]\n", embd_idx+len, embd.size());
-	    llama_kv_cache_seq_rm(ctx, 0, embd_idx+len, -1);
-	  }
-	  n_past = prompt_idx+len;
-	  if (embd_idx > 0) {
-	    // clear the start of the cache
-	    fprintf(stderr, "[clear head: 0 ... %d]\n", embd_idx);
-	    llama_kv_cache_seq_rm(ctx, 0, 0, embd_idx);
+	int common_prefix_len = common_part(embd, prompt_tokens);
+	/*if (common_prefix_len < n_past) {
+	  fprintf(stderr, "n_past = %d\n", n_past);
+	  fprintf(stderr, "embd.size() = %d\n", embd.size());
+	  fprintf(stderr, "num_prompt_tokens = %d\n", num_prompt_tokens);
+	  fprintf(stderr, "common_prefix_len = %d\n", common_prefix_len);
+	  int remaining_tokens_len = (int)num_prompt_tokens-common_prefix_len;
+	  int remaining_embd_len = (int)embd.size()-common_prefix_len;
+	  int len, embd_idx, prompt_idx;
+	  longest_common_part(
+	    embd.data()+common_prefix_len,
+	    remaining_embd_len,
+	    prompt_tokens.data()+common_prefix_len,
+	    remaining_tokens_len,
+	    &len, &embd_idx, &prompt_idx);
+	  fprintf(stderr, "len = %d\n", len);
+	  fprintf(stderr, "embd_idx = %d\n", embd_idx);
+	  fprintf(stderr, "prompt_idx = %d\n", prompt_idx);
+	  if (len > (remaining_tokens_len >> 2)) {
+	    embd_idx += common_prefix_len;
+	    prompt_idx += common_prefix_len;
+	    // threshold to reuse cached keys and values exceeded
+	    if (embd_idx+len < (int)embd.size()) {
+	      // clear the end of the cache
+	      fprintf(stderr, "[clear: %d ... %d]\n", embd_idx+len, embd.size());
+	      llama_kv_cache_seq_rm(ctx, 0, embd_idx+len, -1);
+	    }
+	    n_past = prompt_idx+len;
+	    if (embd_idx > common_prefix_len) {
+	      // clear the start of the cache
+	      fprintf(stderr, "[clear: %d ... %d]\n",
+		common_prefix_len, embd_idx);
+	      llama_kv_cache_seq_rm(ctx, 0, common_prefix_len, embd_idx);
+	    }
 	    if (prompt_idx != embd_idx) {
 	      fprintf(stderr, "[shift: %d ... %d >> %d ... %d]\n",
 		embd_idx, embd_idx+len, prompt_idx, n_past);
@@ -655,7 +673,7 @@ struct llama_server_context
 	    }
 	    // evaluate new prompt start
 	    int max_batch_size = params.n_batch;
-	    int idx = 0;
+	    int idx = common_prefix_len;
 	    while (idx < prompt_idx) {
 	      llama_batch batch;
 	      int batch_size = prompt_idx-idx;
@@ -675,35 +693,23 @@ struct llama_server_context
 	      llama_decode(ctx, batch);
 	      idx += batch_size;
 	    }
+	  } else {
+	    fprintf(stderr, "[clear: %d ...]\n", common_prefix_len);
+	    // clear everything but the common prefix
+	    llama_kv_cache_seq_rm(ctx, 0, common_prefix_len, -1);
+	    n_past = common_prefix_len;
 	  }
-	  if (prompt_tokens.size() > n_past) {
-	    fprintf(stderr, "[add: %d ... %d]\n",
-	      n_past, (int)prompt_tokens.size());
+	  if (n_past == num_prompt_tokens)
+	  {
+	      // we have to evaluate at least 1 token to generate logits.
+	      --n_past;
+	      llama_kv_cache_seq_rm(ctx, 0, n_past, -1);
 	  }
-	} else {
-	  fprintf(stderr, "[new: 0 ... %d]\n", (int)prompt_tokens.size());
-	  // clear the whole cache
-	  llama_kv_cache_seq_rm(ctx, 0, 0, -1);
-	  n_past = 0;
-	}
-
-	// compare the evaluated prompt with the new prompt
-	//n_past = common_part(embd, prompt_tokens);
-
+	}*/
+	n_past = common_prefix_len;
+	if (n_past == num_prompt_tokens) --n_past;
+	llama_kv_cache_seq_rm(ctx, 0, n_past, -1);
 	embd = prompt_tokens;
-	if (n_past == num_prompt_tokens)
-	{
-	    // we have to evaluate at least 1 token to generate logits.
-	    --n_past;
-	    llama_kv_cache_seq_rm(ctx, 0, n_past, -1);
-	}
-
-	/*LOG_VERBOSE("prompt ingested", {
-					   {"n_past", n_past},
-					   {"cached", tokens_to_str(ctx, embd.cbegin(), embd.cbegin() + n_past)},
-					   {"to_eval", tokens_to_str(ctx, embd.cbegin() + n_past, embd.cend())},
-				       });*/
-
 	has_next_token = true;
     }
 
@@ -1738,7 +1744,7 @@ int main(int argc, char **argv)
 	llama_reset_timings(llama.ctx);
 	const json body = json::parse(req.body);
 	maybe_change_model(llama, body);
-	llama.rewind();
+	//llama.rewind();
 	parse_options_completion(body, llama);
 
 	llama.initSampling();
