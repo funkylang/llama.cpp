@@ -112,8 +112,23 @@ static std::vector<llama_token> llama_tokenize(
 int main() {
   llama_log_set(llama_null_log_callback, NULL);
 
-  const char *model_filename = "/var/models/Wizard-Vicuna-13B-Uncensored.Q5_K_M.gguf";
-  const char *prompt = "Once upon a time";
+  const char *model_filename =
+    "/mnt/models/losslessmegacoder-llama2-7b-mini.Q5_K_M.gguf";
+
+  // load the contents of "prompt.txt"
+  char *prompt;
+  FILE *fh = fopen("prompt.txt", "r");
+  if (fh == NULL) {
+    fprintf(stderr, "Could not open prompt.txt\n");
+    return 1;
+  }
+  fseek(fh, 0, SEEK_END);
+  long size = ftell(fh);
+  rewind(fh);
+  prompt = (char *)malloc(size + 1);
+  fread(prompt, 1, size, fh);
+  prompt[size] = '\0';
+  fclose(fh);
 
   llama_backend_init(false);
 
@@ -157,12 +172,13 @@ int main() {
   std::vector<llama_token> embd_inp;
 
   embd_inp = ::llama_tokenize(model, prompt, add_bos, true);
+  fprintf(stderr, "token count: %d\n", embd_inp.size());
 
   int n_past = 0;
   int n_remain = 128;
   int batch_size = 512;
   int n_consumed = 0;
-  int keep_n = 256;
+  int keep_n = 2000; //256;
 
   std::vector<int> input_tokens;
   std::vector<int> output_tokens;
@@ -187,11 +203,17 @@ int main() {
 
       if (n_past + (int) embd.size() > n_ctx) {
 	const int n_left = n_past-keep_n-1;
-	const int n_discard = n_left/2;
+	int n_discard = n_left/8;
+	if (n_past+(int)embd.size()-n_discard > n_ctx) {
+	  n_discard = n_past+(int)embd.size()-n_ctx;
+	}
+	n_discard += 133;
 	llama_kv_cache_seq_rm(
 	  ctx, 0, keep_n+1, keep_n+n_discard+1);
 	llama_kv_cache_seq_shift(
 	  ctx, 0, keep_n+1+n_discard, n_past, -n_discard);
+	fprintf(stderr, "shift %d ... %d << %d\n",
+	  keep_n+1+n_discard, n_past, n_discard);
 	n_past -= n_discard;
       }
       for (int i = 0; i < (int) embd.size(); i += batch_size) {
@@ -229,7 +251,7 @@ int main() {
 	embd.push_back(embd_inp[n_consumed]);
 
 	++n_consumed;
-	if ((int) embd.size() >= batch_size) {
+	if ((int) embd.size() >= 2*batch_size) {
 	    break;
 	}
       }

@@ -708,6 +708,7 @@ struct llama_server_context
 	}*/
 	n_past = common_prefix_len;
 	if (n_past == num_prompt_tokens) --n_past;
+	  // we have to evaluate at least 1 token to generate logits.
 	llama_kv_cache_seq_rm(ctx, 0, n_past, -1);
 	embd = prompt_tokens;
 	has_next_token = true;
@@ -1745,6 +1746,7 @@ int main(int argc, char **argv)
 	const json body = json::parse(req.body);
 	maybe_change_model(llama, body);
 	//llama.rewind();
+	llama.generated_token_probs.clear();
 	parse_options_completion(body, llama);
 
 	llama.initSampling();
