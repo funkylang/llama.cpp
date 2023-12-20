@@ -348,6 +348,7 @@ struct llama_server_context
     bool stream = false;
     bool has_next_token = false;
     std::string generated_text;
+    std::string mode = "exact";
     std::vector<completion_token_output> generated_token_probs;
 
     size_t num_prompt_tokens = 0;
@@ -607,32 +608,42 @@ struct llama_server_context
 	*j_p = best_j-len;
     }
 
-    void loadPrompt(std::vector<llama_token> &prompt_tokens)
-    {
-	num_prompt_tokens = prompt_tokens.size();
-	if (params.n_keep < 0)
-	{
-	    params.n_keep = (int)num_prompt_tokens;
-	}
-	params.n_keep = std::min(n_ctx - 4, params.n_keep);
+    void loadPrompt(
+      std::vector<llama_token> &prompt_tokens,
+      int start_length = 1
+    ) {
+      num_prompt_tokens = prompt_tokens.size();
+      if (params.n_keep < 0)
+      {
+	  params.n_keep = (int)num_prompt_tokens;
+      }
+      params.n_keep = std::min(n_ctx - 4, params.n_keep);
 
-	// if input prompt is too big, truncate like normal
-	if (num_prompt_tokens >= (size_t) n_ctx)
-	{
-	    truncatePrompt(prompt_tokens);
-	    num_prompt_tokens = prompt_tokens.size();
+      /*fprintf(stderr, "[");
+      for (int i = 0; i < num_prompt_tokens; ++i) {
+	if (i > 0) fprintf(stderr, ",");
+	fprintf(stderr, "%d", prompt_tokens[i]);
+      }
+      fprintf(stderr, "]\n");*/
 
-	    GGML_ASSERT(num_prompt_tokens < (size_t)n_ctx);
-	}
+      // if input prompt is too big, truncate like normal
+      if (num_prompt_tokens >= (size_t) n_ctx)
+      {
+	  truncatePrompt(prompt_tokens);
+	  num_prompt_tokens = prompt_tokens.size();
 
-	// push the prompt into the sampling context (do not apply grammar)
-	for (auto & token : prompt_tokens)
-	{
-	    llama_sampling_accept(ctx_sampling, ctx, token, false);
-	}
+	  GGML_ASSERT(num_prompt_tokens < (size_t)n_ctx);
+      }
 
-	int common_prefix_len = common_part(embd, prompt_tokens);
-	/*if (common_prefix_len < n_past) {
+      // push the prompt into the sampling context (do not apply grammar)
+      for (auto & token : prompt_tokens)
+      {
+	  llama_sampling_accept(ctx_sampling, ctx, token, false);
+      }
+
+      int common_prefix_len = common_part(embd, prompt_tokens);
+      if (mode == "shift") {
+	if (common_prefix_len < n_past) {
 	  fprintf(stderr, "n_past = %d\n", n_past);
 	  fprintf(stderr, "embd.size() = %d\n", embd.size());
 	  fprintf(stderr, "num_prompt_tokens = %d\n", num_prompt_tokens);
@@ -699,19 +710,46 @@ struct llama_server_context
 	    llama_kv_cache_seq_rm(ctx, 0, common_prefix_len, -1);
 	    n_past = common_prefix_len;
 	  }
-	  if (n_past == num_prompt_tokens)
-	  {
-	      // we have to evaluate at least 1 token to generate logits.
-	      --n_past;
-	      llama_kv_cache_seq_rm(ctx, 0, n_past, -1);
+	  if (n_past == num_prompt_tokens) --n_past;
+	}
+      } else if (mode == "smart") {
+	int gap_length = n_ctx >> 3;
+	if (common_prefix_len < start_length) {
+	  rebuild:
+	  int remove_size = num_prompt_tokens+gap_length-n_ctx;
+	  if (remove_size > 0) {
+	    // shorten prompt
+	    prompt_tokens.erase(
+	      prompt_tokens.begin()+start_length,
+	      prompt_tokens.begin()+start_length+remove_size);
 	  }
-	}*/
+	  n_past = common_prefix_len;
+	} else {
+	  int remaining_tokens_len = (int)num_prompt_tokens-start_length;
+	  int remaining_embd_len = (int)embd.size()-start_length;
+	  int len, embd_idx, prompt_idx;
+	  longest_common_part(
+	    embd.data()+start_length,
+	    remaining_embd_len,
+	    prompt_tokens.data()+start_length,
+	    remaining_tokens_len,
+	    &len, &embd_idx, &prompt_idx);
+	  if (embd_idx != 0 || len < (remaining_tokens_len >> 1)) goto rebuild;
+	  if (prompt_idx >= 0) {
+	    prompt_tokens.erase(
+	      prompt_tokens.begin()+start_length,
+	      prompt_tokens.begin()+start_length+prompt_idx);
+	  }
+	  n_past = start_length+len;
+	}
+	if (n_past == prompt_tokens.size()) --n_past;
+      } else {
 	n_past = common_prefix_len;
 	if (n_past == num_prompt_tokens) --n_past;
-	  // we have to evaluate at least 1 token to generate logits.
-	llama_kv_cache_seq_rm(ctx, 0, n_past, -1);
-	embd = prompt_tokens;
-	has_next_token = true;
+      }
+      llama_kv_cache_seq_rm(ctx, 0, n_past, -1);
+      embd = prompt_tokens;
+      has_next_token = true;
     }
 
     void beginCompletion()
@@ -1753,14 +1791,18 @@ int main(int argc, char **argv)
 	bool return_logits = json_value(body, "logits", false);
 	bool return_tokens = body.count("tokens") != 0;
 	bool return_brief = json_value(body, "brief", false);
+	llama.mode = "exact";
+	if (body.count("mode") != 0) {
+	  llama.mode = body["mode"];
+	}
 	int generated_token = -1; // make it invalid
 	if (return_tokens) { // we also *got* tokens
 	    std::vector<llama_token> prompt_tokens = body["tokens"];
-	    //fprintf(stderr, "prompt length = %d\n", prompt_tokens.size());
+	    int start_length = json_value(body, "start", 0);
 	    prompt_tokens.insert(
 	      prompt_tokens.begin(), llama_token_bos(llama.model));
-	      // shifting won't work without a BOS token!!!
-	    llama.loadPrompt(prompt_tokens);
+	    ++start_length;
+	    llama.loadPrompt(prompt_tokens, start_length);
 	} else {
 	    std::vector<llama_token> prompt_tokens =
 		llama.tokenize(llama.prompt, true); // always add BOS
