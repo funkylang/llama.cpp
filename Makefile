@@ -1,6 +1,6 @@
 # Define the default target now so that it is always the first target
 BUILD_TARGETS = \
-	main apitest quantize quantize-stats perplexity imatrix embedding vdot q8dot train-text-from-scratch convert-llama2c-to-ggml \
+	main quantize quantize-stats perplexity imatrix embedding vdot q8dot train-text-from-scratch convert-llama2c-to-ggml \
 	simple batched batched-bench save-load-state server funky_server gguf llama-bench libllava.a llava-cli baby-llama beam-search  \
 	speculative infill tokenize benchmark-matmult parallel finetune export-lora lookahead lookup passkey tests/test-c.o
 

@@ -130,7 +130,7 @@ int main() {
   prompt[size] = '\0';
   fclose(fh);
 
-  llama_backend_init(false);
+  llama_backend_init();
 
   llama_model *model;
   llama_context *ctx;

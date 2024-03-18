@@ -340,8 +340,8 @@ static bool server_verbose = false;
 #define LOG_WARNING(MSG, ...) server_log("WARNING", __func__, __LINE__, MSG, __VA_ARGS__)
 #define LOG_INFO(MSG, ...) server_log("INFO", __func__, __LINE__, MSG, __VA_ARGS__)
 
-static bool be_verbose = true;
-static std::string model_path;
+static bool be_verbose = false;
+static std::string model_path = "/var/models";
 
 struct llama_server_context
 {
@@ -643,7 +643,7 @@ struct llama_server_context
 
       int common_prefix_len = common_part(embd, prompt_tokens);
       if (mode == "shift") {
-	if (common_prefix_len < n_past) {
+	/*if (common_prefix_len < n_past) {
 	  fprintf(stderr, "n_past = %d\n", n_past);
 	  fprintf(stderr, "embd.size() = %d\n", embd.size());
 	  fprintf(stderr, "num_prompt_tokens = %d\n", num_prompt_tokens);
@@ -711,7 +711,7 @@ struct llama_server_context
 	    n_past = common_prefix_len;
 	  }
 	  if (n_past == num_prompt_tokens) --n_past;
-	}
+	}*/
       } else if (mode == "smart") {
 	int gap_length = n_ctx >> 3;
 	if (common_prefix_len < start_length) {
@@ -764,7 +764,7 @@ struct llama_server_context
 	completion_token_output result;
 	result.tok = -1;
 
-	if (embd.size() >= (size_t)n_ctx)
+	/*if (embd.size() >= (size_t)n_ctx)
 	{
 	    // Shift context
 
@@ -788,7 +788,7 @@ struct llama_server_context
 					       {"n_keep", params.n_keep},
 					       {"n_left", n_left},
 					   });
-	}
+	}*/
 
 	bool tg = true;
 	while (n_past < embd.size())
@@ -1024,7 +1024,6 @@ static void server_print_usage(const char *argv0, const gpt_params &params,
     printf("options:\n");
     printf("  -h, --help                show this help message and exit\n");
     printf("  -v, --verbose             verbose output (default: %s)\n", server_verbose ? "enabled" : "disabled");
-    printf("  --quiet                   disable diagnostic ouput\n");
     printf("  -t N,  --threads N        number of threads to use during computation (default: %d)\n", params.n_threads);
     printf("  -tb N, --threads-batch N  number of threads to use during batch and prompt processing (default: same as --threads)\n");
     printf("  -c N,  --ctx-size N       size of the prompt context (default: %d)\n", params.n_ctx);
@@ -1032,25 +1031,25 @@ static void server_print_usage(const char *argv0, const gpt_params &params,
     printf("  --rope-freq-scale N       RoPE frequency scaling factor (default: loaded from model)\n");
     printf("  -b N,  --batch-size N     batch size for prompt processing (default: %d)\n", params.n_batch);
     printf("                            not recommended: doubles context memory required and no measurable increase in quality\n");
-    if (llama_mlock_supported())
+    /*if (llama_mlock_supported())
     {
 	printf("  --mlock               force system to keep model in RAM rather than swapping or compressing\n");
     }
     if (llama_mmap_supported())
     {
 	printf("  --no-mmap             do not memory-map model (slower load but may reduce pageouts if not using mlock)\n");
-    }
+    }*/
     printf("  --numa                attempt optimizations that help on some NUMA systems\n");
-#ifdef LLAMA_SUPPORTS_GPU_OFFLOAD
-    printf("  -ngl N, --n-gpu-layers N\n");
-    printf("                        number of layers to store in VRAM\n");
-    printf("  -ts SPLIT --tensor-split SPLIT\n");
-    printf("                        how to split tensors across multiple GPUs, comma-separated list of proportions, e.g. 3,1\n");
-    printf("  -mg i, --main-gpu i   the GPU to use for scratch and small tensors\n");
-    printf("  -nommq, --no-mul-mat-q\n");
-    printf("                        use cuBLAS instead of custom mul_mat_q CUDA kernels.\n");
-    printf("                        Not recommended since this is both slower and uses more VRAM.\n");
-#endif
+    if (llama_supports_gpu_offload()) {
+      printf("  -ngl N, --n-gpu-layers N\n");
+      printf("                        number of layers to store in VRAM\n");
+      printf("  -ts SPLIT --tensor-split SPLIT\n");
+      printf("                        how to split tensors across multiple GPUs, comma-separated list of proportions, e.g. 3,1\n");
+      printf("  -mg i, --main-gpu i   the GPU to use for scratch and small tensors\n");
+      printf("  -nommq, --no-mul-mat-q\n");
+      printf("                        use cuBLAS instead of custom mul_mat_q CUDA kernels.\n");
+      printf("                        Not recommended since this is both slower and uses more VRAM.\n");
+    }
     printf("  -m FNAME, --model FNAME\n");
     printf("                        model path (default: %s)\n", params.model.c_str());
     printf("  -a ALIAS, --alias ALIAS\n");
@@ -1198,13 +1197,13 @@ static void server_params_parse(int argc, char **argv, server_params &sparams,
 		invalid_param = true;
 		break;
 	    }
-#ifdef LLAMA_SUPPORTS_GPU_OFFLOAD
-	    params.n_gpu_layers = std::stoi(argv[i]);
-#else
-	    LOG_WARNING("Not compiled with GPU offload support, --n-gpu-layers option will be ignored. "
-			"See main README.md for information on enabling GPU BLAS support",
-			{{"n_gpu_layers", params.n_gpu_layers}});
-#endif
+	    if (llama_supports_gpu_offload()) {
+		params.n_gpu_layers = std::stoi(argv[i]);
+	    } else {
+		LOG_WARNING("Not compiled with GPU offload support, --n-gpu-layers option will be ignored. "
+		    "See main README.md for information on enabling GPU BLAS support",
+		    {{"n_gpu_layers", params.n_gpu_layers}});
+	    }
 	}
 	else if (arg == "--tensor-split" || arg == "-ts")
 	{
@@ -1220,9 +1219,8 @@ static void server_params_parse(int argc, char **argv, server_params &sparams,
 	    const std::regex regex{R"([,/]+)"};
 	    std::sregex_token_iterator it{arg_next.begin(), arg_next.end(), regex, -1};
 	    std::vector<std::string> split_arg{it, {}};
-	    GGML_ASSERT(split_arg.size() <= LLAMA_MAX_DEVICES);
 
-	    for (size_t i_device = 0; i_device < LLAMA_MAX_DEVICES; ++i_device)
+	    for (size_t i_device = 0; i_device < llama_max_devices(); ++i_device)
 	    {
 		if (i_device < split_arg.size())
 		{
@@ -1240,7 +1238,7 @@ static void server_params_parse(int argc, char **argv, server_params &sparams,
 	else if (arg == "--no-mul-mat-q" || arg == "-nommq")
 	{
 #ifdef GGML_USE_CUBLAS
-	    params.mul_mat_q = false;
+	    //params.mul_mat_q = false;
 #else
 	    LOG_WARNING("warning: llama.cpp was compiled without cuBLAS. Disabling mul_mat_q kernels has no effect.\n", {});
 #endif // GGML_USE_CUBLAS
@@ -1299,6 +1297,7 @@ static void server_params_parse(int argc, char **argv, server_params &sparams,
 	    LOG_WARNING("server.cpp is not built with verbose logging.", {});
 #else
 	    server_verbose = true;
+	    be_verbose = true;
 #endif
 	}
 	else if (arg == "--mlock")
@@ -1309,17 +1308,13 @@ static void server_params_parse(int argc, char **argv, server_params &sparams,
 	{
 	    params.use_mmap = false;
 	}
-	else if (arg == "--numa")
+	/*else if (arg == "--numa")
 	{
 	    params.numa = true;
-	}
+	}*/
 	else if (arg == "--embedding")
 	{
 	    params.embedding = true;
-	}
-	else if (arg == "--quiet")
-	{
-	    be_verbose = false;
 	}
 	else if (arg == "--model-path")
 	{
@@ -1731,7 +1726,7 @@ int main(int argc, char **argv)
 	llama_log_set(llama_null_log_callback, NULL);
     }
 
-    llama_backend_init(llama.params.numa);
+    llama_backend_init();
 
     LOG_INFO("system info", {
 				{"n_threads", llama.params.n_threads},
