@@ -92,3 +92,9 @@ examples/jeopardy/results.txt
 poetry.lock
 poetry.toml
 nppBackup
+
+.bzr
+funky_server*
+start_*
+merge_upstream.txt
+todo.txt
