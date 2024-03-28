@@ -3,16 +3,22 @@ name: Python check requirements.txt
 on:
   push:
     paths:
+      - '.github/workflows/python-check-requirements.yml'
       - 'scripts/check-requirements.sh'
       - 'convert*.py'
       - 'requirements.txt'
       - 'requirements/*.txt'
   pull_request:
     paths:
+      - '.github/workflows/python-check-requirements.yml'
       - 'scripts/check-requirements.sh'
       - 'convert*.py'
       - 'requirements.txt'
       - 'requirements/*.txt'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   python-check-requirements:
@@ -26,4 +32,4 @@ jobs:
         with:
           python-version: "3.11"
       - name: Run check-requirements.sh script
-        run:  bash scripts/check-requirements.sh nocleanup
+        run:  bash scripts/check-requirements.sh

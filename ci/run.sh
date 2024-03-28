@@ -40,12 +40,13 @@ if [ ! -z ${GG_BUILD_METAL} ]; then
 fi
 
 if [ ! -z ${GG_BUILD_CUDA} ]; then
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DLLAMA_CUBLAS=1"
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DLLAMA_CUDA=1"
 fi
 
 if [ ! -z ${GG_BUILD_SYCL} ]; then
     if [ -z ${ONEAPI_ROOT} ]; then
-        echo "Not detected ONEAPI_ROOT, please install oneAPI base toolkit and enable it by:\n source /opt/intel/oneapi/setvars.sh"
+        echo "Not detected ONEAPI_ROOT, please install oneAPI base toolkit and enable it by:"
+        echo "source /opt/intel/oneapi/setvars.sh"
         exit 1
     fi
 
@@ -411,8 +412,8 @@ function gg_run_open_llama_7b_v2 {
 
     set -e
 
-    (time cmake -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} -DLLAMA_CUBLAS=1 .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
-    (time make -j                                                             ) 2>&1 | tee -a $OUT/${ci}-make.log
+    (time cmake -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} -DLLAMA_CUDA=1 .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
+    (time make -j                                                           ) 2>&1 | tee -a $OUT/${ci}-make.log
 
     python3 ../convert.py ${path_models}
 
