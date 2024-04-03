@@ -33,7 +33,11 @@ void longest_common_part(
   int *i_p,
   int *j_p
 ) {
-    int dp[2][m + 1];
+    #ifdef __STDC_NO_VLA__
+      int dp[2][16385];
+    #else
+      int dp[2][m + 1];
+    #endif
     int len = 0;
     int best_i = 0;
     int best_j = 0;
