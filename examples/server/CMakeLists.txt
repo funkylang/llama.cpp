@@ -28,6 +28,7 @@ option(LLAMA_SERVER_SSL "Build SSL support for the server" OFF)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 add_executable(${TARGET}
     funky_server.cpp
+    funky_helper.c
     utils.hpp
     httplib.h
 )

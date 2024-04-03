@@ -21,6 +21,14 @@
 #define SERVER_VERBOSE 1
 #endif
 
+extern "C" void longest_common_part(
+  llama_token *s, int n,
+  llama_token *t, int m,
+  int *len_p,
+  int *i_p,
+  int *j_p
+);
+
 using namespace httplib;
 using json = nlohmann::json;
 
@@ -571,41 +579,6 @@ struct llama_server_context
 				       });
 
 	has_next_token = true;
-    }
-
-    void longest_common_part(
-      // original code by "rajsanghavi9"
-      // (https://www.geeksforgeeks.org/longest-common-substring-dp-29/)
-      llama_token *s, int n,
-      llama_token *t, int m,
-      int *len_p,
-      int *i_p,
-      int *j_p
-    ) {
-	int dp[2][m + 1];
-	int len = 0;
-	int best_i = 0;
-	int best_j = 0;
-
-	memset(dp, 0, sizeof(dp)); // this is necessary!
-	for (int i = 1; i <= n; ++i) {
-	    for (int j = 1; j <= m; ++j) {
-		if (s[i - 1] == t[j - 1]) {
-		    int new_len = dp[(i - 1) % 2][j - 1] + 1;
-		    dp[i % 2][j] = new_len;
-		    if (new_len > len) {
-			len = new_len;
-			best_i = i;
-			best_j = j;
-		    }
-		}
-		else
-		    dp[i % 2][j] = 0;
-	    }
-	}
-	*len_p = len;
-	*i_p = best_i-len;
-	*j_p = best_j-len;
     }
 
     void loadPrompt(
