@@ -7,7 +7,7 @@
 #endif
 
 #include "httplib.h"
-#include "json.hpp"
+#include "old_json.hpp"
 
 // auto generated files (update with ./deps.sh)
 #include "index.html.hpp"
@@ -2129,6 +2129,8 @@ int main(int argc, char **argv)
 	     {
 	auto lock = llama.lock();
 	const json body = json::parse(req.body);
+	std::string uuid = body.count("uuid") ? body["uuid"] : "";
+	fprintf(stderr, "client uuid %s\n", uuid.c_str());
 	maybe_change_model(llama, body);
 	if (llama.do_print_newline) {
 	  fprintf(stderr, "\n");
@@ -2159,6 +2161,8 @@ int main(int argc, char **argv)
 	auto lock = llama.lock();
 
 	const json body = json::parse(req.body);
+	std::string uuid = body.count("uuid") ? body["uuid"] : "";
+	fprintf(stderr, "client uuid %s\n", uuid.c_str());
 	maybe_change_model(llama, body);
 	std::string content;
 	if (body.count("tokens") != 0)
@@ -2174,6 +2178,8 @@ int main(int argc, char **argv)
 	     {
 	auto lock = llama.lock();
 	const json body = json::parse(req.body);
+	std::string uuid = body.count("uuid") ? body["uuid"] : "";
+	fprintf(stderr, "client uuid %s\n", uuid.c_str());
 	maybe_change_model(llama, body);
 	if (llama.do_print_newline) {
 	  fprintf(stderr, "\n");

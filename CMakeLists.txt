@@ -128,6 +128,7 @@ set(LLAMA_SCHED_MAX_COPIES  "4" CACHE STRING "llama: max input copies for pipeli
 option(LLAMA_BUILD_TESTS                     "llama: build tests"    ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_EXAMPLES                  "llama: build examples" ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_SERVER                    "llama: build server example"                      ON)
+option(LLAMA_BUILD_FUNKY_SERVER              "llama: build server example"                      ON)
 
 # add perf arguments
 option(LLAMA_PERF                            "llama: enable perf"                               OFF)
