@@ -1,5 +1,6 @@
 #include "common.h"
 #include "llama.h"
+#include <sys/sysinfo.h>
 
 #ifndef NDEBUG
 // crash the server in debug mode, otherwise send an http 500 error
@@ -16,6 +17,24 @@
 #include "json-schema-to-grammar.mjs.hpp"
 
 #include <cstddef>
+
+#ifdef GGML_USE_CUDA
+  struct ggml_cuda_device_info {
+      int device_count;
+
+      struct cuda_device_info {
+	  int     cc;                 // compute capability
+	  size_t  smpb;               // max. shared memory per block
+	  bool    vmm;                // virtual memory support
+	  size_t  vmm_granularity;    // granularity of virtual memory
+	  size_t  total_vram;
+      };
+
+      cuda_device_info devices[16];
+  };
+
+  const ggml_cuda_device_info & ggml_cuda_info();
+#endif
 
 #ifndef SERVER_VERBOSE
 #define SERVER_VERBOSE 1
@@ -349,7 +368,52 @@ static bool server_verbose = false;
 #define LOG_INFO(MSG, ...) server_log("INFO", __func__, __LINE__, MSG, __VA_ARGS__)
 
 static bool be_verbose = false;
+bool do_print_newline = false;
+static bool never_do_shutdown = true;
+bool do_shutdown = false;
+static bool do_test_hardware = false;
 static std::string model_path = "/var/models";
+
+static std::set<std::string> registered_clients;
+
+static void register_client(const char *uuid) {
+  if (*uuid) {
+    if (registered_clients.find(uuid) == registered_clients.end()) {
+      if (do_print_newline) {
+	fprintf(stderr, "\n");
+	do_print_newline = false;
+      }
+      fprintf(stderr, "registering new client with uuid %s\n", uuid);
+      registered_clients.insert(uuid);
+    }
+  }
+}
+
+static void register_client(const json &body) {
+  std::string uuid = body.count("uuid") ? body["uuid"] : "";
+  register_client(uuid.c_str());
+}
+
+static void deregister_client(const json &body) {
+  std::string uuid = body.count("uuid") ? body["uuid"] : "";
+  if (do_print_newline) {
+    fprintf(stderr, "\n");
+    do_print_newline = false;
+  }
+  if (uuid != "") {
+    if (registered_clients.find(uuid) != registered_clients.end()) {
+      fprintf(stderr, "deregistering client with uuid %s\n", uuid.c_str());
+      registered_clients.erase(uuid);
+      fprintf(stderr, "clients remaining: %ld\n", registered_clients.size());
+      if (!never_do_shutdown && registered_clients.size() == 0)
+	do_shutdown = true;
+    } else {
+      fprintf(stderr, "DEREGISTER FAILED - %s IS NOT REGISTERED!\n", uuid.c_str());
+    }
+  } else {
+    fprintf(stderr, "DEREGISTER FAILED - NO UUID SUPPLIED!\n");
+  }
+}
 
 struct llama_server_context
 {
@@ -380,7 +444,6 @@ struct llama_server_context
     bool stopped_eos = false;
     bool stopped_word = false;
     bool stopped_limit = false;
-    bool do_print_newline = false;
     std::string stopping_word;
     int32_t multibyte_pending = 0;
 
@@ -997,6 +1060,8 @@ static void server_print_usage(const char *argv0, const gpt_params &params,
     printf("options:\n");
     printf("  -h, --help                show this help message and exit\n");
     printf("  -v, --verbose             verbose output (default: %s)\n", server_verbose ? "enabled" : "disabled");
+    printf("  --test-hardware           text hardware and exit\n");
+    printf("  --uuid                    specify a client UUID\n");
     printf("  -t N,  --threads N        number of threads to use during computation (default: %d)\n", params.n_threads);
     printf("  -tb N, --threads-batch N  number of threads to use during batch and prompt processing (default: same as --threads)\n");
     printf("  -c N,  --ctx-size N       size of the prompt context (default: %d)\n", params.n_ctx);
@@ -1013,6 +1078,7 @@ static void server_print_usage(const char *argv0, const gpt_params &params,
 	printf("  --no-mmap             do not memory-map model (slower load but may reduce pageouts if not using mlock)\n");
     }*/
     printf("  --numa                attempt optimizations that help on some NUMA systems\n");
+    printf("  --model-path PATH      path to folder containing model files (default: %s\n", model_path.c_str());
     if (llama_supports_gpu_offload()) {
       printf("  -ngl N, --n-gpu-layers N\n");
       printf("                        number of layers to store in VRAM\n");
@@ -1272,6 +1338,20 @@ static void server_params_parse(int argc, char **argv, server_params &sparams,
 	    server_verbose = true;
 	    be_verbose = true;
 #endif
+	}
+	else if (arg == "--test-hardware")
+	{
+	  do_test_hardware = true;
+	}
+	else if (arg == "--uuid")
+	{
+	    if (++i >= argc)
+	    {
+		invalid_param = true;
+		break;
+	    }
+	    never_do_shutdown = false;
+	    register_client(argv[i]);
 	}
 	else if (arg == "--mlock")
 	{
@@ -1649,6 +1729,19 @@ static void llama_null_log_callback(
   (void)user_data;
 }
 
+static void discard_model(llama_server_context &llama) {
+  if (llama.model) {
+    // discard current model and context
+    if (do_print_newline) {
+      fprintf(stderr, "\n");
+      do_print_newline = false;
+    }
+    fprintf(stderr, "free %s\n", llama.params.model.c_str());
+    llama_free(llama.ctx);
+    llama_free_model(llama.model);
+  }
+}
+
 static void maybe_change_model(llama_server_context &llama, const json &body)
 {
     if (body.count("model") != 0) { // model was specified in request
@@ -1656,20 +1749,11 @@ static void maybe_change_model(llama_server_context &llama, const json &body)
 	model_name = model_path + "/" + model_name;
 	if (model_name != llama.params.model) {
 	    // we need another model
-	    if (llama.model) {
-		// discard current model and context
-		if (llama.do_print_newline) {
-		  fprintf(stderr, "\n");
-		  llama.do_print_newline = false;
-		}
-		fprintf(stderr, "free %s\n", llama.params.model.c_str());
-		llama_free(llama.ctx);
-		llama_free_model(llama.model);
-	    }
+	    discard_model(llama);
 	    // load the new model
-	    if (llama.do_print_newline) {
+	    if (do_print_newline) {
 	      fprintf(stderr, "\n");
-	      llama.do_print_newline = false;
+	      do_print_newline = false;
 	    }
 	    fprintf(stderr, "load %s\n", model_name.c_str());
 	    llama.params.model = model_name;
@@ -1699,20 +1783,45 @@ int main(int argc, char **argv)
 	llama_log_set(llama_null_log_callback, NULL);
     }
 
+    if (do_test_hardware) {
+	__builtin_cpu_init();
+	bool has_avx = __builtin_cpu_supports("avx");
+	bool has_avx2 = __builtin_cpu_supports("avx2");
+	bool has_avx512 = __builtin_cpu_supports("avx512f");
+	printf(
+	    "avx:  %s\n"
+	    "avx2: %s\n"
+	    "avx512: %s\n",
+	    has_avx ? "yes" : "no",
+	    has_avx2 ? "yes" : "no",
+	    has_avx512 ? "yes" : "no"
+	);
+	struct sysinfo info;
+	if (sysinfo(&info) == 0) {
+	  printf("ram: %lu\n", info.totalram);
+	}
+	#if defined(GGML_USE_HIPBLAS)
+	  printf("gpu: amd\n");
+	#elif defined(GGML_USE_CUDA)
+	  printf("gpu: nvidia\n");
+	#endif
+	#ifdef GGML_USE_CUDA
+	  const ggml_cuda_device_info &cuda_info = ggml_cuda_info();
+	  if (cuda_info.device_count >= 1) {
+	    printf("vram: %lu\n", cuda_info.devices[0].total_vram);
+	  }
+	#endif
+	exit(EXIT_SUCCESS);
+    }
+
     llama_backend_init();
 
-    LOG_INFO("system info", {
+    /*LOG_INFO("system info", {
 				{"n_threads", llama.params.n_threads},
 				{"n_threads_batch", llama.params.n_threads_batch},
 				{"total_threads", std::thread::hardware_concurrency()},
 				{"system_info", llama_print_system_info()},
-			    });
-
-    // load the model
-    /*if (!llama.load_model(params))
-    {
-	return 1;
-    }*/
+			    });*/
 
     Server svr;
 
@@ -1750,6 +1859,7 @@ int main(int argc, char **argv)
 
 	llama_reset_timings(llama.ctx);
 	const json body = json::parse(req.body);
+	register_client(body);
 	maybe_change_model(llama, body);
 	//llama.rewind();
 	llama.generated_token_probs.clear();
@@ -1778,7 +1888,7 @@ int main(int argc, char **argv)
 	}
 	llama.beginCompletion();
 
-	/*if (!llama.do_print_newline) { // first completion
+	/*if (!do_print_newline) { // first completion
 	    fprintf(stderr,
 	      "stream = %d\n"
 	      "has_next_token = %d\n"
@@ -1819,7 +1929,7 @@ int main(int argc, char **argv)
 	}*/
 
 	fprintf(stderr, ".");
-	llama.do_print_newline = true;
+	do_print_newline = true;
 	if (!llama.stream) {
 	    if (llama.params.n_beams) {
 		// Fill llama.generated_token_probs vector with final beam.
@@ -2098,16 +2208,32 @@ int main(int argc, char **argv)
     svr.Options(R"(/.*)", [](const Request &, Response &res)
 		{ return res.set_content("", "application/json"); });
 
+    svr.Post("/deregister", [&llama](const Request &req, Response &res)
+	     {
+	auto lock = llama.lock();
+	const json body = json::parse(req.body);
+	deregister_client(body);
+	if (do_shutdown) {
+	  fprintf(stderr, "shutdown\n");
+	  discard_model(llama);
+	  llama_backend_free();
+	  exit(EXIT_SUCCESS);
+	}
+	const json data =
+	  json{
+	    {"unregistered", true},
+	  };
+	return res.set_content(data.dump(), "application/json");
+      });
     svr.Post("/tokenize", [&llama](const Request &req, Response &res)
 	     {
 	auto lock = llama.lock();
 	const json body = json::parse(req.body);
-	std::string uuid = body.count("uuid") ? body["uuid"] : "";
-	fprintf(stderr, "client uuid %s\n", uuid.c_str());
+	register_client(body);
 	maybe_change_model(llama, body);
-	if (llama.do_print_newline) {
+	if (do_print_newline) {
 	  fprintf(stderr, "\n");
-	  llama.do_print_newline = false;
+	  do_print_newline = false;
 	}
 	fprintf(stderr, "tokenize\n");
 	std::vector<llama_token> tokens;
@@ -2134,8 +2260,7 @@ int main(int argc, char **argv)
 	auto lock = llama.lock();
 
 	const json body = json::parse(req.body);
-	std::string uuid = body.count("uuid") ? body["uuid"] : "";
-	fprintf(stderr, "client uuid %s\n", uuid.c_str());
+	register_client(body);
 	maybe_change_model(llama, body);
 	std::string content;
 	if (body.count("tokens") != 0)
@@ -2151,12 +2276,11 @@ int main(int argc, char **argv)
 	     {
 	auto lock = llama.lock();
 	const json body = json::parse(req.body);
-	std::string uuid = body.count("uuid") ? body["uuid"] : "";
-	fprintf(stderr, "client uuid %s\n", uuid.c_str());
+	register_client(body);
 	maybe_change_model(llama, body);
-	if (llama.do_print_newline) {
+	if (do_print_newline) {
 	  fprintf(stderr, "\n");
-	  llama.do_print_newline = false;
+	  do_print_newline = false;
 	}
 	fprintf(stderr, "get_tokens\n");
 	json tokens = json::array();
@@ -2283,12 +2407,14 @@ int main(int argc, char **argv)
     svr.set_base_dir(sparams.public_path);
 
     // to make it ctrl+clickable:
-    printf("\nllama server listening at http://%s:%d\n\n", sparams.hostname.c_str(), sparams.port);
+    fprintf(stderr,
+      "funky server listening at http://%s:%d\n",
+      sparams.hostname.c_str(), sparams.port);
 
-    LOG_INFO("HTTP server listening", {
+    /*LOG_INFO("HTTP server listening", {
 					  {"hostname", sparams.hostname},
 					  {"port", sparams.port},
-				      });
+				      });*/
 
     if (!svr.listen_after_bind())
     {

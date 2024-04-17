@@ -133,6 +133,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
         info.default_tensor_split[id] = total_vram;
         total_vram += prop.totalGlobalMem;
+        info.devices[id].total_vram = prop.totalGlobalMem;
 
 #if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
         info.devices[id].cc = 100*prop.major + 10*prop.minor + CC_OFFSET_AMD;
