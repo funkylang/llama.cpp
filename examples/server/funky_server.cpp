@@ -1,6 +1,8 @@
 #include "common.h"
 #include "llama.h"
-#include <sys/sysinfo.h>
+#ifndef _WIN32
+  #include <sys/sysinfo.h>
+#endif
 
 #ifndef NDEBUG
 // crash the server in debug mode, otherwise send an http 500 error
@@ -1796,10 +1798,12 @@ int main(int argc, char **argv)
 	    has_avx2 ? "yes" : "no",
 	    has_avx512 ? "yes" : "no"
 	);
-	struct sysinfo info;
-	if (sysinfo(&info) == 0) {
-	  printf("ram: %lu\n", info.totalram);
-	}
+	#ifndef _WIN32
+	  struct sysinfo info;
+	  if (sysinfo(&info) == 0) {
+	    printf("ram: %lu\n", info.totalram);
+	  }
+	#endif
 	#if defined(GGML_USE_HIPBLAS)
 	  printf("gpu: amd\n");
 	#elif defined(GGML_USE_CUDA)
