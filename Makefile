@@ -279,25 +279,20 @@ endif
 ifndef RISCV
 
 ifeq ($(UNAME_M),$(filter $(UNAME_M),x86_64 i686 amd64))
-	# Use all CPU extensions that are available:
-	#MK_CFLAGS     += -march=native -mtune=native
-	#HOST_CXXFLAGS += -march=native -mtune=native
-
-	# Usage AVX-only
-	#MK_CFLAGS += -mfma -mf16c -mavx
-	#MK_CXXFLAGS += -mfma -mf16c -mavx
-
-	# Usage AVX2
-	MK_CFLAGS += -mfma -mf16c -mavx2
-	MK_CXXFLAGS += -mfma -mf16c -mavx2
-
-	# Usage AVX512
-	#MK_CFLAGS   += -mfma -mf16c -mavx512f -mavx512ifma -mavx512vnni -mavx512vl -mavx512bf16
-	#MK_CXXFLAGS   += -mfma -mf16c -mavx512f -mavx512ifma -mavx512vnni -mavx512vl -mavx512bf16
-
-	# Usage SSSE3-only (Not is SSE3!)
-	#MK_CFLAGS   += -mssse3
-	#MK_CXXFLAGS += -mssse3
+	ifdef LLAMA_AVX512
+		MK_CFLAGS   += -mfma -mf16c -mavx512f -mavx512ifma -mavx512vnni -mavx512vl -mavx512bf16
+		MK_CXXFLAGS   += -mfma -mf16c -mavx512f -mavx512ifma -mavx512vnni -mavx512vl -mavx512bf16
+	else ifdef LLAMA_AVX2
+		MK_CFLAGS += -mfma -mf16c -mavx2
+		MK_CXXFLAGS += -mfma -mf16c -mavx2
+	else ifdef LLAMA_AVX
+		MK_CFLAGS += -mfma -mf16c -mavx
+		MK_CXXFLAGS += -mfma -mf16c -mavx
+	else
+		# Use all CPU extensions that are available:
+		MK_CFLAGS     += -march=native -mtune=native
+		HOST_CXXFLAGS += -march=native -mtune=native
+	endif
 endif
 
 ifneq '' '$(findstring mingw,$(shell $(CC) -dumpmachine))'
