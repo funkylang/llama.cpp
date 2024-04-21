@@ -90,6 +90,8 @@ enum llm_arch {
 
 struct hparams {
   bool vocab_only;
+  bool rope_finetuned;
+
   uint32_t n_vocab;
   uint32_t n_ctx_train; // context size the model was trained on
   uint32_t n_embd;
@@ -97,16 +99,12 @@ struct hparams {
   uint32_t n_head_kv;
   uint32_t n_layer;
   uint32_t n_rot;
+  uint32_t n_embd_head_k; // dimension of keys (d_k). d_q is assumed to be the same, but
+  uint32_t n_embd_head_v; // dimension of values (d_v) aka n_embd_head
   uint32_t n_ff;
-
-  float f_norm_eps;
-  float f_norm_rms_eps;
-
-  float rope_freq_base_train;
-  float rope_freq_scale_train;
-
-  float f_clamp_kqv;
-  float f_max_alibi_bias;
+  uint32_t n_expert = 0;
+  uint32_t n_expert_used = 0;
+  uint32_t n_vocab_type = 0; // for BERT-style token types
 };
 
 struct llama_model_header {
@@ -118,6 +116,17 @@ struct llama_model_header {
   hparams params;
 };
 
+extern size_t model_file_size;
+extern int tensor_count;
+
+static bool be_verbose = false;
+bool do_print_newline = false;
+static bool never_do_shutdown = true;
+bool do_shutdown = false;
+static bool do_test_hardware = false;
+static std::string model_path = "/var/models";
+static size_t total_vram = 0;
+
 //////////
 
 // modified versions of "common" functions
@@ -127,21 +136,59 @@ static std::tuple<struct llama_model *, struct llama_context *>
 our_llama_init_from_gpt_params(gpt_params & params) {
   auto mparams = llama_model_params_from_gpt_params(params);
 
-  llama_model * model  = llama_load_model_from_file(params.model.c_str(), mparams);
+  mparams.vocab_only = true;
+  llama_model *model =
+    llama_load_model_from_file(params.model.c_str(), mparams);
   if (model == NULL) {
+    load_failed:
     fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, params.model.c_str());
     return std::make_tuple(nullptr, nullptr);
   }
-
+  unsigned int model_context_size =
+    ((struct llama_model_header *)model)->params.n_ctx_train;
+  unsigned int max_context_size = params.n_ctx;
   unsigned int context_size =
-  ((struct llama_model_header *)model)->params.n_ctx_train;
+    model_context_size > max_context_size ?
+    max_context_size :
+    model_context_size;
   unsigned int layer_count =
-  ((struct llama_model_header *)model)->params.n_layer;
+    ((struct llama_model_header *)model)->params.n_layer;
+  unsigned int expert_count =
+    ((struct llama_model_header *)model)->params.n_expert;
   unsigned int embeddings_count =
-  ((struct llama_model_header *)model)->params.n_embd;
-  fprintf(stderr, "context size: %d\n", context_size);
-  fprintf(stderr, "layers: %d\n", layer_count);
-  fprintf(stderr, "embeddings: %d\n", embeddings_count);
+    ((struct llama_model_header *)model)->params.n_embd;
+  unsigned int vocab_size =
+    ((struct llama_model_header *)model)->params.n_vocab;
+  size_t tensor_overhead = ggml_tensor_overhead();
+  size_t context_element_size =
+    tensor_overhead*(tensor_count+1+expert_count*layer_count);
+  size_t context_buffer_size = context_size*context_element_size;
+  size_t layer_size = model_file_size/layer_count;
+  size_t threshold = 1500000000;
+  unsigned int gpu_layer_count =
+    (total_vram-threshold-context_buffer_size)/layer_size;
+  if (gpu_layer_count > layer_count+1) gpu_layer_count = layer_count+1;
+  fprintf(stderr, "vram: %lu\n", total_vram);
+  fprintf(stderr, "model file size: %lu\n", model_file_size);
+  fprintf(stderr, "model context size: %u\n", model_context_size);
+  fprintf(stderr, "maximum context size: %u\n", max_context_size);
+  fprintf(stderr, "effective context size: %u\n", context_size);
+  fprintf(stderr, "layers: %u\n", layer_count);
+  fprintf(stderr, "experts: %u\n", expert_count);
+  fprintf(stderr, "tensors: %u\n", tensor_count);
+  fprintf(stderr, "embeddings: %u\n", embeddings_count);
+  fprintf(stderr, "vocabulary: %u\n", vocab_size);
+  fprintf(stderr, "overhead per tensor: %lu\n", tensor_overhead);
+  fprintf(stderr, "context element size: %lu\n", context_element_size);
+  fprintf(stderr, "context buffer size: %lu\n", context_buffer_size);
+  fprintf(stderr, "gpu layers: %u\n", gpu_layer_count);
+  llama_free_model(model);
+
+  mparams.n_gpu_layers = gpu_layer_count;
+  mparams.vocab_only = false;
+  model = llama_load_model_from_file(params.model.c_str(), mparams);
+  if (model == NULL) goto load_failed;
+
   auto cparams = llama_context_params_from_gpt_params(params);
   if (cparams.n_ctx > context_size) cparams.n_ctx = context_size;
   // do not set a context size greater than the model's trained context size
@@ -369,13 +416,6 @@ static bool server_verbose = false;
 #define LOG_ERROR(MSG, ...) server_log("ERROR", __func__, __LINE__, MSG, __VA_ARGS__)
 #define LOG_WARNING(MSG, ...) server_log("WARNING", __func__, __LINE__, MSG, __VA_ARGS__)
 #define LOG_INFO(MSG, ...) server_log("INFO", __func__, __LINE__, MSG, __VA_ARGS__)
-
-static bool be_verbose = false;
-bool do_print_newline = false;
-static bool never_do_shutdown = true;
-bool do_shutdown = false;
-static bool do_test_hardware = false;
-static std::string model_path = "/var/models";
 
 static std::set<std::string> registered_clients;
 
@@ -1811,12 +1851,18 @@ int main(int argc, char **argv)
     #elif defined(GGML_USE_CUDA)
       printf("gpu: nvidia\n");
     #endif
-    #ifdef GGML_USE_CUDA
-      const ggml_cuda_device_info &cuda_info = ggml_cuda_info();
-      if (cuda_info.device_count >= 1) {
-	printf("vram: %lu\n", cuda_info.devices[0].total_vram);
-      }
-    #endif
+  }
+
+  #ifdef GGML_USE_CUDA
+    const ggml_cuda_device_info &cuda_info = ggml_cuda_info();
+    if (cuda_info.device_count >= 1) {
+      total_vram =  cuda_info.devices[0].total_vram;
+    }
+  #endif
+  if (do_test_hardware) {
+    if (total_vram) {
+      printf("vram: %lu\n", total_vram);
+    }
     exit(EXIT_SUCCESS);
   }
 

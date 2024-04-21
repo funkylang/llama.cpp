@@ -2941,6 +2941,30 @@ namespace GGUFMeta {
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
+struct gguf_header {
+    char magic[4];
+
+    uint32_t version;
+    uint64_t n_tensors; // GGUFv2
+    uint64_t n_kv;      // GGUFv2
+};
+
+struct gguf_context {
+    struct gguf_header header;
+
+    struct gguf_kv          * kv;
+    struct gguf_tensor_info * infos;
+
+    size_t alignment;
+    size_t offset;    // offset of `data` from beginning of file
+    size_t size;      // size of `data` in bytes
+
+    void * data;
+};
+
+size_t model_file_size;
+int tensor_count;
+
 struct llama_model_loader {
     int n_kv      = 0;
     int n_tensors = 0;
@@ -3001,6 +3025,7 @@ struct llama_model_loader {
         if (!meta) {
             throw std::runtime_error(format("%s: failed to load model from %s\n", __func__, fname.c_str()));
         }
+        model_file_size = meta->size;
 
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
@@ -3046,6 +3071,7 @@ struct llama_model_loader {
                 if (!ctx_gguf) {
                     throw std::runtime_error(format("%s: failed to load GGUF split from %s\n", __func__, split_path));
                 }
+                model_file_size += ctx_gguf->size;
 
                 // Save tensors data offset info of the shard.
                 for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
@@ -3072,6 +3098,7 @@ struct llama_model_loader {
 
         n_kv      = gguf_get_n_kv(meta);
         n_tensors = weights.size();
+        tensor_count = n_tensors;
 
         fver = (enum llama_fver) gguf_get_version(meta);
 
