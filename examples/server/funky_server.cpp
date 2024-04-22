@@ -16,10 +16,12 @@
 #include "index.html.hpp"
 #include "index.js.hpp"
 #include "completion.js.hpp"
-#include "json-schema-to-grammar.mjs.hpp"
+//#include "json-schema-to-grammar.mjs.hpp"
 
 #include <cstddef>
-#include <dirent.h>
+#ifndef _WIN32
+  #include <dirent.h>
+#endif
 
 #ifdef GGML_USE_CUDA
   struct ggml_cuda_device_info {
@@ -1905,11 +1907,6 @@ int main(int argc, char **argv)
   });
 
   // this is only called if no index.html is found in the public --path
-  svr.Get("/json-schema-to-grammar.mjs", [](const Request &, Response &res)
-  {
-    res.set_content(reinterpret_cast<const char*>(&json_schema_to_grammar_mjs), json_schema_to_grammar_mjs_len, "application/javascript");
-    return false;
-  });
 
   svr.Post("/completion", [&llama](const Request &req, Response &res)
   {
@@ -2150,16 +2147,18 @@ int main(int argc, char **argv)
 
     // return a list of all model files in <model_path>
     std::vector<std::string> model_files;
-    DIR *dir = opendir(model_path.c_str());
-    if (dir) {
-      struct dirent *ent;
-      while ((ent = readdir(dir)) != NULL) {
-	if (ent->d_type == DT_REG) {
-	  model_files.push_back(ent->d_name);
+    #ifndef _WIN32
+      DIR *dir = opendir(model_path.c_str());
+      if (dir) {
+	struct dirent *ent;
+	while ((ent = readdir(dir)) != NULL) {
+	  if (ent->d_type == DT_REG) {
+	    model_files.push_back(ent->d_name);
+	  }
 	}
+	closedir(dir);
       }
-      closedir(dir);
-    }
+    #endif
     const json data =
       json{
 	{"models", model_files},
