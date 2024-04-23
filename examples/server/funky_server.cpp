@@ -1086,331 +1086,95 @@ struct llama_server_context
   }
 };
 
-static void server_print_usage(const char *argv0, const gpt_params &params,
-const server_params &sparams)
-{
+static void server_print_usage(
+  const char *argv0,
+  const gpt_params &params,
+  const server_params &sparams
+) {
   printf("usage: %s [options]\n", argv0);
   printf("\n");
   printf("options:\n");
-  printf("  -h, --help                show this help message and exit\n");
-  printf("  -v, --verbose             verbose output (default: %s)\n", server_verbose ? "enabled" : "disabled");
-  printf("  --test-hardware           text hardware and exit\n");
-  printf("  --uuid                    specify a client UUID\n");
-  printf("  -t N,  --threads N        number of threads to use during computation (default: %d)\n", params.n_threads);
-  printf("  -tb N, --threads-batch N  number of threads to use during batch and prompt processing (default: same as --threads)\n");
-  printf("  -c N,  --ctx-size N       size of the prompt context (default: %d)\n", params.n_ctx);
-  printf("  --rope-freq-base N        RoPE base frequency (default: loaded from model)\n");
-  printf("  --rope-freq-scale N       RoPE frequency scaling factor (default: loaded from model)\n");
-  printf("  -b N,  --batch-size N     batch size for prompt processing (default: %d)\n", params.n_batch);
-  printf("                            not recommended: doubles context memory required and no measurable increase in quality\n");
-  /*if (llama_mlock_supported())
-  {
-    printf("  --mlock               force system to keep model in RAM rather than swapping or compressing\n");
-  }
-  if (llama_mmap_supported())
-  {
-    printf("  --no-mmap             do not memory-map model (slower load but may reduce pageouts if not using mlock)\n");
-  }*/
-  printf("  --numa                attempt optimizations that help on some NUMA systems\n");
-  printf("  --model-path PATH      path to folder containing model files (default: %s\n", model_path.c_str());
-  if (llama_supports_gpu_offload()) {
-    printf("  -ts SPLIT --tensor-split SPLIT\n");
-    printf("                        how to split tensors across multiple GPUs, comma-separated list of proportions, e.g. 3,1\n");
-    printf("  -mg i, --main-gpu i   the GPU to use for scratch and small tensors\n");
-    printf("  -nommq, --no-mul-mat-q\n");
-    printf("                        use cuBLAS instead of custom mul_mat_q CUDA kernels.\n");
-    printf("                        Not recommended since this is both slower and uses more VRAM.\n");
-  }
-  printf("  -m FNAME, --model FNAME\n");
-  printf("                        model path (default: %s)\n", params.model.c_str());
-  printf("  -a ALIAS, --alias ALIAS\n");
-  printf("                        set an alias for the model, will be added as `model` field in completion response\n");
-  printf("  --lora FNAME          apply LoRA adapter (implies --no-mmap)\n");
-  printf("  --lora-base FNAME     optional model to use as a base for the layers modified by the LoRA adapter\n");
-  printf("  --host                ip address to listen (default  (default: %s)\n", sparams.hostname.c_str());
-  printf("  --port PORT           port to listen (default  (default: %d)\n", sparams.port);
-  printf("  --path PUBLIC_PATH    path from which to serve static files (default %s)\n", sparams.public_path.c_str());
-  printf("  -to N, --timeout N    server read/write timeout in seconds (default: %d)\n", sparams.read_timeout);
-  printf("  --embedding           enable embedding vector output (default: %s)\n", params.embedding ? "enabled" : "disabled");
+  printf("  --help               show this help message and exit\n");
+  printf("  --verbose            verbose output (default: %s)\n", server_verbose ? "enabled" : "disabled");
+  printf("  --test-hardware      text hardware and exit\n");
+  printf("  --uuid UUID          specify a client UUID\n");
+  printf("  --context-size N     size of the prompt context (default: %d)\n", params.n_ctx);
+  printf("  --batch-size N       batch size for prompt processing (default: %d)\n", params.n_batch);
+  printf("  --model-path PATH    path to folder containing model files (default: %s\n", model_path.c_str());
+  printf("  --host ADDRESS       ip address to listen (default  (default: %s)\n", sparams.hostname.c_str());
+  printf("  --port PORT          port to listen (default  (default: %d)\n", sparams.port);
   printf("\n");
 }
 
-static void server_params_parse(int argc, char **argv, server_params &sparams,
-gpt_params &params)
-{
-  gpt_params default_params;
-  server_params default_sparams;
+static void server_params_parse(
+  int argc, char **argv, server_params &sparams, gpt_params &params
+) {
   std::string arg;
   bool invalid_param = false;
 
-  for (int i = 1; i < argc; i++)
+  for (int i = 1; i < argc; ++i)
   {
     arg = argv[i];
-    if (arg == "--port")
-    {
-      if (++i >= argc)
-      {
+    fprintf(stderr, "arg[%d] = %s\n", i, argv[i]);
+    if (arg == "--port") {
+      if (++i >= argc) {
 	invalid_param = true;
 	break;
       }
       sparams.port = std::stoi(argv[i]);
-    }
-    else if (arg == "--host")
-    {
-      if (++i >= argc)
-      {
+    } else if (arg == "--host") {
+      if (++i >= argc) {
 	invalid_param = true;
 	break;
       }
       sparams.hostname = argv[i];
-    }
-    else if (arg == "--path")
-    {
-      if (++i >= argc)
-      {
-	invalid_param = true;
-	break;
-      }
-      sparams.public_path = argv[i];
-    }
-    else if (arg == "--timeout" || arg == "-to")
-    {
-      if (++i >= argc)
-      {
-	invalid_param = true;
-	break;
-      }
-      sparams.read_timeout = std::stoi(argv[i]);
-      sparams.write_timeout = std::stoi(argv[i]);
-    }
-    /*else if (arg == "-m" || arg == "--model")
-    {
-      if (++i >= argc)
-      {
-	invalid_param = true;
-	break;
-      }
-      params.model = argv[i];
-    }*/
-    else if (arg == "-a" || arg == "--alias")
-    {
-      if (++i >= argc)
-      {
-	invalid_param = true;
-	break;
-      }
-      params.model_alias = argv[i];
-    }
-    else if (arg == "-h" || arg == "--help")
-    {
-      server_print_usage(argv[0], default_params, default_sparams);
-      exit(0);
-    }
-    else if (arg == "-c" || arg == "--ctx-size" || arg == "--ctx_size")
-    {
-      if (++i >= argc)
-      {
+    } else if (arg == "--help") {
+      server_print_usage(argv[0], params, sparams);
+      exit(EXIT_SUCCESS);
+    } else if (arg == "--context-size") {
+      if (++i >= argc) {
 	invalid_param = true;
 	break;
       }
       params.n_ctx = std::stoi(argv[i]);
-    }
-    else if (arg == "--rope-freq-base")
-    {
-      if (++i >= argc)
-      {
-	invalid_param = true;
-	break;
-      }
-      params.rope_freq_base = std::stof(argv[i]);
-    }
-    else if (arg == "--rope-freq-scale")
-    {
-      if (++i >= argc)
-      {
-	invalid_param = true;
-	break;
-      }
-      params.rope_freq_scale = std::stof(argv[i]);
-    }
-    else if (arg == "--threads" || arg == "-t")
-    {
-      if (++i >= argc)
-      {
-	invalid_param = true;
-	break;
-      }
-      params.n_threads = std::stoi(argv[i]);
-    }
-    else if (arg == "--threads-batch" || arg == "-tb")
-    {
-      if (++i >= argc)
-      {
-	invalid_param = true;
-	break;
-      }
-      params.n_threads_batch = std::stoi(argv[i]);
-    }
-    else if (arg == "-b" || arg == "--batch-size")
-    {
-      if (++i >= argc)
-      {
+    } else if (arg == "--batch-size") {
+      if (++i >= argc) {
 	invalid_param = true;
 	break;
       }
       params.n_batch = std::stoi(argv[i]);
       params.n_batch = std::min(512, params.n_batch);
-    }
-    else if (arg == "--tensor-split" || arg == "-ts")
-    {
-      if (++i >= argc)
-      {
-	invalid_param = true;
-	break;
-      }
-      #ifdef GGML_USE_CUBLAS
-	std::string arg_next = argv[i];
-
-	// split string by , and /
-	const std::regex regex{R"([,/]+)"};
-	std::sregex_token_iterator it{arg_next.begin(), arg_next.end(), regex, -1};
-	std::vector<std::string> split_arg{it, {}};
-
-	for (size_t i_device = 0; i_device < llama_max_devices(); ++i_device)
-	{
-	  if (i_device < split_arg.size())
-	  {
-	    params.tensor_split[i_device] = std::stof(split_arg[i_device]);
-	  }
-	  else
-	  {
-	    params.tensor_split[i_device] = 0.0f;
-	  }
-	}
-      #else
-	LOG_WARNING("llama.cpp was compiled without cuBLAS. It is not possible to set a tensor split.\n", {});
-      #endif // GGML_USE_CUBLAS
-    }
-    else if (arg == "--no-mul-mat-q" || arg == "-nommq")
-    {
-      #ifdef GGML_USE_CUBLAS
-	//params.mul_mat_q = false;
-      #else
-	LOG_WARNING("warning: llama.cpp was compiled without cuBLAS. Disabling mul_mat_q kernels has no effect.\n", {});
-      #endif // GGML_USE_CUBLAS
-    }
-    else if (arg == "--main-gpu" || arg == "-mg")
-    {
-      if (++i >= argc)
-      {
-	invalid_param = true;
-	break;
-      }
-      #ifdef GGML_USE_CUBLAS
-	params.main_gpu = std::stoi(argv[i]);
-      #else
-	LOG_WARNING("llama.cpp was compiled without cuBLAS. It is not possible to set a main GPU.", {});
-      #endif
-    }
-    else if (arg == "--lora")
-    {
-      if (++i >= argc)
-      {
-	invalid_param = true;
-	break;
-      }
-      params.lora_adapter.push_back(std::make_tuple(argv[i], 1.0f));
-      params.use_mmap = false;
-    }
-    else if (arg == "--lora-scaled")
-    {
-      if (++i >= argc)
-      {
-	invalid_param = true;
-	break;
-      }
-      const char * lora_adapter = argv[i];
-      if (++i >= argc)
-      {
-	invalid_param = true;
-	break;
-      }
-      params.lora_adapter.push_back(std::make_tuple(lora_adapter, std::stof(argv[i])));
-      params.use_mmap = false;
-    }
-    else if (arg == "--lora-base")
-    {
-      if (++i >= argc)
-      {
-	invalid_param = true;
-	break;
-      }
-      params.lora_base = argv[i];
-    }
-    else if (arg == "-v" || arg == "--verbose")
-    {
-      #if SERVER_VERBOSE != 1
-	LOG_WARNING("server.cpp is not built with verbose logging.", {});
-      #else
-	server_verbose = true;
-	be_verbose = true;
-      #endif
-    }
-    else if (arg == "--test-hardware")
-    {
+    } else if (arg == "--verbose") {
+      server_verbose = true;
+      be_verbose = true;
+    } else if (arg == "--test-hardware") {
       do_test_hardware = true;
-    }
-    else if (arg == "--uuid")
-    {
-      if (++i >= argc)
-      {
+    } else if (arg == "--uuid") {
+      if (++i >= argc) {
 	invalid_param = true;
 	break;
       }
       never_do_shutdown = false;
       register_client(argv[i]);
-    }
-    else if (arg == "--mlock")
-    {
-      params.use_mlock = true;
-    }
-    else if (arg == "--no-mmap")
-    {
-      params.use_mmap = false;
-    }
-    /*else if (arg == "--numa")
-    {
-      params.numa = true;
-    }*/
-    else if (arg == "--embedding")
-    {
-      params.embedding = true;
-    }
-    else if (arg == "--model-path")
-    {
-      if (++i >= argc)
-      {
+    } else if (arg == "--model-path") {
+      if (++i >= argc) {
 	invalid_param = true;
 	break;
       }
-      if (argv[i][strlen(argv[i]) - 1] == '/')
-      {
+      if (argv[i][strlen(argv[i]) - 1] == '/') {
 	argv[i][strlen(argv[i]) - 1] = '\0';
       }
       model_path = argv[i];
-    }
-    else
-    {
+    } else {
       fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
-      server_print_usage(argv[0], default_params, default_sparams);
-      exit(1);
+      server_print_usage(argv[0], params, sparams);
+      exit(EXIT_FAILURE);
     }
   }
 
-  if (invalid_param)
-  {
+  if (invalid_param) {
     fprintf(stderr, "error: invalid parameter for argument: %s\n", arg.c_str());
-    server_print_usage(argv[0], default_params, default_sparams);
+    server_print_usage(argv[0], params, sparams);
     exit(1);
   }
 }
@@ -1787,12 +1551,14 @@ static void maybe_change_model(llama_server_context &llama, const json &body)
 
 int main(int argc, char **argv)
 {
-  // own arguments required by this example
-  //gpt_params params;
   server_params sparams;
 
   // struct that contains llama context and inference
   llama_server_context llama;
+
+  // change default values
+  llama.params.n_ctx = 4096;
+  llama.params.n_batch = 512;
 
   server_params_parse(argc, argv, sparams, llama.params);
 
