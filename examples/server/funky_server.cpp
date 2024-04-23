@@ -24,21 +24,7 @@
 #endif
 
 #ifdef GGML_USE_CUDA
-  struct ggml_cuda_device_info {
-    int device_count;
-
-    struct cuda_device_info {
-      int     cc;                 // compute capability
-      size_t  smpb;               // max. shared memory per block
-      bool    vmm;                // virtual memory support
-      size_t  vmm_granularity;    // granularity of virtual memory
-      size_t  total_vram;
-    };
-
-    cuda_device_info devices[16];
-  };
-
-  const ggml_cuda_device_info & ggml_cuda_info();
+  #include "ggml-cuda.h"
 #endif
 
 #ifndef SERVER_VERBOSE
@@ -128,6 +114,7 @@ bool do_shutdown = false;
 static bool do_test_hardware = false;
 static std::string model_path = "/var/models";
 static size_t total_vram = 0;
+static size_t free_vram = 0;
 
 //////////
 
@@ -168,9 +155,10 @@ our_llama_init_from_gpt_params(gpt_params & params) {
   size_t layer_size = model_file_size/layer_count;
   size_t threshold = 2000000000;
   unsigned int gpu_layer_count =
-    (total_vram-threshold-context_buffer_size)/layer_size;
+    (free_vram-threshold-context_buffer_size)/layer_size;
   if (gpu_layer_count > layer_count+1) gpu_layer_count = layer_count+1;
-  fprintf(stderr, "vram: %lu\n", total_vram);
+  fprintf(stderr, "total vram: %lu\n", total_vram);
+  fprintf(stderr, "free vram: %lu\n", free_vram);
   fprintf(stderr, "model file size: %lu\n", model_file_size);
   fprintf(stderr, "model context size: %u\n", model_context_size);
   fprintf(stderr, "maximum context size: %u\n", max_context_size);
@@ -1126,8 +1114,6 @@ const server_params &sparams)
   printf("  --numa                attempt optimizations that help on some NUMA systems\n");
   printf("  --model-path PATH      path to folder containing model files (default: %s\n", model_path.c_str());
   if (llama_supports_gpu_offload()) {
-    printf("  -ngl N, --n-gpu-layers N\n");
-    printf("                        number of layers to store in VRAM\n");
     printf("  -ts SPLIT --tensor-split SPLIT\n");
     printf("                        how to split tensors across multiple GPUs, comma-separated list of proportions, e.g. 3,1\n");
     printf("  -mg i, --main-gpu i   the GPU to use for scratch and small tensors\n");
@@ -1274,21 +1260,6 @@ gpt_params &params)
       }
       params.n_batch = std::stoi(argv[i]);
       params.n_batch = std::min(512, params.n_batch);
-    }
-    else if (arg == "--gpu-layers" || arg == "-ngl" || arg == "--n-gpu-layers")
-    {
-      if (++i >= argc)
-      {
-	invalid_param = true;
-	break;
-      }
-      if (llama_supports_gpu_offload()) {
-	params.n_gpu_layers = std::stoi(argv[i]);
-	} else {
-	LOG_WARNING("Not compiled with GPU offload support, --n-gpu-layers option will be ignored. "
-	"See main README.md for information on enabling GPU BLAS support",
-	{{"n_gpu_layers", params.n_gpu_layers}});
-      }
     }
     else if (arg == "--tensor-split" || arg == "-ts")
     {
@@ -1856,14 +1827,14 @@ int main(int argc, char **argv)
   }
 
   #ifdef GGML_USE_CUDA
-    const ggml_cuda_device_info &cuda_info = ggml_cuda_info();
-    if (cuda_info.device_count >= 1) {
-      total_vram =  cuda_info.devices[0].total_vram;
-    }
+    ggml_backend_cuda_get_device_memory(0, &free_vram, &total_vram);
   #endif
   if (do_test_hardware) {
     if (total_vram) {
       printf("vram: %lu\n", total_vram);
+    }
+    if (free_vram) {
+      printf("free vram: %lu\n", free_vram);
     }
     exit(EXIT_SUCCESS);
   }
