@@ -1115,7 +1115,6 @@ static void server_params_parse(
   for (int i = 1; i < argc; ++i)
   {
     arg = argv[i];
-    fprintf(stderr, "arg[%d] = %s\n", i, argv[i]);
     if (arg == "--port") {
       if (++i >= argc) {
 	invalid_param = true;

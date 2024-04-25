@@ -89,8 +89,8 @@ gcovr-report: coverage ## Generate gcovr report
 	gcovr --root . --html --html-details --output gcovr-report/coverage.html
 
 ifdef RISCV_CROSS_COMPILE
-CC	:= riscv64-unknown-linux-gnu-gcc
-CXX	:= riscv64-unknown-linux-gnu-g++
+CC      := riscv64-unknown-linux-gnu-gcc
+CXX     := riscv64-unknown-linux-gnu-g++
 endif
 
 #
@@ -434,7 +434,9 @@ endif #LLAMA_CUDA_NVCC
 ifdef CUDA_DOCKER_ARCH
 	MK_NVCCFLAGS += -Wno-deprecated-gpu-targets -arch=$(CUDA_DOCKER_ARCH)
 else ifndef CUDA_POWER_ARCH
-	MK_NVCCFLAGS += -arch=sm_86 # native
+	MK_NVCCFLAGS += -gencode=arch=compute_52,code=sm_52 -gencode=arch=compute_60,code=sm_60 \
+	-gencode=arch=compute_61,code=sm_61 -gencode=arch=compute_70,code=sm_70 \
+	-gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_75,code=compute_75
 endif # CUDA_DOCKER_ARCH
 ifdef LLAMA_CUDA_FORCE_DMMV
 	MK_NVCCFLAGS += -DGGML_CUDA_FORCE_DMMV
@@ -538,10 +540,10 @@ endif # LLAMA_VULKAN
 
 ifdef LLAMA_HIPBLAS
 	ifeq ($(wildcard /opt/rocm),)
-		ROCM_PATH	?= /usr
+		ROCM_PATH       ?= /usr
 		GPU_TARGETS ?= $(shell $(shell which amdgpu-arch))
 	else
-		ROCM_PATH	?= /opt/rocm
+		ROCM_PATH       ?= /opt/rocm
 		GPU_TARGETS ?= $(shell $(ROCM_PATH)/llvm/bin/amdgpu-arch)
 	endif
 	HIPCC                   ?= $(CCACHE) $(ROCM_PATH)/bin/hipcc
@@ -553,7 +555,7 @@ ifdef LLAMA_HIP_UMA
 	MK_CPPFLAGS += -DGGML_HIP_UMA
 endif # LLAMA_HIP_UMA
 	MK_LDFLAGS  += -L$(ROCM_PATH)/lib -Wl,-rpath=$(ROCM_PATH)/lib
-	MK_LDFLAGS	+= -lhipblas -lamdhip64 -lrocblas
+	MK_LDFLAGS      += -lhipblas -lamdhip64 -lrocblas
 	HIPFLAGS    += $(addprefix --offload-arch=,$(GPU_TARGETS))
 	HIPFLAGS    += -DGGML_CUDA_DMMV_X=$(LLAMA_CUDA_DMMV_X)
 	HIPFLAGS    += -DGGML_CUDA_MMV_Y=$(LLAMA_CUDA_MMV_Y)
@@ -563,10 +565,10 @@ endif # LLAMA_HIP_UMA
 	HIPFLAGS    += --offload-arch=gfx1100
 	HIPFLAGS    += --offload-arch=gfx1103
 ifdef LLAMA_CUDA_FORCE_DMMV
-	HIPFLAGS 	+= -DGGML_CUDA_FORCE_DMMV
+	HIPFLAGS        += -DGGML_CUDA_FORCE_DMMV
 endif # LLAMA_CUDA_FORCE_DMMV
 ifdef LLAMA_CUDA_NO_PEER_COPY
-	HIPFLAGS 	+= -DGGML_CUDA_NO_PEER_COPY
+	HIPFLAGS        += -DGGML_CUDA_NO_PEER_COPY
 endif # LLAMA_CUDA_NO_PEER_COPY
 	OBJS        += ggml-cuda.o
 	OBJS        += $(patsubst %.cu,%.o,$(wildcard ggml-cuda/*.cu))
@@ -582,7 +584,7 @@ endif # LLAMA_HIPBLAS
 ifdef LLAMA_METAL
 	MK_CPPFLAGS += -DGGML_USE_METAL
 	MK_LDFLAGS  += -framework Foundation -framework Metal -framework MetalKit
-	OBJS		+= ggml-metal.o
+	OBJS            += ggml-metal.o
 ifdef LLAMA_METAL_NDEBUG
 	MK_CPPFLAGS += -DGGML_METAL_NDEBUG
 endif
@@ -663,11 +665,6 @@ ifdef LLAMA_CUDA
 $(info I NVCC:      $(shell $(NVCC) --version | tail -n 1))
 CUDA_VERSION := $(shell $(NVCC) --version | grep -oP 'release (\K[0-9]+\.[0-9])')
 ifeq ($(shell awk -v "v=$(CUDA_VERSION)" 'BEGIN { print (v < 11.7) }'),1)
-ifndef CUDA_DOCKER_ARCH
-ifndef CUDA_POWER_ARCH
-$(error I ERROR: For CUDA versions < 11.7 a target CUDA architecture must be explicitly provided via environment variable CUDA_DOCKER_ARCH, e.g. by running "export CUDA_DOCKER_ARCH=compute_XX" on Unix-like systems, where XX is the minimum compute capability that the code needs to run on. A list with compute capabilities can be found here: https://developer.nvidia.com/cuda-gpus )
-endif # CUDA_POWER_ARCH
-endif # CUDA_DOCKER_ARCH
 endif # eq ($(shell echo "$(CUDA_VERSION) < 11.7" | bc),1)
 endif # LLAMA_CUDA
 $(info )
