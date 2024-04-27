@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #ifndef _WIN32
+  #define __BSD_VISIBLE 1
   #include <dirent.h>
 #endif
 

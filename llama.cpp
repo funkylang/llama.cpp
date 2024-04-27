@@ -1493,20 +1493,22 @@ struct llama_mlock {
             return true;
         }
 
-        char* errmsg = std::strerror(errno);
-        bool suggest = (errno == ENOMEM);
+        #ifndef __CYGWIN__
+            char* errmsg = std::strerror(errno);
+            bool suggest = (errno == ENOMEM);
 
-        // Check if the resource limit is fine after all
-        struct rlimit lock_limit;
-        if (suggest && getrlimit(RLIMIT_MEMLOCK, &lock_limit)) {
-            suggest = false;
-        }
-        if (suggest && (lock_limit.rlim_max > lock_limit.rlim_cur + size)) {
-            suggest = false;
-        }
+            // Check if the resource limit is fine after all
+            struct rlimit lock_limit;
+            if (suggest && getrlimit(RLIMIT_MEMLOCK, &lock_limit)) {
+                suggest = false;
+            }
+            if (suggest && (lock_limit.rlim_max > lock_limit.rlim_cur + size)) {
+                suggest = false;
+            }
 
-        LLAMA_LOG_WARN("warning: failed to mlock %zu-byte buffer (after previously locking %zu bytes): %s\n%s",
-                size, this->size, errmsg, suggest ? MLOCK_SUGGESTION : "");
+            LLAMA_LOG_WARN("warning: failed to mlock %zu-byte buffer (after previously locking %zu bytes): %s\n%s",
+                    size, this->size, errmsg, suggest ? MLOCK_SUGGESTION : "");
+        #endif
         return false;
     }
 

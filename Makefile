@@ -261,7 +261,9 @@ endif
 
 # Windows Sockets 2 (Winsock) for network-capable apps
 ifeq ($(_WIN32),1)
-	LWINSOCK2 := -lws2_32
+	ifneq ($(shell uname -o),Cygwin)
+		LWINSOCK2 := -lws2_32
+	endif
 endif
 
 ifdef LLAMA_GPROF
