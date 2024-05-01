@@ -82,9 +82,11 @@ models-mnt
 /retrieval
 /speculative
 /parallel
+/test-hardware
 /train-text-from-scratch
 /tokenize
 /vdot
+/workflows
 /common/build-info.cpp
 arm_neon.h
 compile_commands.json
