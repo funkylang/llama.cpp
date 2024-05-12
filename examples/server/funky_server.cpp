@@ -2027,6 +2027,16 @@ int main(int argc, char **argv)
   svr.Options(R"(/.*)", [](const Request &, Response &res)
   { return res.set_content("", "application/json"); });
 
+  svr.Post("/register", [&llama](const Request &req, Response &res)
+  {
+    const json body = json::parse(req.body);
+    register_client(body);
+    const json data =
+      json{
+	{"registered", true},
+      };
+    return res.set_content(data.dump(), "application/json");
+  });
   svr.Post("/deregister", [&llama](const Request &req, Response &res)
   {
     auto lock = llama.lock();
