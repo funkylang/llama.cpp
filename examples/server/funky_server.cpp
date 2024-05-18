@@ -154,9 +154,9 @@ our_llama_init_from_gpt_params(gpt_params & params) {
     tensor_overhead*(tensor_count+1+expert_count*layer_count);
   size_t context_buffer_size = context_size*context_element_size;
   size_t layer_size = model_file_size/layer_count;
-  size_t threshold = 2000000000;
+  size_t threshold = 1800000000;
   unsigned int gpu_layer_count =
-    (free_vram-threshold-context_buffer_size)/layer_size;
+    (free_vram-threshold-context_buffer_size)/layer_size-1; // -1 to stay on the safe side
   if (gpu_layer_count > layer_count+1) gpu_layer_count = layer_count+1;
   fprintf(stderr, "total vram: %lu\n", total_vram);
   fprintf(stderr, "free vram: %lu\n", free_vram);
