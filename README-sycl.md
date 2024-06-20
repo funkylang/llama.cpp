@@ -1,6 +1,7 @@
 # llama.cpp for SYCL
 
 - [Background](#background)
+- [Recommended Release](#recommended-release)
 - [News](#news)
 - [OS](#os)
 - [Hardware](#hardware)
@@ -29,9 +30,24 @@ The llama.cpp SYCL backend is designed to support **Intel GPU** firstly. Based o
 
 When targeting **Intel CPU**, it is recommended to use llama.cpp for [Intel oneMKL](README.md#intel-onemkl) backend.
 
-It has the similar design of other llama.cpp BLAS-based paths such as *OpenBLAS, cuBLAS, CLBlast etc..*. In beginning work, the oneAPI's [SYCLomatic](https://github.com/oneapi-src/SYCLomatic) open-source migration tool (Commercial release [Intel® DPC++ Compatibility Tool](https://www.intel.com/content/www/us/en/developer/tools/oneapi/dpc-compatibility-tool.html)) was used for this purpose.
+It has the similar design of other llama.cpp BLAS-based paths such as *OpenBLAS, cuBLAS, etc..*. In beginning work, the oneAPI's [SYCLomatic](https://github.com/oneapi-src/SYCLomatic) open-source migration tool (Commercial release [Intel® DPC++ Compatibility Tool](https://www.intel.com/content/www/us/en/developer/tools/oneapi/dpc-compatibility-tool.html)) was used for this purpose.
+
+## Recommended Release
+
+The SYCL backend would be broken by some PRs due to no online CI.
+
+The following release is verified with good quality:
+
+|Commit ID|Tag|Release|Verified  Platform|
+|-|-|-|-|
+|fb76ec31a9914b7761c1727303ab30380fd4f05c|b3038 |[llama-b3038-bin-win-sycl-x64.zip](https://github.com/ggerganov/llama.cpp/releases/download/b3038/llama-b3038-bin-win-sycl-x64.zip) |Arc770/Linux/oneAPI 2024.1<br>MTL Arc GPU/Windows 11/oneAPI 2024.1|
+
 
 ## News
+
+- 2024.5
+  - Performance is increased: 34 -> 37 tokens/s of llama-2-7b.Q4_0 on Arc770.
+  - Arch Linux is verified successfully.
 
 - 2024.4
   - Support data types: GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M.
@@ -54,10 +70,10 @@ It has the similar design of other llama.cpp BLAS-based paths such as *OpenBLAS,
 
 ## OS
 
-| OS      | Status  | Verified                           |
-|---------|---------|------------------------------------|
-| Linux   | Support | Ubuntu 22.04, Fedora Silverblue 39 |
-| Windows | Support | Windows 11                         |
+| OS      | Status  | Verified                                       |
+|---------|---------|------------------------------------------------|
+| Linux   | Support | Ubuntu 22.04, Fedora Silverblue 39, Arch Linux |
+| Windows | Support | Windows 11                                     |
 
 
 ## Hardware
@@ -70,14 +86,14 @@ It has the similar design of other llama.cpp BLAS-based paths such as *OpenBLAS,
 |-------------------------------|---------|---------------------------------------|
 | Intel Data Center Max Series  | Support | Max 1550, 1100                        |
 | Intel Data Center Flex Series | Support | Flex 170                              |
-| Intel Arc Series              | Support | Arc 770, 730M                         |
+| Intel Arc Series              | Support | Arc 770, 730M, Arc A750               |
 | Intel built-in Arc GPU        | Support | built-in Arc GPU in Meteor Lake       |
 | Intel iGPU                    | Support | iGPU in i5-1250P, i7-1260P, i7-1165G7 |
 
 *Notes:*
 
 - **Memory**
-  - The device memory is a limitation when running a large model. The loaded model size, *`llm_load_tensors: buffer_size`*, is displayed in the log when running `./bin/main`.
+  - The device memory is a limitation when running a large model. The loaded model size, *`llm_load_tensors: buffer_size`*, is displayed in the log when running `./bin/llama-cli`.
 
   - Please make sure the GPU shared memory from the host is large enough to account for the model's size. For e.g. the *llama-2-7b.Q4_0* requires at least 8.0GB for integrated GPU and 4.0GB for discrete GPU.
 
@@ -99,14 +115,14 @@ The docker build option is currently limited to *intel GPU* targets.
 ### Build image
 ```sh
 # Using FP16
-docker build -t llama-cpp-sycl --build-arg="LLAMA_SYCL_F16=ON" -f .devops/main-intel.Dockerfile .
+docker build -t llama-cpp-sycl --build-arg="LLAMA_SYCL_F16=ON" -f .devops/llama-cli-intel.Dockerfile .
 ```
 
 *Notes*:
 
 To build in default FP32 *(Slower than FP16 alternative)*, you can remove the `--build-arg="LLAMA_SYCL_F16=ON"` argument from the previous command.
 
-You can also use the `.devops/server-intel.Dockerfile`, which builds the *"server"* alternative.
+You can also use the `.devops/llama-server-intel.Dockerfile`, which builds the *"server"* alternative.
 
 ### Run container
 
@@ -185,9 +201,8 @@ Upon a successful installation, SYCL is enabled for the available intel devices,
 ```sh
 git clone https://github.com/oneapi-src/oneMKL
 cd oneMKL
-mkdir -p buildWithCublas && cd buildWithCublas
-cmake ../ -DCMAKE_CXX_COMPILER=icpx -DCMAKE_C_COMPILER=icx -DENABLE_MKLGPU_BACKEND=OFF -DENABLE_MKLCPU_BACKEND=OFF -DENABLE_CUBLAS_BACKEND=ON -DTARGET_DOMAINS=blas
-make
+cmake -B buildWithCublas -DCMAKE_CXX_COMPILER=icpx -DCMAKE_C_COMPILER=icx -DENABLE_MKLGPU_BACKEND=OFF -DENABLE_MKLCPU_BACKEND=OFF -DENABLE_CUBLAS_BACKEND=ON -DTARGET_DOMAINS=blas
+cmake --build buildWithCublas --config Release
 ```
 
 
@@ -227,17 +242,15 @@ Similarly, user targeting Nvidia GPUs should expect at least one SYCL-CUDA devic
 source /opt/intel/oneapi/setvars.sh
 
 # Build LLAMA with MKL BLAS acceleration for intel GPU
-mkdir -p build && cd build
 
-# Option 1: Use FP16 for better performance in long-prompt  inference
-cmake --build .. -DLLAMA_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DLLAMA_SYCL_F16=ON
-# Or without "--build", run "make" next
+# Option 1: Use FP32 (recommended for better performance in most cases)
+cmake -B build -DLLAMA_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
 
-# Option 2: Use FP32 by default
-cmake --build .. -DLLAMA_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
+# Option 2: Use FP16
+cmake -B build -DLLAMA_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DLLAMA_SYCL_F16=ON
 
-#build all binary
-cmake --build . --config Release -j -v
+# build all binary
+cmake --build build --config Release -j -v
 ```
 
 #### Nvidia GPU
@@ -249,16 +262,15 @@ export CPLUS_INCLUDE_DIR=/path/to/oneMKL/buildWithCublas/include:$CPLUS_INCLUDE_
 export CPLUS_INCLUDE_DIR=/path/to/oneMKL/include:$CPLUS_INCLUDE_DIR
 
 # Build LLAMA with Nvidia BLAS acceleration through SYCL
-mkdir -p build && cd build
 
-# Option 1: Use FP16 for better performance in long-prompt  inference
-cmake --build .. -DLLAMA_SYCL=ON -DLLAMA_SYCL_TARGET=NVIDIA -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DLLAMA_SYCL_F16=ON
+# Option 1: Use FP32 (recommended for better performance in most cases)
+cmake -B build -DLLAMA_SYCL=ON -DLLAMA_SYCL_TARGET=NVIDIA -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
 
-# Option 2: Use FP32 by default
-cmake --build .. -DLLAMA_SYCL=ON -DLLAMA_SYCL_TARGET=NVIDIA -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
+# Option 2: Use FP16
+cmake -B build -DLLAMA_SYCL=ON -DLLAMA_SYCL_TARGET=NVIDIA -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DLLAMA_SYCL_F16=ON
 
-#build all binary
-cmake --build . --config Release -j -v
+# build all binary
+cmake --build build --config Release -j -v
 
 ```
 
@@ -279,7 +291,7 @@ source /opt/intel/oneapi/setvars.sh
 Similar to the native `sycl-ls`, available SYCL devices can be queried as follow:
 
 ```sh
-./build/bin/ls-sycl-device
+./build/bin/llama-ls-sycl-device
 ```
 A example of such log in a system with 1 *intel CPU* and 1 *intel GPU* can look like the following:
 ```
@@ -317,7 +329,7 @@ Examples:
 - Use device 0:
 
 ```sh
-ZES_ENABLE_SYSMAN=1 ./build/bin/main -m models/llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 400 -e -ngl 33 -sm none -mg 0
+ZES_ENABLE_SYSMAN=1 ./build/bin/llama-cli -m models/llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 400 -e -ngl 33 -sm none -mg 0
 ```
 or run by script:
 
@@ -328,7 +340,7 @@ or run by script:
 - Use multiple devices:
 
 ```sh
-ZES_ENABLE_SYSMAN=1 ./build/bin/main -m models/llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 400 -e -ngl 33 -sm layer
+ZES_ENABLE_SYSMAN=1 ./build/bin/llama-cli -m models/llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 400 -e -ngl 33 -sm layer
 ```
 
 Otherwise, you can run the script:
@@ -413,13 +425,15 @@ b. Download & install mingw-w64 make for Windows provided by w64devkit
 On the oneAPI command line window, step into the llama.cpp main directory and run the following:
 
 ```
-mkdir -p build
-cd build
 @call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 --force
 
-cmake -G "MinGW Makefiles" ..  -DLLAMA_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icx  -DCMAKE_BUILD_TYPE=Release -DLLAMA_SYCL_F16=ON
+# Option 1: Use FP32 (recommended for better performance in most cases)
+cmake -B build -G "MinGW Makefiles" -DLLAMA_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icx  -DCMAKE_BUILD_TYPE=Release
 
-make -j
+# Option 2: Or FP16
+cmake -B build -G "MinGW Makefiles" -DLLAMA_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icx  -DCMAKE_BUILD_TYPE=Release -DLLAMA_SYCL_F16=ON
+
+cmake --build build --config Release -j
 ```
 
 Otherwise, run the `win-build-sycl.bat` wrapper which encapsulates the former instructions:
@@ -429,7 +443,7 @@ Otherwise, run the `win-build-sycl.bat` wrapper which encapsulates the former in
 
 *Notes:*
 
-- By default, calling `make` will build all target binary files. In case of a minimal experimental setup, the user can build the inference executable only through `make main`.
+- By default, calling `make` will build all target binary files. In case of a minimal experimental setup, the user can build the inference executable only through `make llama-cli`.
 
 ### III. Run the inference
 
@@ -490,13 +504,13 @@ Examples:
 - Use device 0:
 
 ```
-build\bin\main.exe -m models\llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:\nStep 1:" -n 400 -e -ngl 33 -s 0 -sm none -mg 0
+build\bin\llama-cli.exe -m models\llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:\nStep 1:" -n 400 -e -ngl 33 -s 0 -sm none -mg 0
 ```
 
 - Use multiple devices:
 
 ```
-build\bin\main.exe -m models\llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:\nStep 1:" -n 400 -e -ngl 33 -s 0 -sm layer
+build\bin\llama-cli.exe -m models\llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:\nStep 1:" -n 400 -e -ngl 33 -s 0 -sm layer
 ```
 Otherwise, run the following wrapper script:
 

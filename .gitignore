@@ -1,46 +1,76 @@
-*.o
+# Extensions
+
 *.a
-*.so
-*.gguf
-*.bin
-*.exe
-*.dll
-*.log
-*.gcov
-*.gcno
-*.gcda
-*.dot
 *.bat
-*.tmp
-*.metallib
+*.bin
+*.dll
+*.dot
 *.etag
+*.exe
+*.gcda
+*.gcno
+*.gcov
+*.gguf
+*.gguf.json
 *.lastModified
-.DS_Store
-.build/
+*.log
+*.metallib
+*.o
+*.so
+*.tmp
+
+# IDE / OS
+
 .cache/
 .ccls-cache/
 .direnv/
+.DS_Store
 .envrc
+.idea/
 .swiftpm
-.venv
-.clang-tidy
 .vs/
 .vscode/
 .idea/
 *.bak
+nppBackup
 
-ggml-metal-embed.metal
 
-lcov-report/
+# Coverage
+
 gcovr-report/
+lcov-report/
 
+# Build Artifacts
+
+tags
+.build/
 build*
+!build-info.cmake
+!build-info.cpp.in
+!build-info.sh
+!build.zig
+/libllama.so
+/llama-*
+android-ndk-*
+arm_neon.h
 cmake-build-*
+CMakeSettings.json
+compile_commands.json
+ggml-metal-embed.metal
+llama-batched-swift
 out/
 tmp/
 
+# CI
+
+!.github/workflows/*.yml
+
+# Models
+
 models/*
 models-mnt
+!models/.editorconfig
+!models/ggml-vocab-*.gguf*
 
 /Pipfile
 /baby-llama
@@ -94,16 +124,37 @@ CMakeSettings.json
 
 __pycache__
 dist
+# Zig
 
 zig-out/
 zig-cache/
+
+# Logs
 
 ppl-*.txt
 qnt-*.txt
 perf-*.txt
 
-examples/jeopardy/results.txt
+# Examples
 
+examples/jeopardy/results.txt
+examples/server/*.css.hpp
+examples/server/*.html.hpp
+examples/server/*.js.hpp
+examples/server/*.mjs.hpp
+!build_64.sh
+!examples/*.bat
+!examples/*/*.kts
+!examples/*/*/*.kts
+!examples/sycl/*.bat
+!examples/sycl/*.sh
+
+# Python
+
+__pycache__
+.venv
+/Pipfile
+dist
 poetry.lock
 poetry.toml
 nppBackup
@@ -114,3 +165,21 @@ funky_server*
 start_*
 merge_upstream.txt
 todo.txt
+
+# Test binaries
+/tests/test-backend-ops
+/tests/test-double-float
+/tests/test-grad0
+/tests/test-grammar-parser
+/tests/test-llama-grammar
+/tests/test-opt
+/tests/test-quantize-fns
+/tests/test-quantize-perf
+/tests/test-rope
+/tests/test-sampling
+/tests/test-tokenizer-0
+/tests/test-tokenizer-1-bpe
+/tests/test-tokenizer-1-spm
+
+# Scripts
+!/scripts/install-oneapi.bat

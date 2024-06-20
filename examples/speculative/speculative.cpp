@@ -27,7 +27,8 @@ struct seq_draft {
 int main(int argc, char ** argv) {
     gpt_params params;
 
-    if (gpt_params_parse(argc, argv, params) == false) {
+    if (!gpt_params_parse(argc, argv, params)) {
+        gpt_params_print_usage(argc, argv, params);
         return 1;
     }
 
@@ -360,7 +361,7 @@ int main(int argc, char ** argv) {
                     }
                 }
 
-                if (token_id == llama_token_eos(model_tgt)) {
+                if (llama_token_is_eog(model_tgt, token_id)) {
                     has_eos = true;
                 }
                 ++n_predict;

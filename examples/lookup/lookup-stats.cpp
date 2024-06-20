@@ -16,6 +16,7 @@ int main(int argc, char ** argv){
     gpt_params params;
 
     if (!gpt_params_parse(argc, argv, params)) {
+        gpt_params_print_usage(argc, argv, params);
         return 1;
     }
 
@@ -30,7 +31,6 @@ int main(int argc, char ** argv){
 
     // load the model
     std::tie(model, ctx) = llama_init_from_gpt_params(params);
-    llama_set_rng_seed(ctx, params.seed);
     GGML_ASSERT(llama_n_vocab(model) < (1 << 16));
 
     // tokenize the prompt
