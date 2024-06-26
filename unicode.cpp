@@ -23,7 +23,7 @@ static std::string unicode_cpts_to_utf8(const std::vector<uint32_t> & cps) {
     return result;
 }
 
-static uint32_t unicode_cpt_from_utf8(const std::string & utf8, size_t & offset) {
+uint32_t unicode_cpt_from_utf8(const std::string & utf8, size_t & offset) {
     assert(offset < utf8.size());
     if (!(utf8[offset + 0] & 0x80)) {
         auto result = utf8[offset + 0];
@@ -596,6 +596,7 @@ std::vector<uint32_t> unicode_cpts_normalize_nfd(const std::vector<uint32_t> & c
 
 std::vector<uint32_t> unicode_cpts_from_utf8(const std::string & utf8) {
     std::vector<uint32_t> result;
+    result.reserve(utf8.size());
     size_t offset = 0;
     while (offset < utf8.size()) {
         result.push_back(unicode_cpt_from_utf8(utf8, offset));
