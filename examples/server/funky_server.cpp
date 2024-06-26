@@ -16,7 +16,6 @@
 #include "index.html.hpp"
 #include "index.js.hpp"
 #include "completion.js.hpp"
-//#include "json-schema-to-grammar.mjs.hpp"
 
 #include <cstddef>
 #ifndef _WIN32
@@ -80,6 +79,7 @@ enum llm_arch {
 struct hparams {
   bool vocab_only;
   bool rope_finetuned;
+  bool use_par_res;
 
   uint32_t n_vocab;
   uint32_t n_ctx_train; // context size the model was trained on
@@ -114,8 +114,8 @@ static bool never_do_shutdown = true;
 bool do_shutdown = false;
 static bool do_test_hardware = false;
 static std::string model_path = "/var/models";
-static size_t total_vram = 0;
-static size_t free_vram = 0;
+static ssize_t total_vram = 0;
+static ssize_t free_vram = 0;
 
 //////////
 
@@ -127,62 +127,67 @@ our_llama_init_from_gpt_params(
   gpt_params &gpt_parameters,
   int requested_context_size
 ) {
+  fprintf(stderr, "loading model ...\n");
   auto model_parameters = llama_model_params_from_gpt_params(gpt_parameters);
+  fprintf(stderr, "loaded model parameters\n");
 
   model_parameters.vocab_only = true;
   llama_model *model =
     llama_load_model_from_file(gpt_parameters.model.c_str(), model_parameters);
+  fprintf(stderr, "loaded model\n");
   if (model == NULL) {
     load_failed:
     fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, gpt_parameters.model.c_str());
     return std::make_tuple(nullptr, nullptr);
   }
-  unsigned int model_context_size =
+  int model_context_size =
     ((struct llama_model_header *)model)->params.n_ctx_train;
-  unsigned int max_context_size =
+  int max_context_size =
     (
       requested_context_size != 0 &&
       requested_context_size != gpt_parameters.n_ctx
     )
     ? requested_context_size
     : gpt_parameters.n_ctx;
-  unsigned int context_size =
+  int context_size =
     model_context_size > max_context_size ?
     max_context_size :
     model_context_size;
-  unsigned int layer_count =
+  int layer_count =
     ((struct llama_model_header *)model)->params.n_layer;
-  unsigned int expert_count =
+  int expert_count =
     ((struct llama_model_header *)model)->params.n_expert;
-  unsigned int embeddings_count =
+  int embeddings_count =
     ((struct llama_model_header *)model)->params.n_embd;
-  unsigned int vocab_size =
+  int vocab_size =
     ((struct llama_model_header *)model)->params.n_vocab;
-  size_t tensor_overhead = ggml_tensor_overhead();
-  size_t context_element_size =
+  ssize_t tensor_overhead = ggml_tensor_overhead();
+  ssize_t context_element_size =
     tensor_overhead*(tensor_count+1+expert_count*layer_count);
   context_element_size *= 3; // heuristic
-  size_t context_buffer_size = context_size*context_element_size;
-  size_t layer_size = model_file_size/layer_count;
-  size_t threshold = 1800000000;
-  unsigned int gpu_layer_count =
+  ssize_t context_buffer_size = context_size*context_element_size;
+  ssize_t layer_size = model_file_size/layer_count;
+  ssize_t threshold = 1800000000;
+  int gpu_layer_count =
     (free_vram-threshold-context_buffer_size)/layer_size-1; // -1 to stay on the safe side
+  if (gpu_layer_count < 0) gpu_layer_count = 0;
   if (gpu_layer_count > layer_count+1) gpu_layer_count = layer_count+1;
-  fprintf(stderr, "total vram: %lu\n", total_vram);
-  fprintf(stderr, "free vram: %lu\n", free_vram);
-  fprintf(stderr, "model file size: %lu\n", model_file_size);
-  fprintf(stderr, "model context size: %u\n", model_context_size);
-  fprintf(stderr, "maximum context size: %u\n", max_context_size);
-  fprintf(stderr, "effective context size: %u\n", context_size);
-  fprintf(stderr, "layers: %u\n", layer_count);
-  fprintf(stderr, "experts: %u\n", expert_count);
-  fprintf(stderr, "tensors: %u\n", tensor_count);
-  fprintf(stderr, "embeddings: %u\n", embeddings_count);
-  fprintf(stderr, "vocabulary: %u\n", vocab_size);
-  fprintf(stderr, "overhead per tensor: %lu\n", tensor_overhead);
-  fprintf(stderr, "context element size: %lu\n", context_element_size);
-  fprintf(stderr, "context buffer size: %lu\n", context_buffer_size);
-  fprintf(stderr, "gpu layers: %u\n", gpu_layer_count);
+  fprintf(stderr, "total vram: %ld\n", total_vram);
+  fprintf(stderr, "free vram: %ld\n", free_vram);
+  fprintf(stderr, "model file size: %ld\n", model_file_size);
+  fprintf(stderr, "model context size: %d\n", model_context_size);
+  fprintf(stderr, "maximum context size: %d\n", max_context_size);
+  fprintf(stderr, "effective context size: %d\n", context_size);
+  fprintf(stderr, "layers: %d\n", layer_count);
+  fprintf(stderr, "experts: %d\n", expert_count);
+  fprintf(stderr, "tensors: %d\n", tensor_count);
+  fprintf(stderr, "embeddings: %d\n", embeddings_count);
+  fprintf(stderr, "vocabulary: %d\n", vocab_size);
+  fprintf(stderr, "layer size: %ld\n", layer_size);
+  fprintf(stderr, "overhead per tensor: %ld\n", tensor_overhead);
+  fprintf(stderr, "context element size: %ld\n", context_element_size);
+  fprintf(stderr, "context buffer size: %ld\n", context_buffer_size);
+  fprintf(stderr, "gpu layers: %d\n", gpu_layer_count);
   llama_free_model(model);
 
   model_parameters.n_gpu_layers = gpu_layer_count;
@@ -1459,39 +1464,6 @@ static bool is_at_eob(llama_server_context &server_context, const llama_token *t
   return n_tokens && tokens[n_tokens-1] == llama_token_eos(server_context.model);
 }
 
-// Function matching type llama_beam_search_callback_fn_t.
-// Custom callback example is called each time the beams lengths increase:
-//  * Show progress by printing ',' following by number of convergent beam tokens if any.
-//  * When all beams converge to a common prefix, they are made available in beams_state.beams[0].
-//    This is also called when the stop condition is met.
-//    Collect tokens into std::vector<llama_token> response which is pointed to by callback_data.
-static void beam_search_callback(void *callback_data, llama_beams_state beams_state) {
-  auto &llama = *static_cast<llama_server_context*>(callback_data);
-  // Mark beams as EOS as needed.
-  for (size_t i = 0 ; i < beams_state.n_beams ; ++i) {
-    llama_beam_view& beam_view = beams_state.beam_views[i];
-    if (!beam_view.eob && is_at_eob(llama, beam_view.tokens, beam_view.n_tokens)) {
-      beam_view.eob = true;
-    }
-  }
-  printf(",");  // Show progress
-  if (const size_t n = beams_state.common_prefix_length) {
-    llama.generated_token_probs.resize(llama.generated_token_probs.size() + n);
-    assert(0u < beams_state.n_beams);
-    const llama_token *tokens = beams_state.beam_views[0].tokens;
-    const auto map = [](llama_token tok) { return completion_token_output{{},tok}; };
-    std::transform(tokens, tokens + n, llama.generated_token_probs.end() - n, map);
-    printf("%zu", n);
-  }
-  fflush(stdout);
-  #if 0 // DEBUG: print current beams for this iteration
-    std::cout << "\n\nCurrent beams:\n";
-    for (size_t i=0 ; i < beams_state.n_beams ; ++i) {
-      std::cout << "beams["<<i<<"]: " << ostream_beam_view{state.ctx,beams_state.beam_views[i]} << std::endl;
-    }
-  #endif
-}
-
 struct token_translator {
   llama_context *ctx;
   std::string operator()(llama_token tok) const { return llama_token_to_piece(ctx, tok); }
@@ -1614,7 +1586,7 @@ int main(int argc, char **argv)
   }
 
   #ifdef GGML_USE_CUDA
-    ggml_backend_cuda_get_device_memory(0, &free_vram, &total_vram);
+    ggml_backend_cuda_get_device_memory(0, (size_t *)&free_vram, (size_t *)&total_vram);
   #endif
   if (do_test_hardware) {
     if (total_vram) {
@@ -1627,13 +1599,6 @@ int main(int argc, char **argv)
   }
 
   llama_backend_init();
-
-  /*LOG_INFO("system info", {
-    {"n_threads", llama.gpt_parameters.n_threads},
-    {"n_threads_batch", llama.gpt_parameters.n_threads_batch},
-    {"total_threads", std::thread::hardware_concurrency()},
-    {"system_info", llama_print_system_info()},
-  });*/
 
   Server svr;
 
@@ -1744,35 +1709,27 @@ int main(int argc, char **argv)
     fprintf(stderr, ".");
     do_print_newline = true;
     if (!llama.stream) {
-      if (llama.gpt_parameters.n_beams) {
-	// Fill llama.generated_token_probs vector with final beam.
-	llama_beam_search(llama.ctx, beam_search_callback, &llama, llama.gpt_parameters.n_beams,
-	llama.n_past, llama.n_remain);
-	// Translate llama.generated_token_probs to llama.generated_text.
-	append_to_generated_text_from_generated_token_probs(llama);
-      } else {
-	size_t stop_pos = std::string::npos;
+      size_t stop_pos = std::string::npos;
 
-	while (llama.has_next_token) {
-	  const completion_token_output token_with_probs = llama.doCompletion(return_logits);
-	  generated_token = token_with_probs.tok;
-	  //fprintf(stderr, "n = %ld\n", token_with_probs.probs.size());
-	  //for (unsigned long i = 0; i < token_with_probs.probs.size(); ++i) {
-	  //  fprintf(stderr, "  %d: %f\n", token_with_probs.probs[i].tok, token_with_probs.probs[i].prob);
-	  //}
-	  const std::string token_text = token_with_probs.tok == -1 ? "" : llama_token_to_piece(llama.ctx, token_with_probs.tok);
+      while (llama.has_next_token) {
+	const completion_token_output token_with_probs = llama.doCompletion(return_logits);
+	generated_token = token_with_probs.tok;
+	//fprintf(stderr, "n = %ld\n", token_with_probs.probs.size());
+	//for (unsigned long i = 0; i < token_with_probs.probs.size(); ++i) {
+	//  fprintf(stderr, "  %d: %f\n", token_with_probs.probs[i].tok, token_with_probs.probs[i].prob);
+	//}
+	const std::string token_text = token_with_probs.tok == -1 ? "" : llama_token_to_piece(llama.ctx, token_with_probs.tok);
 
-	  stop_pos = llama.findStoppingStrings(llama.generated_text,
-	  token_text.size(), STOP_FULL);
-	}
+	stop_pos = llama.findStoppingStrings(llama.generated_text,
+	token_text.size(), STOP_FULL);
+      }
 
-	if (stop_pos == std::string::npos) {
-	  stop_pos = llama.findStoppingStrings(llama.generated_text, 0, STOP_PARTIAL);
-	}
-	if (stop_pos != std::string::npos) {
-	  llama.generated_text.erase(llama.generated_text.begin() + stop_pos,
-	  llama.generated_text.end());
-	}
+      if (stop_pos == std::string::npos) {
+	stop_pos = llama.findStoppingStrings(llama.generated_text, 0, STOP_PARTIAL);
+      }
+      if (stop_pos != std::string::npos) {
+	llama.generated_text.erase(llama.generated_text.begin() + stop_pos,
+	llama.generated_text.end());
       }
 
       auto probs = llama.generated_token_probs;

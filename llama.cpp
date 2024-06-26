@@ -4220,9 +4220,9 @@ static void llm_load_hparams(
     ml.get_key(LLM_KV_VOCAB_SIZE,           hparams.n_vocab,       false) || ml.get_arr_n(LLM_KV_TOKENIZER_LIST, hparams.n_vocab);
 
     // everything past this point is not vocab-related
-    if (hparams.vocab_only) {
+    /*if (hparams.vocab_only) {
         return;
-    }
+    }*/
 
     ml.get_key(LLM_KV_CONTEXT_LENGTH,       hparams.n_ctx_train);
     ml.get_key(LLM_KV_EMBEDDING_LENGTH,     hparams.n_embd);
