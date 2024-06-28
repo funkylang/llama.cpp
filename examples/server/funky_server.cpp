@@ -2119,6 +2119,8 @@ int main(int argc, char **argv)
     }
     int bos = llama_token_bos(llama.model);
     int eos = llama_token_eos(llama.model);
+    int cls = llama_token_cls(llama.model);
+    int sep = llama_token_sep(llama.model);
     int nl = llama_token_nl(llama.model);
     int prefix = llama_token_prefix(llama.model);
     int suffix = llama_token_suffix(llama.model);
@@ -2127,6 +2129,8 @@ int main(int argc, char **argv)
     json data = json{
       {"begin_of_stream", bos},
       {"end_of_stream", eos},
+      {"classification", cls},
+      {"separator", sep},
       {"newline", nl},
       {"prefix", prefix},
       {"suffix", suffix},
