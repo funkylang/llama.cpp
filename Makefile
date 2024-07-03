@@ -731,7 +731,7 @@ ifdef GGML_HIPBLAS
 		ROCM_PATH      ?= /usr
 		AMDGPU_TARGETS ?= $(shell $(shell which amdgpu-arch))
 	else
-		ROCM_PATH	?= /opt/rocm
+		ROCM_PATH       ?= /opt/rocm
 		AMDGPU_TARGETS ?= $(shell $(ROCM_PATH)/llvm/bin/amdgpu-arch)
 	endif
 
@@ -746,7 +746,7 @@ ifdef GGML_HIP_UMA
 endif # LLAMA_HIP_UMA
 	MK_LDFLAGS  += -L$(ROCM_PATH)/lib -Wl,-rpath=$(ROCM_PATH)/lib
 	MK_LDFLAGS  += -L$(ROCM_PATH)/lib64 -Wl,-rpath=$(ROCM_PATH)/lib64
-	MK_LDFLAGS	+= -lhipblas -lamdhip64 -lrocblas
+	MK_LDFLAGS      += -lhipblas -lamdhip64 -lrocblas
 	HIPFLAGS    += $(addprefix --offload-arch=,$(AMDGPU_TARGETS))
 	HIPFLAGS    += -DGGML_CUDA_DMMV_X=$(LLAMA_CUDA_DMMV_X)
 	HIPFLAGS    += -DGGML_CUDA_MMV_Y=$(LLAMA_CUDA_MMV_Y)
@@ -809,7 +809,7 @@ endif # GGML_HIPBLAS
 ifdef GGML_METAL
 	MK_CPPFLAGS += -DGGML_USE_METAL
 	MK_LDFLAGS  += -framework Foundation -framework Metal -framework MetalKit
-	OBJ_GGML	+= ggml/src/ggml-metal.o
+	OBJ_GGML        += ggml/src/ggml-metal.o
 ifdef GGML_METAL_NDEBUG
 	MK_CPPFLAGS += -DGGML_METAL_NDEBUG
 endif
@@ -1329,8 +1329,23 @@ llama-server: \
 	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h %.hpp $<,$^) -Iexamples/server $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS) $(LWINSOCK2)
 
-funky_server: examples/server/funky_server.cpp examples/server/httplib.h examples/server/old_json.hpp examples/server/index.html.hpp examples/server/index.js.hpp examples/server/completion.js.hpp examples/llava/clip.cpp examples/llava/clip.h common/stb_image.h  examples/server/funky_helper.o ggml.o llama.o $(COMMON_DEPS) grammar-parser.o $(OBJS)
-	$(CXX) $(CXXFLAGS) -Iexamples/server $(filter-out %.h,$(filter-out %.hpp,$^)) -o $@ $(LDFLAGS) $(LWINSOCK2) -Wno-cast-qual
+funky_server: \
+	examples/server/funky_server.cpp \
+	examples/server/httplib.h \
+	examples/server/old_json.hpp \
+	examples/server/index.html.hpp \
+	examples/server/index.js.hpp \
+	examples/server/completion.js.hpp \
+	examples/llava/clip.cpp \
+	examples/llava/clip.h \
+	common/stb_image.h  \
+	examples/server/funky_helper.o \
+	$(OBJ_ALL)
+	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
+	$(CXX) $(CXXFLAGS) $(filter-out %.h %.hpp $<,$^) \
+	-Iexamples/server $(call GET_OBJ_FILE, $<) \
+	-Wno-cast-qual \
+	-o $@ $(LDFLAGS) $(LWINSOCK2)
 
 examples/server/funky_helper.o: examples/server/funky_helper.c
 	$(CC) $(CFLAGS) -c $< -o $@
