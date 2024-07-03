@@ -88,6 +88,7 @@ struct hparams {
   uint32_t n_head_kv;
   uint32_t n_layer;
   uint32_t n_rot;
+  uint32_t n_swa = 0; // sliding window attention (SWA)
   uint32_t n_embd_head_k; // dimension of keys (d_k). d_q is assumed to be the same, but
   uint32_t n_embd_head_v; // dimension of values (d_v) aka n_embd_head
   uint32_t n_ff;
@@ -2092,15 +2093,15 @@ int main(int argc, char **argv)
     fprintf(stderr, "get_tokens\n");
     json tokens = json::array();
     for (int id = 0; id < llama.n_vocab; ++id) {
-      auto piece = llama_token_to_piece(llama.ctx, id);
+      auto piece = llama_token_to_piece(llama.ctx, id, false);
       int n = piece.length();
       int i = 0;
       bool send_as_array = false;
       while (i < n) {
 	if ((unsigned char)piece[i] < 0x80) ++i;
 	else if (((unsigned char)piece[i] & 0xe0) == 0xc0) i += 2;
-	else if ((unsigned char)(piece[i] & 0xf0) == 0xe0) i += 3;
-	else if ((unsigned char)(piece[i] & 0xf8) == 0xf0) i += 4;
+	else if (((unsigned char)piece[i] & 0xf0) == 0xe0) i += 3;
+	else if (((unsigned char)piece[i] & 0xf8) == 0xf0) i += 4;
 	else i = n+1;
 	if (i > n) {
 	  send_as_array = true;
@@ -2126,7 +2127,7 @@ int main(int argc, char **argv)
     int suffix = llama_token_suffix(llama.model);
     int middle = llama_token_middle(llama.model);
     int eot = llama_token_eot(llama.model);
-    json data = json{
+    json data = json {
       {"begin_of_stream", bos},
       {"end_of_stream", eos},
       {"classification", cls},
@@ -2140,7 +2141,8 @@ int main(int argc, char **argv)
       {"context_size", llama.n_ctx}
     };
 
-  return res.set_content(data.dump(), "application/json"); });
+    return res.set_content(data.dump(), "application/json");
+  });
 
   svr.Post("/embedding", [&llama](const Request &req, Response &res)
   {
