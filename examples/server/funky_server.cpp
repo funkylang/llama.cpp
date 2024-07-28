@@ -117,6 +117,7 @@ static bool do_test_hardware = false;
 static std::string model_path = "/var/models";
 static ssize_t total_vram = 0;
 static ssize_t free_vram = 0;
+static int vram_size = 0; // in GiB - overrides the measured value
 
 //////////
 
@@ -140,6 +141,10 @@ our_llama_init_from_gpt_params(
     load_failed:
     fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, gpt_parameters.model.c_str());
     return std::make_tuple(nullptr, nullptr);
+  }
+  if (vram_size) {
+    total_vram = (long)vram_size << 30;
+    free_vram = total_vram;
   }
   int model_context_size =
     ((struct llama_model_header *)model)->params.n_ctx_train;
@@ -168,7 +173,7 @@ our_llama_init_from_gpt_params(
   context_element_size *= 3; // heuristic
   ssize_t context_buffer_size = context_size*context_element_size;
   ssize_t layer_size = model_file_size/layer_count;
-  ssize_t threshold = 1800000000;
+  ssize_t threshold = 800000000;
   int gpu_layer_count =
     (free_vram-threshold-context_buffer_size)/layer_size-1; // -1 to stay on the safe side
   if (gpu_layer_count < 0) gpu_layer_count = 0;
@@ -1114,6 +1119,7 @@ static void server_print_usage(
   printf("  --help               show this help message and exit\n");
   printf("  --verbose            verbose output (default: %s)\n", server_verbose ? "enabled" : "disabled");
   printf("  --test-hardware      text hardware and exit\n");
+  printf("  --vram-size N        size of the gpu's video ram in GiB (default: 0)\n");
   printf("  --uuid UUID          specify a client UUID\n");
   printf("  --context-size N     size of the prompt context (default: %d)\n", gpt_parameters.n_ctx);
   printf("  --batch-size N       batch size for prompt processing (default: %d)\n", gpt_parameters.n_batch);
@@ -1147,6 +1153,12 @@ static void server_params_parse(
     } else if (arg == "--help") {
       server_print_usage(argv[0], gpt_parameters, sparams);
       exit(EXIT_SUCCESS);
+    } else if (arg == "--vram-size") {
+      if (++i >= argc) {
+	invalid_param = true;
+	break;
+      }
+      vram_size = std::stoi(argv[i]);
     } else if (arg == "--context-size") {
       if (++i >= argc) {
 	invalid_param = true;
