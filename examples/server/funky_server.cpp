@@ -273,9 +273,7 @@ struct completion_token_output
 static size_t common_part(const std::vector<llama_token> &a, const std::vector<llama_token> &b)
 {
   size_t i;
-  for (i = 0; i < a.size() && i < b.size() && a[i] == b[i]; i++)
-  {
-  }
+  for (i = 0; i < a.size() && i < b.size() && a[i] == b[i]; i++);
   return i;
 }
 
@@ -804,38 +802,38 @@ struct llama_server_context
 	}
 	if (n_past == num_prompt_tokens) --n_past;
       }*/
-      } else if (mode == "smart") {
-	int gap_length = n_ctx >> 3;
-	if (common_prefix_len < start_length) {
-	  rebuild:
-	  int remove_size = num_prompt_tokens+gap_length-n_ctx;
-	  if (remove_size > 0) {
-	    // shorten prompt
-	    prompt_tokens.erase(
-	    prompt_tokens.begin()+start_length,
-	    prompt_tokens.begin()+start_length+remove_size);
-	  }
-	  n_past = common_prefix_len;
-	  } else {
-	  int remaining_tokens_len = (int)num_prompt_tokens-start_length;
-	  int remaining_embd_len = (int)embd.size()-start_length;
-	  int len, embd_idx, prompt_idx;
-	  longest_common_part(
+    } else if (mode == "smart") {
+      int gap_length = n_ctx >> 3;
+      if (common_prefix_len < start_length) {
+	rebuild:
+	int remove_size = num_prompt_tokens+gap_length-n_ctx;
+	if (remove_size > 0) {
+	  // shorten prompt
+	  prompt_tokens.erase(
+	  prompt_tokens.begin()+start_length,
+	  prompt_tokens.begin()+start_length+remove_size);
+	}
+	n_past = common_prefix_len;
+      } else {
+	int remaining_tokens_len = (int)num_prompt_tokens-start_length;
+	int remaining_embd_len = (int)embd.size()-start_length;
+	int len, embd_idx, prompt_idx;
+	longest_common_part(
 	  embd.data()+start_length,
 	  remaining_embd_len,
 	  prompt_tokens.data()+start_length,
 	  remaining_tokens_len,
 	  &len, &embd_idx, &prompt_idx);
-	  if (embd_idx != 0 || len < (remaining_tokens_len >> 1)) goto rebuild;
-	  if (prompt_idx >= 0) {
-	    prompt_tokens.erase(
+	if (embd_idx != 0 || len < (remaining_tokens_len >> 1)) goto rebuild;
+	if (prompt_idx >= 0) {
+	  prompt_tokens.erase(
 	    prompt_tokens.begin()+start_length,
 	    prompt_tokens.begin()+start_length+prompt_idx);
-	  }
-	  n_past = start_length+len;
 	}
-	if (n_past == prompt_tokens.size()) --n_past;
-      } else {
+	n_past = start_length+len;
+      }
+      if (n_past == prompt_tokens.size()) --n_past;
+    } else {
       n_past = common_prefix_len;
       if (n_past == num_prompt_tokens) --n_past;
     }
@@ -1644,10 +1642,26 @@ int main(int argc, char **argv)
 
   // this is only called if no index.html is found in the public --path
 
+  svr.Post("/cached_prefix", [&llama](const Request &req, Response &res)
+  {
+    auto lock = llama.lock();
+    const json body = json::parse(req.body);
+    register_client(body);
+    maybe_switch_model(llama, body);
+    std::vector<llama_token> prompt_tokens = body["tokens"];
+    prompt_tokens.insert(prompt_tokens.begin(), llama_token_bos(llama.model));
+    int prefix_len = common_part(llama.embd, prompt_tokens);
+    if (prefix_len > 0) --prefix_len; // don't count begin-of-stream-token
+    const json data =
+      json{
+	{"cached_prefix_length", prefix_len},
+      };
+    return res.set_content(data.dump(), "application/json");
+  });
+
   svr.Post("/completion", [&llama](const Request &req, Response &res)
   {
     auto lock = llama.lock();
-
     llama_reset_timings(llama.ctx);
     const json body = json::parse(req.body);
     register_client(body);
@@ -1668,11 +1682,10 @@ int main(int argc, char **argv)
     if (return_tokens) { // we also *got* tokens
       std::vector<llama_token> prompt_tokens = body["tokens"];
       int start_length = json_value(body, "start", 0);
-      prompt_tokens.insert(
-      prompt_tokens.begin(), llama_token_bos(llama.model));
+      prompt_tokens.insert(prompt_tokens.begin(), llama_token_bos(llama.model));
       ++start_length;
       llama.loadPrompt(prompt_tokens, start_length);
-      } else {
+    } else {
       std::vector<llama_token> prompt_tokens =
       llama.tokenize(llama.prompt, true); // always add BOS
       llama.loadPrompt(prompt_tokens);
