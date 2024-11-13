@@ -412,13 +412,13 @@ static bool server_verbose = false;
 #if SERVER_VERBOSE != 1
   #define LOG_VERBOSE(MSG, ...)
 #else
-  #define LOG_VERBOSE(MSG, ...)                                            \
-  do                                                                   \
-  {                                                                    \
-    if (server_verbose)                                              \
-    {                                                                \
+  #define LOG_VERBOSE(MSG, ...) \
+  do \
+  { \
+    if (server_verbose) \
+    { \
       server_log("VERBOSE", __func__, __LINE__, MSG, __VA_ARGS__); \
-    }                                                                \
+    } \
   } while (0)
 #endif
 
@@ -696,6 +696,37 @@ struct llama_server_context
     });
 
     has_next_token = true;
+  }
+
+  int check_prefix(
+    std::vector<llama_token> &prompt_tokens,
+    int start_length = 1
+  ) {
+    num_prompt_tokens = prompt_tokens.size();
+    int common_prefix_len = common_part(embd, prompt_tokens);
+    if (mode == "smart") {
+      int gap_length = n_ctx >> 3;
+      if (common_prefix_len < start_length) {
+	return common_prefix_len;
+      } else {
+	int remaining_tokens_len = (int)num_prompt_tokens-start_length;
+	int remaining_embd_len = (int)embd.size()-start_length;
+	int len, embd_idx, prompt_idx;
+	longest_common_part(
+	  embd.data()+start_length,
+	  remaining_embd_len,
+	  prompt_tokens.data()+start_length,
+	  remaining_tokens_len,
+	  &len, &embd_idx, &prompt_idx);
+	if (embd_idx != 0 || len < (remaining_tokens_len >> 1)) {
+	  return common_prefix_len;
+	} else {
+	  return start_length+prompt_idx+len;
+	}
+      }
+    } else {
+      return common_prefix_len;
+    }
   }
 
   void loadPrompt(
@@ -1649,8 +1680,13 @@ int main(int argc, char **argv)
     register_client(body);
     maybe_switch_model(llama, body);
     std::vector<llama_token> prompt_tokens = body["tokens"];
+    llama.mode = "exact";
+    int start_length = json_value(body, "start", 0);
+    if (body.count("mode") != 0) {
+      llama.mode = body["mode"];
+    }
     prompt_tokens.insert(prompt_tokens.begin(), llama_token_bos(llama.model));
-    int prefix_len = common_part(llama.embd, prompt_tokens);
+    int prefix_len = llama.check_prefix(prompt_tokens, start_length);
     if (prefix_len > 0) --prefix_len; // don't count begin-of-stream-token
     const json data =
       json{
