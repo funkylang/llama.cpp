@@ -698,19 +698,28 @@ struct llama_server_context
     has_next_token = true;
   }
 
-  int check_prefix(
+  void check_prefix(
     std::vector<llama_token> &prompt_tokens,
-    int start_length = 1
+    int start_length,
+    int additional_length,
+    int *prefix_len_p,
+    int *additional_len_p
   ) {
+    *additional_len_p = 0;
     num_prompt_tokens = prompt_tokens.size();
     int common_prefix_len = common_part(embd, prompt_tokens);
     if (mode == "smart") {
       int gap_length = n_ctx >> 3;
+      //fprintf(stderr, "common_prefix_len: %d\n", common_prefix_len);
+      //fprintf(stderr, "start_length: %d\n", start_length);
+      //fprintf(stderr, "additional_length: %d\n", additional_length);
       if (common_prefix_len < start_length) {
-	return common_prefix_len;
+	*prefix_len_p = common_prefix_len;
       } else {
 	int remaining_tokens_len = (int)num_prompt_tokens-start_length;
 	int remaining_embd_len = (int)embd.size()-start_length;
+	//fprintf(stderr, "remaining_tokens_len: %d\n", remaining_tokens_len);
+	//fprintf(stderr, "remaining_embd_len: %d\n", remaining_embd_len);
 	int len, embd_idx, prompt_idx;
 	longest_common_part(
 	  embd.data()+start_length,
@@ -718,14 +727,20 @@ struct llama_server_context
 	  prompt_tokens.data()+start_length,
 	  remaining_tokens_len,
 	  &len, &embd_idx, &prompt_idx);
-	if (embd_idx != 0 || len < (remaining_tokens_len >> 1)) {
-	  return common_prefix_len;
+	//fprintf(stderr, "len: %d\n", len);
+	//fprintf(stderr, "embd_idx: %d\n", embd_idx);
+	//fprintf(stderr, "prompt_idx: %d\n", prompt_idx);
+	if (embd_idx > 0 || len < (remaining_tokens_len >> 1)) {
+	  *prefix_len_p = start_length;
 	} else {
-	  return start_length+prompt_idx+len;
+	  if (prompt_idx < additional_length) {
+	    *additional_len_p = additional_length-prompt_idx;
+	  }
+	  *prefix_len_p = start_length+len;
 	}
       }
     } else {
-      return common_prefix_len;
+      *prefix_len_p = common_prefix_len;
     }
   }
 
@@ -1682,15 +1697,27 @@ int main(int argc, char **argv)
     std::vector<llama_token> prompt_tokens = body["tokens"];
     llama.mode = "exact";
     int start_length = json_value(body, "start", 0);
+    int additional_length = json_value(body, "additional", 0);
     if (body.count("mode") != 0) {
       llama.mode = body["mode"];
     }
     prompt_tokens.insert(prompt_tokens.begin(), llama_token_bos(llama.model));
-    int prefix_len = llama.check_prefix(prompt_tokens, start_length);
+    int prefix_len, additional_len;
+    llama.check_prefix(
+      prompt_tokens, start_length, additional_length,
+      &prefix_len, &additional_len);
     if (prefix_len > 0) --prefix_len; // don't count begin-of-stream-token
+    if (do_print_newline) {
+      fprintf(stderr, "\n");
+      do_print_newline = false;
+    }
+    fprintf(stderr,
+      "cached_prefix (prefix length: %d, additional tokens used: %d)\n",
+      prefix_len, additional_len);
     const json data =
       json{
 	{"cached_prefix_length", prefix_len},
+	{"additional_length", additional_len},
       };
     return res.set_content(data.dump(), "application/json");
   });
