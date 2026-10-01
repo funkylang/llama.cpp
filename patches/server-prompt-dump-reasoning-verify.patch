@@ -1,0 +1,27 @@
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index 2ac98b6fd..2841eee37 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1339,6 +1339,22 @@ json oaicompat_chat_params_parse(
+ 
+     llama_params["chat_format"] = static_cast<int>(chat_params.format);
+     llama_params["prompt"]      = chat_params.prompt;
++
++    // Optional prompt dump for debugging (reasoning replay verification)
++    if (const char * dump_path = getenv("LLAMA_PROMPT_DUMP")) {
++        if (dump_path[0] != '\0') {
++            try {
++                std::ofstream f(dump_path, std::ios::binary);
++                if (f.is_open()) {
++                    f.write(chat_params.prompt.data(), chat_params.prompt.size());
++                    SRV_INF("dumped prompt (%zu bytes) to %s\n", chat_params.prompt.size(), dump_path);
++                }
++            } catch (const std::exception & e) {
++                SRV_ERR("failed to dump prompt to %s: %s\n", dump_path, e.what());
++            }
++        }
++    }
++
+     if (!chat_params.grammar.empty()) {
+         llama_params["grammar"]      = chat_params.grammar;
+         llama_params["grammar_type"] = std::string("tool_calls");
