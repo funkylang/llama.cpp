@@ -1,0 +1,26 @@
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3890,6 +3890,9 @@
+
+             GGML_ASSERT(n_draft > 0);
+
++            // keep a copy of the speculative batch indices for populating probs later
++            auto spec_i_batch = std::vector<int32_t>(slot.spec_i_batch);
++
+             // verify and try to accept the draft
+             {
+                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+@@ -3988,6 +3991,12 @@
+                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+                 result.prob         = 1.0f; // set later
+
+-                // TODO: set result.probs
++                if (slot.task->params.sampling.n_probs > 0) {
++                    const int tok_idx = spec_i_batch[i] - off;
++                    if (tok_idx >= 0 && tok_idx < static_cast<int>(n_batch_tokens)) {
++                        populate_token_probs(slot, result, slot.task->params.post_sampling_probs,
++                                params_base.special, tok_idx);
++                    }
++                }
+
+                 slot.stats.n_gen += 1;
