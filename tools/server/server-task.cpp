@@ -10,6 +10,7 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <cstdlib>
 #include <sstream>
 
 //
@@ -1699,6 +1700,16 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+
+// Instrumentation: LLAMA_PROMPT_CACHE_INSTRUMENT (any non-empty value enables)
+static bool pc_instr_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("LLAMA_PROMPT_CACHE_INSTRUMENT");
+        return v && v[0];
+    }();
+    return enabled;
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1752,6 +1763,10 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         if (len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
+            if (pc_instr_enabled()) {
+                SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=obsolete\n",
+                        (const void*)&(*it), (size_t)it->prompt.n_tokens());
+            }
             it = states.erase(it);
         } else {
             ++it;
@@ -1764,6 +1779,10 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
+            if (pc_instr_enabled()) {
+                SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=size-limit\n",
+                        (const void*)&states.front(), (size_t)states.front().prompt.n_tokens());
+            }
             states.pop_front();
         }
     }
@@ -1797,6 +1816,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.drft =*/ std::move(state_data_dft),
         },
     });
+
+    // Instrumentation: log creation
+    if (pc_instr_enabled()) {
+        SRV_INF("PCACHE_CREATE addr=%p tok=%zu\n", 
+                (const void*)&states.back(), (size_t)states.back().prompt.n_tokens());
+    }
 
     return &states.back();
 }
@@ -1835,6 +1860,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+        
+        // Instrumentation: log hit
+        if (pc_instr_enabled()) {
+            SRV_INF("PCACHE_HIT addr=%p tok=%zu matched=%d slot=%d\n",
+                    (const void*)&(*it_best), (size_t)it_best->prompt.n_tokens(), lcp_best, id_slot);
+        }
 
         {
             auto & data = it_best->data.main;
@@ -1883,6 +1914,10 @@ void server_prompt_cache::update() {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
+            if (pc_instr_enabled()) {
+                SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=size-limit\n",
+                        (const void*)&states.front(), (size_t)states.front().prompt.n_tokens());
+            }
             states.pop_front();
         }
     }
@@ -1898,6 +1933,10 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
+            if (pc_instr_enabled()) {
+                SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=token-limit\n",
+                        (const void*)&states.front(), (size_t)states.front().prompt.n_tokens());
+            }
             states.pop_front();
         }
     }
