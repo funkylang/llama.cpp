@@ -675,6 +675,9 @@ struct server_prompt_cache {
     void update();
 };
 
+// Instrumentation: LLAMA_PROMPT_CACHE_INSTRUMENT (any non-empty value enables)
+bool pc_instr_enabled();
+
 // used exclusively by router mode
 struct server_task_result_router : server_task_result {
     json data;

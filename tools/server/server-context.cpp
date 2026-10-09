@@ -1493,6 +1493,7 @@ private:
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
+        SRV_INF("%s", pc_instr_enabled() ? "prompt cache instrumentation: ENABLED\n" : "prompt cache instrumentation: disabled\n");
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
         if (params_base.n_ctx_checkpoints > 0) {

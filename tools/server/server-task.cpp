@@ -1702,7 +1702,7 @@ json server_task_result_apply_lora::to_json() {
 //
 
 // Instrumentation: LLAMA_PROMPT_CACHE_INSTRUMENT (any non-empty value enables)
-static bool pc_instr_enabled() {
+bool pc_instr_enabled() {
     static const bool enabled = [] {
         const char * v = getenv("LLAMA_PROMPT_CACHE_INSTRUMENT");
         return v && v[0];
