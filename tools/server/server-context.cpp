@@ -3800,20 +3800,22 @@ private:
                             }
 
                             {
-                                // Conservative checkpoint management for multi-conversation support:
-                                // Don't immediately erase invalidated checkpoints - keep them for potential reuse.
-                                // They'll be evicted by the prompt cache when memory pressure is high.
-                                // This prevents multiple conversations from evicting each other's state.
-                                //
-                                // Original aggressive deletion (disabled):
-                                // for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
-                                //     const auto & cur = *it;
-                                //     if (cur.pos_max > pos_next) {
-                                //         it = slot.prompt.checkpoints.erase(it);
-                                //     } else {
-                                //         ++it;
-                                //     }
-                                // }
+                                // erase any checkpoints with pos_max > pos_next
+                                for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
+                                    const auto & cur = *it;
+                                    if (cur.pos_max > pos_next) {
+                                        SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+
+                                        if (pc_instr_enabled()) {
+                                            SLT_INF(slot, "CKPT_DELETE id_task=%d pos_min=%d pos_max=%d tok=%" PRId64 " reason=invalidated\n",
+                                                    cur.id_task, (int)cur.pos_min, (int)cur.pos_max, cur.n_tokens);
+                                        }
+
+                                        it = slot.prompt.checkpoints.erase(it);
+                                    } else {
+                                        ++it;
+                                    }
+                                }
                             }
                         }
 
