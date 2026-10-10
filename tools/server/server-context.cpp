@@ -4016,6 +4016,16 @@ private:
                             }
                         }
 
+                        // Also break at system message boundaries to allow checkpointing of non-constant system prompts
+                        if (do_checkpoint && spans.is_system_end(slot.prompt.n_tokens())) {
+                            const auto pos = slot.prompt.n_tokens();
+                            const auto & checkpoints = slot.prompt.checkpoints;
+
+                            if (checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                                break;
+                            }
+                        }
+
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
                         //  - 4 + n_ubatch
@@ -4048,6 +4058,9 @@ private:
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
 
+                    // Check if we're at a system message boundary (for checkpointing non-constant system prompts)
+                    const bool is_system_end = spans.is_system_end(n_tokens_start);
+
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
@@ -4063,8 +4076,8 @@ private:
                         slot.init_sampler();
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
-                        // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        // message, ends a system message (for non-constant system prompts), or we are near the end of the prompt
+                        if (!is_user_start && !is_system_end && !near_prompt_end) {
                             do_checkpoint = false;
                         }
                     }
