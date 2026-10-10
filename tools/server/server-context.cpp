@@ -661,10 +661,9 @@ struct server_slot {
         }
 
         const double n_prompt_second = stats.n_prompt_tps();
-        const double f_progress = task->n_tokens() > 0 ? (double) prompt.n_tokens() / task->n_tokens() : 0.0;
 
-        SLT_INF(*this, "prompt processing, n_tokens = %6d, progress = %.2f, t = %6.2f s / %.2f tokens per second\n",
-                (int) stats.n_prompt_processed, f_progress, t_prompt_total / 1e3, n_prompt_second);
+        SLT_INF(*this, "prompt processing, %6d/%d tokens, t = %6.2f s / %.2f tokens per second\n",
+                (int) stats.n_prompt_processed, (int) task->n_tokens(), t_prompt_total / 1e3, n_prompt_second);
     }
 
     void print_timings() const {
