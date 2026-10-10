@@ -4002,6 +4002,28 @@ private:
                         }
                         slot.prompt.tokens.push_back(cur_tok);
 
+                        // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
+                        // create checkpoints that many tokens before the end of the prompt:
+                        //  - 4 + n_ubatch
+                        //  - 4
+                        // this keeps trailing reasoning tokens outside the snapshot, so they are re-processed on resume
+                        // ref: https://github.com/ggml-org/llama.cpp/pull/20288
+                        {
+                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+
+                            bool should_break = false;
+                            for (int offset : checkpoint_offsets) {
+                                const int n_last = std::min(n_batch, offset);
+                                if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                    should_break = true;
+                                    break;
+                                }
+                            }
+                            if (should_break) {
+                                break;
+                            }
+                        }
+
                         // automatic checkpoint every checkpoint_min_step tokens (position-based)
                         if (do_checkpoint && params_base.checkpoint_min_step > 0) {
                             const auto pos = slot.prompt.n_tokens();
