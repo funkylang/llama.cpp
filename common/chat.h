@@ -187,26 +187,6 @@ struct common_chat_msg_spans {
         }
         return -1;
     }
-
-    // Added for checkpointing non-constant system prompts (like those with timestamps or dynamic memory)
-    // This allows checkpoints to be created at system message boundaries, not just user messages
-    bool is_system_end(int32_t pos) const {
-        for (const auto & span : spans) {
-            if (span.role == COMMON_CHAT_ROLE_SYSTEM && (int32_t)(span.pos + span.len) == pos) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    int32_t last_system_message_end() const {
-        for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
-            if (it->role == COMMON_CHAT_ROLE_SYSTEM) {
-                return (int32_t)(it->pos + it->len);
-            }
-        }
-        return -1;
-    }
 };
 
 struct common_chat_msg_delimiter {
