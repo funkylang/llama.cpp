@@ -1693,6 +1693,7 @@ private:
         // find the slot that has at least n% prompt similarity
         if (slot_prompt_similarity != 0.0f) {
             float f_sim_best = 0;
+            size_t lcp_len_best = 0;
 
             for (server_slot & slot : slots) {
                 if (task.id_slot != -1 && slot.id != task.id_slot) {
@@ -1722,6 +1723,7 @@ private:
                 // select the current slot if the criteria match
                 if (f_sim_cur > f_sim_best && f_sim_cur > slot_prompt_similarity) {
                     f_sim_best = f_sim_cur;
+                    lcp_len_best = lcp_len;
 
                     ret = &slot;
                 }
@@ -1731,8 +1733,8 @@ private:
                 const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
 
                 if (task.id_slot == -1) {
-                    SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
-                            f_sim_best, slot_prompt_similarity, f_keep);
+                    SLT_INF(*ret, "selected slot by LCP similarity: prompt=%zu, cached=%zu, match=%zu\n",
+                            task.tokens.size(), ret->prompt.tokens.size(), lcp_len_best);
                 }
 
                 // if we are about to lose a large portion of the existing context - save it in the prompt cache
