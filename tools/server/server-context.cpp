@@ -661,9 +661,10 @@ struct server_slot {
         }
 
         const double n_prompt_second = stats.n_prompt_tps();
+        const int64_t total_processed = (int64_t) stats.n_prompt_cached + (int64_t) stats.n_prompt_processed;
 
         SLT_INF(*this, "prompt processing, %6d/%d tokens, t = %6.2f s / %.2f tokens per second\n",
-                (int) stats.n_prompt_processed, (int) task->n_tokens(), t_prompt_total / 1e3, n_prompt_second);
+                (int) total_processed, (int) task->n_tokens(), t_prompt_total / 1e3, n_prompt_second);
     }
 
     void print_timings() const {
