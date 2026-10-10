@@ -4068,10 +4068,13 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
-                    // avoid checkpoints that are too close together (at least min_step apart)
+                    // avoid creating checkpoints too close to the beginning or end of the prompt, or too close together
+                    const bool near_prompt_start = n_tokens_start < params_base.checkpoint_min_step;
+                    const bool near_prompt_end = (slot.task->n_tokens() - pos_max) < params_base.checkpoint_min_step / 2;
                     do_checkpoint = do_checkpoint && (
-                            slot.prompt.checkpoints.empty() ||
-                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                        !near_prompt_start &&
+                        !near_prompt_end &&
+                        (slot.prompt.checkpoints.empty() || n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step));
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
