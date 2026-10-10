@@ -4013,27 +4013,6 @@ private:
                                 break;
                             }
                         }
-
-                        // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
-                        // create checkpoints that many tokens before the end of the prompt:
-                        //  - 4 + n_ubatch
-                        //  - 4
-                        // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
-
-                            bool should_break = false;
-                            for (int offset : checkpoint_offsets) {
-                                const int n_last = std::min(n_batch, offset);
-                                if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
-                                    should_break = true;
-                                    break;
-                                }
-                            }
-                            if (should_break) {
-                                break;
-                            }
-                        }
                     }
 
                     // the number of tokens added to the batch for the current slot
@@ -4059,6 +4038,12 @@ private:
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                     const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
 
+                    // Create an unconditional checkpoint at the very end of the prompt (before generation starts)
+                    if (slot.state == SLOT_STATE_DONE_PROMPT && do_checkpoint) {
+                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        do_checkpoint = false; // prevent duplicate from the regular logic below
+                    }
+
                     // nothing to checkpoint yet
                     // TODO: is this check needed?
                     if (do_checkpoint && pos_min < 0) {
@@ -4074,7 +4059,7 @@ private:
                     do_checkpoint = do_checkpoint && (
                         !near_prompt_start &&
                         !near_prompt_end &&
-                        (slot.prompt.checkpoints.empty() || n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step));
+                        (slot.prompt.checkpoints.empty() || n_tokens_start >= slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step));
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
