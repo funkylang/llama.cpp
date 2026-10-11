@@ -1895,12 +1895,6 @@ bool server_prompt_cache::restore_entry(server_prompt & prompt, std::list<server
 
         prompt = std::move(it_best->prompt);
         states.erase(it_best);
-
-        // Log the deletion of the moved entry
-        if (pc_instr_enabled()) {
-            SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=consumed remaining=%zu total=%.3f MiB\n",
-                    addr, tok, states.size(), this->size() / (1024.0 * 1024.0));
-        }
     } else {
         // Only a prefix is used as a new prompt: copy the state into the slot, keep the entry in the cache.
 
