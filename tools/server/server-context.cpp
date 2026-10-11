@@ -1708,8 +1708,8 @@ private:
                 type = is_all ? "all" : "part";
             }
 
-            SLT_INF(log_slot, "PCACHE_SCAN source=cache type=%s match_len=%zu entry_tok=%zu %s\n",
-                    type.c_str(), best_lcp,
+            SLT_INF(log_slot, "PCACHE_SCAN source=cache addr=%p type=%s match_len=%zu entry_tok=%zu %s\n",
+                    (const void*) best_entry, type.c_str(), best_lcp,
                     best_entry ? (size_t) best_entry->prompt.n_tokens() : 0,
                     (best_entry && best_lcp > lcp_to_compare) ? "(better than slot)" : "");
         };
@@ -1776,11 +1776,14 @@ private:
                             is_continuation ? "ALL" : "PART");
 
                     if (pc_instr_enabled()) {
-                        SLT_INF(*ret, "PCACHE_MATCH type=%s source=slot match_len=%zu f_keep=%.3f\n",
-                                is_continuation ? "all" : "part", lcp_len_best, f_keep);
+                        SLT_INF(*ret, "PCACHE_MATCH type=%s source=slot %d match_len=%zu f_keep=%.3f\n",
+                                is_continuation ? "all" : "part", ret->id, lcp_len_best, f_keep);
 
                         // read-only scan: what would the prompt cache match? (diagnostic only)
-                        scan_prompt_cache(*ret, lcp_len_best);
+                        // skip when the slot match is a full continuation — nothing interesting to compare
+                        if (!is_continuation) {
+                            scan_prompt_cache(*ret, lcp_len_best);
+                        }
                     }
                 }
 
