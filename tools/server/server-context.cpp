@@ -663,7 +663,7 @@ struct server_slot {
         const double n_prompt_second = stats.n_prompt_tps();
         const int64_t total_processed = (int64_t) stats.n_prompt_cached + (int64_t) stats.n_prompt_processed;
 
-        SLT_INF(*this, "prompt processing, %6d/%d tokens, t = %6.2f s / %.2f tokens per second\n",
+        SLT_INF(*this, "prompt processing, %6d/%d tokens, t = %6.2f s / %.2f t/s\n",
                 (int) total_processed, (int) task->n_tokens(), t_prompt_total / 1e3, n_prompt_second);
     }
 
@@ -671,19 +671,17 @@ struct server_slot {
         const double t_prompt_total = stats.t_prompt_ms();
         const double t_gen_total    = stats.t_gen_ms();
 
-        const double t_prompt        = stats.t_prompt_per_token_ms();
         const double n_prompt_second = stats.n_prompt_tps();
 
-        const double t_gen        = stats.t_gen_per_token_ms();
         const double n_gen_second = stats.n_gen_tps();
 
         SLT_INF(*this,
-                "prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
-                t_prompt_total, (int) stats.n_prompt_processed, t_prompt, n_prompt_second);
+                "prompt eval time = %10.2f ms / %5d tokens (%8.2f t/s)\n",
+                t_prompt_total, (int) stats.n_prompt_processed, n_prompt_second);
 
         SLT_INF(*this,
-                "       eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
-                t_gen_total, (int) stats.n_gen, t_gen, n_gen_second);
+                "       eval time = %10.2f ms / %5d tokens (%8.2f t/s)\n",
+                t_gen_total, (int) stats.n_gen, n_gen_second);
 
         SLT_INF(*this,
                 "      total time = %10.2f ms / %5d tokens\n",
