@@ -1842,6 +1842,11 @@ private:
             // its existing state is displaced, so save it to keep the conversation restorable.
             const int64_t t_start = ggml_time_us();
 
+            if (best.slot == ret && best.qualified) {
+                SLT_INF(*ret, "selected slot by PART match (displaced, covers checkpoint): prompt=%zu, match=%zu\n",
+                        task.tokens.size(), best.lcp);
+            }
+
             ret->prompt_save(*prompt_cache);
             prompt_cache->update();
 
