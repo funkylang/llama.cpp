@@ -670,7 +670,13 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    // Restore a pre-selected cache entry into a slot (KV state + prompt).
+    // is_move=true  : the whole prompt is consumed -> clear/erase the entry (MOVE).
+    // is_move=false : only a prefix is used as a new prompt -> keep the entry in the cache (COPY).
+    // matched_len   : LCP of the incoming prompt vs this entry, for PCACHE_HIT logging only.
+    bool restore_entry(server_prompt & prompt, std::list<server_prompt_cache_state>::iterator it_entry,
+                       llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool is_move,
+                       int matched_len);
 
     void update();
 };

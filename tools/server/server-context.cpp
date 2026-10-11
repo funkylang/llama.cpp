@@ -331,8 +331,9 @@ struct server_slot {
         return true;
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+    bool prompt_load(server_prompt_cache & prompt_cache,
+                     std::list<server_prompt_cache_state>::iterator it_entry, bool is_move, int matched_len) {
+        bool res = prompt_cache.restore_entry(prompt, it_entry, ctx_tgt, ctx_dft, id, is_move, matched_len);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -1679,170 +1680,193 @@ private:
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
-        bool update_cache = false;
+        // Unified LCP-based candidate selection (improve/concept-cache-mgmt.txt).
+        // Candidates: idle live slots AND prompt-cache entries.
+        //   qualified : the match covers at least one of the candidate's checkpoints
+        //   all       : the match covers the candidate's last checkpoint
+        // An "all" match on a live slot is an early winner (no cache scan needed).
+        // Otherwise the longest LCP wins; ties prefer the live slot.
 
-        // read-only diagnostic: report what the prompt cache would match (LLAMA_PROMPT_CACHE_INSTRUMENT)
-        auto scan_prompt_cache = [&](server_slot & log_slot, size_t lcp_to_compare) {
-            if (!pc_instr_enabled() || task.id_slot != -1 || !prompt_cache) {
-                return;
-            }
-
-            size_t best_lcp = 0;
-            const server_prompt_cache_state * best_entry = nullptr;
-            for (const auto & st : prompt_cache->states) {
-                if (st.data.main.empty()) {
-                    continue; // entry already consumed (moved to a slot)
-                }
-                const size_t lcp = st.prompt.tokens.get_common_prefix(task.tokens);
-                if (lcp > best_lcp) {
-                    best_lcp = lcp;
-                    best_entry = &st;
-                }
-            }
-
-            std::string type = "none";
-            if (best_entry && best_lcp > 0) {
-                const bool is_all = best_entry->prompt.checkpoints.empty() ?
-                    (best_lcp >= best_entry->prompt.tokens.size()) :
-                    (best_lcp >= static_cast<size_t>(best_entry->prompt.checkpoints.back().n_tokens));
-                type = is_all ? "all" : "part";
-            }
-
-            SLT_INF(log_slot, "PCACHE_SCAN source=cache addr=%p type=%s match_len=%zu entry_tok=%zu %s\n",
-                    (const void*) best_entry, type.c_str(), best_lcp,
-                    best_entry ? (size_t) best_entry->prompt.n_tokens() : 0,
-                    (best_entry && best_lcp > lcp_to_compare) ? "use" : "");
+        struct pc_candidate {
+            server_slot * slot = nullptr;                                // live-slot candidate
+            std::list<server_prompt_cache_state>::iterator entry_it;     // cache-entry candidate
+            bool is_entry = false;
+            size_t lcp = 0;
+            bool qualified = false;
+            bool is_all = false;
         };
 
-        // if a specific slot is requested, use it (still goes through cache update logic below)
-        if (task.id_slot != -1) {
-            ret = get_slot_by_id(task.id_slot);
-            if (ret) {
-                SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+        const bool use_cache = (task.type == SERVER_TASK_TYPE_COMPLETION) && (prompt_cache != nullptr);
+
+        auto classify_prompt = [](const server_prompt & p, size_t lcp, bool & qualified, bool & is_all) {
+            if (!p.checkpoints.empty()) {
+                qualified = lcp >= static_cast<size_t>(p.checkpoints.front().n_tokens);
+                is_all    = lcp >= static_cast<size_t>(p.checkpoints.back().n_tokens);
+            } else {
+                // no checkpoints: usable only when the whole prompt is shared
+                qualified = (lcp > 0) && (lcp >= p.tokens.size());
+                is_all    = qualified;
             }
-        }
+        };
 
-        // find the slot that has at least n% prompt similarity
-        if (slot_prompt_similarity != 0.0f) {
-            float f_sim_best = 0;
-            size_t lcp_len_best = 0;
+        // return true if candidate c beats the current best (longer LCP wins; tie -> live slot preferred)
+        auto consider_better = [](const pc_candidate & c, const pc_candidate & best) {
+            if (!c.qualified) {
+                return false;
+            }
+            if (!best.qualified) {
+                return true;
+            }
+            if (c.lcp > best.lcp) {
+                return true;
+            }
+            return (c.lcp == best.lcp) && !c.is_entry && best.is_entry;
+        };
 
+        // scan live slots: an "all" match is an early winner; otherwise collect the best partial
+        bool early_winner = false;
+        pc_candidate best;
+        if (task.id_slot == -1) {
             for (server_slot & slot : slots) {
-                if (task.id_slot != -1 && slot.id != task.id_slot) {
-                    continue;
-                }
-
-                // skip the slot if it is not available
                 if (slot.is_processing()) {
                     SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing());
                     continue;
                 }
 
                 const auto & tokens = slot.prompt.tokens;
-
-                // skip the slot if it does not contains cached tokens
                 if (tokens.empty()) {
                     SLT_TRC(slot, "%s", " - skipping, slot is empty\n");
                     continue;
                 }
 
-                // fraction of the Longest Common Prefix length with respect to the input prompt length
                 const size_t lcp_len = tokens.get_common_prefix(task.tokens);
-                const float f_sim_cur = float(lcp_len) / task.tokens.size();
+                bool qualified, is_all;
+                classify_prompt(slot.prompt, lcp_len, qualified, is_all);
 
-                SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
+                SLT_TRC(slot, " - checking LCP: prompt=%zu, cached=%zu, match=%zu [%s]\n",
+                        task.tokens.size(), tokens.size(), lcp_len, is_all ? "ALL" : (qualified ? "PART" : "-"));
 
-                // select the current slot if the criteria match
-                if (f_sim_cur > f_sim_best && f_sim_cur > slot_prompt_similarity) {
-                    f_sim_best = f_sim_cur;
-                    lcp_len_best = lcp_len;
+                if (is_all) {
+                    ret = &slot; // early winner: the conversation is already in live memory
+                    SLT_INF(slot, "selected slot by ALL match (continuation): prompt=%zu, match=%zu\n",
+                            task.tokens.size(), lcp_len);
+                    early_winner = true;
+                    break;
+                }
 
-                    ret = &slot;
+                pc_candidate c;
+                c.slot      = &slot;
+                c.lcp       = lcp_len;
+                c.qualified = qualified;
+                if (consider_better(c, best)) {
+                    best = std::move(c);
+                    ret  = &slot;
                 }
             }
-
-            if (ret != nullptr) {
-                const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
-
-                // Classification for diagnostics: is this a continuation or divergence?
-                const bool is_continuation =
-                    ret->prompt.checkpoints.empty() ?
-                        (lcp_len_best >= ret->prompt.tokens.size()) :
-                        (lcp_len_best >= static_cast<size_t>(ret->prompt.checkpoints.back().n_tokens));
-
-                if (task.id_slot == -1) {
-                    SLT_INF(*ret, "selected slot by LCP similarity: prompt=%zu, cached=%zu, match=%zu [%s]\n",
-                            task.tokens.size(), ret->prompt.tokens.size(), lcp_len_best,
-                            is_continuation ? "ALL" : "PART");
-
-                    if (pc_instr_enabled()) {
-                        SLT_INF(*ret, "PCACHE_MATCH type=%s source=slot %d match_len=%zu f_keep=%.3f\n",
-                                is_continuation ? "all" : "part", ret->id, lcp_len_best, f_keep);
-
-                        // read-only scan: what would the prompt cache match? (diagnostic only)
-                        // skip when the slot match is a full continuation — nothing interesting to compare
-                        if (!is_continuation) {
-                            scan_prompt_cache(*ret, lcp_len_best);
-                        }
-                    }
-                }
-
-                // if this is not a plain continuation, the slot's existing state would be displaced -
-                // save it to the prompt cache first so its conversation can be restored later
-                // (unconditional save on displacement: concept-eviction.txt step 1)
-                if (!is_continuation) {
-                    update_cache = true;
-                }
+        } else {
+            // a specific slot is requested: use it
+            ret = get_slot_by_id(task.id_slot);
+            if (ret) {
+                SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
             }
         }
 
-        // find the slot that has been least recently used
-        if (ret == nullptr) {
-            int64_t t_last = -1;
+        // scan the prompt cache for a better candidate than any live slot
+        pc_candidate cache_best;
+        if (use_cache && !early_winner && task.id_slot == -1) {
+            for (auto it = prompt_cache->states.begin(); it != prompt_cache->states.end(); ++it) {
+                const auto & st = *it;
+                if (st.data.main.empty()) {
+                    continue; // entry already consumed (moved to a slot)
+                }
 
-            for (server_slot & slot : slots) {
-                // skip the slot if it is not available
-                if (slot.is_processing()) {
+                const size_t lcp = st.prompt.tokens.get_common_prefix(task.tokens);
+                bool qualified, is_all;
+                classify_prompt(st.prompt, lcp, qualified, is_all);
+
+                if (!qualified) {
                     continue;
                 }
 
-                // select the current slot if the criteria match
+                pc_candidate c;
+                c.entry_it  = it;
+                c.is_entry  = true;
+                c.lcp       = lcp;
+                c.qualified = qualified;
+                c.is_all    = is_all;
+
+                if (consider_better(c, best)) {
+                    cache_best = c;
+                    ret        = nullptr; // winner is a cache entry, not a live slot
+                } else {
+                    cache_best = c; // remember the longest qualified entry for diagnostics
+                }
+            }
+
+            // (a cache-entry win logs PCACHE_HIT inside restore_entry; no separate SCAN needed)
+        }
+
+        // handle the winner and prepare the slot:
+        if (ret == nullptr && use_cache && cache_best.qualified) {
+            // Winner = a cache entry. Find a free slot, else LRU-evict a used one,
+            // save its displaced state first, then move/copy the winning entry in.
+            int64_t t_last = -1;
+            for (server_slot & slot : slots) {
+                if (slot.is_processing()) {
+                    continue;
+                }
                 if (!ret || slot.t_last_used <= t_last) {
                     t_last = slot.t_last_used;
-                    ret = &slot;
+                    ret    = &slot;
                 }
             }
 
             if (ret != nullptr) {
-                SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 "\n", t_last);
-
-                // no slot matched: report what the prompt cache would match (diagnostic only)
-                scan_prompt_cache(*ret, 0);
-
-                update_cache = true;
-            }
-        }
-
-        if (ret) {
-            update_cache = update_cache && prompt_cache;
-
-            // cache prompts only for completion tasks
-            update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
-
-            if (update_cache) {
-                SRV_TRC("%s", "updating prompt cache\n");
+                SLT_INF(*ret, "selected slot for cache restore, t_last = %" PRId64 "\n", t_last);
 
                 const int64_t t_start = ggml_time_us();
 
+                // unconditional save of the displaced state (concept-cache-mgmt R3)
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                if (!ret->prompt_load(*prompt_cache, cache_best.entry_it, cache_best.is_all, (int) cache_best.lcp)) {
                     ret->prompt_clear();
                 }
 
                 prompt_cache->update();
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+            }
+        } else if (ret != nullptr && use_cache && !early_winner) {
+            // Winner = a live slot with a PARTIAL match (not an ALL continuation):
+            // its existing state is displaced, so save it to keep the conversation restorable.
+            const int64_t t_start = ggml_time_us();
+
+            ret->prompt_save(*prompt_cache);
+            prompt_cache->update();
+
+            SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+        } else if (ret == nullptr) {
+            // Nothing matched: take the least recently used idle slot and reuse it fresh,
+            // saving its displaced state first so nothing recoverable is lost.
+            int64_t t_last = -1;
+            for (server_slot & slot : slots) {
+                if (slot.is_processing()) {
+                    continue;
+                }
+                if (!ret || slot.t_last_used <= t_last) {
+                    t_last = slot.t_last_used;
+                    ret    = &slot;
+                }
+            }
+
+            if (ret != nullptr) {
+                SLT_INF(*ret, "selected slot by LRU (no match), t_last = %" PRId64 "\n", t_last);
+
+                if (use_cache && !ret->prompt.tokens.empty()) {
+                    ret->prompt_save(*prompt_cache);
+                    prompt_cache->update();
+                }
             }
         }
 

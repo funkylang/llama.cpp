@@ -1826,84 +1826,70 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
-
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float f_sim_best  = float(lcp_best) / tokens_new.size();
-
-    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
-
-    auto it_best = states.end();
-
-    // find the most similar cached prompt, that would also preserve the most context
-    for (auto it = states.begin(); it != states.end(); ++it) {
-        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
-
-        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
-
-        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
-
-        // don't trash large prompts
-        if (f_keep_cur < 0.25f) {
-            continue;
-        }
-
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
-            f_keep_best = f_keep_cur;
-            f_sim_best  = f_sim_cur;
-
-            it_best = it;
-        }
+bool server_prompt_cache::restore_entry(server_prompt & prompt, std::list<server_prompt_cache_state>::iterator it_best,
+        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool is_move, int matched_len) {
+    if (it_best == states.end()) {
+        return true; // nothing to restore
     }
 
-    if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
-        
-        // Instrumentation: log hit
-        if (pc_instr_enabled()) {
-            SRV_INF("PCACHE_HIT addr=%p tok=%zu matched=%d slot=%d\n",
-                    (const void*)&(*it_best), (size_t)it_best->prompt.n_tokens(), lcp_best, id_slot);
+    // Instrumentation: log hit
+    if (pc_instr_enabled()) {
+        SRV_INF("PCACHE_HIT addr=%p tok=%zu matched=%d type=%s slot=%d\n",
+                (const void*)&(*it_best), (size_t)it_best->prompt.n_tokens(), matched_len,
+                is_move ? "move" : "copy", id_slot);
+    }
+
+    if (is_move) {
+        // The whole prompt is consumed: relocate the state into the slot and free it from the cache.
+
+        auto & data = it_best->data.main;
+        const size_t size = data.size();
+        const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+        if (n != size) {
+            SRV_ERR("failed to restore state with size %zu\n", size);
+            return false;
         }
+        data.clear();
+        data.shrink_to_fit();
 
-        {
-            auto & data = it_best->data.main;
-
-            const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
-            if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
-
+        if (!it_best->data.drft.empty()) {
+            GGML_ASSERT(ctx_dft);
+            auto & drft = it_best->data.drft;
+            const size_t dsize = drft.size();
+            const size_t dn = llama_state_seq_set_data_ext(ctx_dft, drft.data(), dsize, id_slot, 0);
+            if (dn != dsize) {
+                SRV_WRN("failed to restore draft state with size %zu\n", dsize);
                 return false;
             }
-
-            data.clear();
-            data.shrink_to_fit();
-        }
-
-        {
-            auto & data = it_best->data.drft;
-
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
-
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-                if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
-
-                    return false;
-                }
-
-                data.clear();
-                data.shrink_to_fit();
-            }
+            drft.clear();
+            drft.shrink_to_fit();
         }
 
         prompt = std::move(it_best->prompt);
-
         states.erase(it_best);
+    } else {
+        // Only a prefix is used as a new prompt: copy the state into the slot, keep the entry in the cache.
+
+        if (!it_best->data.main.empty()) {
+            const size_t size = it_best->data.main.size();
+            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, it_best->data.main.data(), size, id_slot, 0);
+            if (n != size) {
+                SRV_ERR("failed to restore state with size %zu\n", size);
+                return false;
+            }
+        }
+
+        if (!it_best->data.drft.empty()) {
+            GGML_ASSERT(ctx_dft);
+            const size_t size = it_best->data.drft.size();
+            const size_t n = llama_state_seq_set_data_ext(ctx_dft, it_best->data.drft.data(), size, id_slot, 0);
+            if (n != size) {
+                SRV_WRN("failed to restore draft state with size %zu\n", size);
+                return false;
+            }
+        }
+
+        prompt = it_best->prompt.clone(); // COPY: original stays in the cache
     }
 
     return true;
