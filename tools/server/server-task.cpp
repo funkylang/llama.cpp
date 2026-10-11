@@ -1709,7 +1709,7 @@ json server_task_result_apply_lora::to_json() {
 std::string server_prompt_cache::state_dump(const std::string & header) const {
     // Every row carries the full indent so all addresses align under the header data,
     // which starts after the log prefix (timestamp, level, "srv", function name).
-    const size_t row_indent = 38;
+    const size_t row_indent = 45;
     std::stringstream ss;
     ss << header << "\n";
     for (const auto & state : states) {
@@ -1717,7 +1717,7 @@ std::string server_prompt_cache::state_dump(const std::string & header) const {
            << (const void*)&state << "  "
            << std::setw(6) << std::right << state.prompt.n_tokens() << " tokens"
            << "  "
-           << std::setw(9) << std::right
+           << std::setw(6) << std::right
            << static_cast<size_t>(state.size() / (1024.0 * 1024.0)) << " MiB"
            << "  "
            << std::setw(3) << std::right << state.prompt.checkpoints.size() << " snapshots\n";
@@ -1849,10 +1849,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         std::ostringstream os;
         os << "PCACHE_CREATE addr=" << (const void*)&states.back()
            << " tok=" << states.back().prompt.n_tokens()
-           << " size=" << std::fixed << std::setprecision(3)
-           << states.back().size() / (1024.0 * 1024.0)
+           << " size=" << static_cast<size_t>(states.back().size() / (1024.0 * 1024.0))
            << " MiB entries=" << states.size()
-           << " total=" << size() / (1024.0 * 1024.0) << " MiB";
+           << " total=" << static_cast<size_t>(size() / (1024.0 * 1024.0)) << " MiB";
         SRV_INF("%s", state_dump(os.str()).c_str());
     }
 
@@ -1923,8 +1922,9 @@ bool server_prompt_cache::restore_entry(server_prompt & prompt, std::list<server
 
     // Instrumentation: log hit after restore, so counters reflect resulting cache state
     if (pc_instr_enabled()) {
-        SRV_INF("PCACHE_HIT addr=%p tok=%zu matched=%d type=%s slot=%d entries=%zu total=%.3f MiB\n",
-                addr, tok, matched_len, is_move ? "move" : "copy", id_slot, states.size(), size() / (1024.0 * 1024.0));
+        SRV_INF("PCACHE_HIT addr=%p tok=%zu matched=%d type=%s slot=%d entries=%zu total=%zu MiB\n",
+                addr, tok, matched_len, is_move ? "move" : "copy", id_slot, states.size(),
+                static_cast<size_t>(size() / (1024.0 * 1024.0)));
     }
 
     return true;
@@ -1944,8 +1944,7 @@ void server_prompt_cache::update() {
                    << " tok=" << tok
                    << " reason=size-limit"
                    << " remaining=" << states.size()
-                   << " total=" << std::fixed << std::setprecision(3)
-                   << size() / (1024.0 * 1024.0) << " MiB";
+                   << " total=" << static_cast<size_t>(size() / (1024.0 * 1024.0)) << " MiB";
                 SRV_INF("%s", state_dump(os.str()).c_str());
             }
         }
@@ -1971,8 +1970,7 @@ void server_prompt_cache::update() {
                    << " tok=" << tok
                    << " reason=token-limit"
                    << " remaining=" << states.size()
-                   << " total=" << std::fixed << std::setprecision(3)
-                   << size() / (1024.0 * 1024.0) << " MiB";
+                   << " total=" << static_cast<size_t>(size() / (1024.0 * 1024.0)) << " MiB";
                 SRV_INF("%s", state_dump(os.str()).c_str());
             }
         }
