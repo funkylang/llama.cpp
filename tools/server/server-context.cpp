@@ -2608,6 +2608,7 @@ private:
         size_t pos = 0;
         for (const auto & ckpt : slot.prompt.checkpoints) {
             if (pos % n_cols == 0) {
+                msg += pos == 0 ? "" : "\n";
                 msg.append(row_indent, ' ');
             }
             const bool marked = (ckpt.id_task == del_id_task) && (ckpt.n_tokens == del_n_tokens);
@@ -2621,44 +2622,6 @@ private:
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
-
-        // evict checkpoints within min-step of a previous checkpoint, unless they were
-        // created by the current task
-        // only when the list is full, otherwise short prompts keep just the oldest checkpoint
-        int64_t last = -1;
-        for (auto it = slot.prompt.checkpoints.begin();
-                slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
-                it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
-                SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                        it->n_tokens, (float) it->size() / 1024 / 1024);
-
-                if (pc_instr_enabled()) {
-                    log_checkpoint_delete(slot, it->id_task, it->n_tokens,
-                            "too-many (" + std::to_string(slot.prompt.checkpoints.size()) + ")");
-                }
-
-                it = slot.prompt.checkpoints.erase(it);
-                continue;
-            }
-
-            last = it->n_tokens;
-            ++it;
-        }
-
-        while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
-
-            SLT_WRN(slot, "erasing old context checkpoint (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.n_tokens, (float) cur.size() / 1024 / 1024);
-
-            if (pc_instr_enabled()) {
-                log_checkpoint_delete(slot, cur.id_task, cur.n_tokens, "limit");
-            }
-
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
-        }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
         {
@@ -2691,6 +2654,41 @@ private:
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+
+        // keep the list at or below capacity: while over the limit, delete the internal
+        // checkpoint (never first, never last) whose nearest neighbour is closest to it;
+        // on ties take the earliest candidate. Runs after insertion so the new
+        // checkpoint is protected as "last"; std::list makes erasing cheap.
+        while (slot.prompt.checkpoints.size() > (size_t) params_base.n_ctx_checkpoints) {
+            if (slot.prompt.checkpoints.size() < 3) {
+                break; // degenerate list: only first and last exist, neither is deletable
+            }
+
+            int64_t best_dist = -1;
+            auto best_it = slot.prompt.checkpoints.end();
+
+            auto it_prev = slot.prompt.checkpoints.begin();
+            for (auto it = std::next(slot.prompt.checkpoints.begin());
+                    std::next(it) != slot.prompt.checkpoints.end(); ++it, it_prev = it) {
+                const int64_t dist = std::min(
+                        it->n_tokens - it_prev->n_tokens,
+                        std::next(it)->n_tokens - it->n_tokens);
+
+                if (best_dist < 0 || dist < best_dist) { // ties keep the earliest candidate
+                    best_dist = dist;
+                    best_it = it;
+                }
+            }
+
+            SLT_TRC(slot, "erasing context checkpoint with closest neighbour (n_tokens = %" PRId64 ", dist = %" PRId64 ", size = %.3f MiB)\n",
+                    best_it->n_tokens, best_dist, (float) best_it->size() / 1024 / 1024);
+
+            if (pc_instr_enabled()) {
+                log_checkpoint_delete(slot, best_it->id_task, best_it->n_tokens, "spacing");
+            }
+
+            slot.prompt.checkpoints.erase(best_it);
+        }
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
