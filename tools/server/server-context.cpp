@@ -2589,6 +2589,20 @@ private:
         return true;
     }
 
+    // instrumentation (LLAMA_PROMPT_CACHE_INSTRUMENT): dump all checkpoint positions, 8 per line
+    void log_checkpoint_list(const server_slot & slot) const {
+        std::string msg = "CKPT_DELETE_LIST";
+        size_t count = 0;
+        for (const auto & ckpt : slot.prompt.checkpoints) {
+            if (count > 0 && count % 8 == 0) {
+                msg += "\n";
+            }
+            msg += " " + std::to_string(ckpt.n_tokens);
+            count++;
+        }
+        SLT_INF(slot, "%s\n", msg.c_str());
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
@@ -2605,6 +2619,7 @@ private:
                         it->n_tokens, (float) it->size() / 1024 / 1024);
 
                 if (pc_instr_enabled()) {
+                    log_checkpoint_list(slot);
                     SLT_INF(slot, "CKPT_DELETE id_task=%d tok=%" PRId64 " reason=too-many (%zu)\n",
                             it->id_task, it->n_tokens, slot.prompt.checkpoints.size());
                 }
