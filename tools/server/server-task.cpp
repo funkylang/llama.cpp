@@ -1704,13 +1704,17 @@ json server_task_result_apply_lora::to_json() {
 
 // Instrumentation: LLAMA_PROMPT_CACHE_INSTRUMENT (any non-empty value enables)
 std::string server_prompt_cache::state_dump() const {
+    // Every line carries the full indent so all lines align in the log, where the
+    // framework only prefixes the first physical line of a multi-line message.
+    const size_t row_indent = 38; // aligns with the log prefix (timestamp, level, "srv", function)
     std::stringstream ss;
     for (const auto & state : states) {
-        ss << (const void*)&state << "  "
+        ss << std::string(row_indent, ' ')
+           << (const void*)&state << "  "
            << std::setw(6) << std::right << state.prompt.n_tokens() << " tokens"
            << "  "
-           << std::setw(10) << std::right << std::fixed << std::setprecision(3)
-           << state.size() / (1024.0 * 1024.0) << " MiB"
+           << std::setw(9) << std::right
+           << static_cast<size_t>(state.size() / (1024.0 * 1024.0)) << " MiB"
            << "  "
            << std::setw(3) << std::right << state.prompt.checkpoints.size() << " snapshots\n";
     }
