@@ -1762,12 +1762,14 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
         if (len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
+            const void * addr = (const void*)&(*it);
+            const size_t tok = it->prompt.n_tokens();
+            it = states.erase(it);
 
             if (pc_instr_enabled()) {
-                SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=obsolete\n",
-                        (const void*)&(*it), (size_t)it->prompt.n_tokens());
+                SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=obsolete remaining=%zu total=%.3f MiB\n",
+                        addr, tok, states.size(), size() / (1024.0 * 1024.0));
             }
-            it = states.erase(it);
         } else {
             ++it;
         }
@@ -1778,12 +1780,14 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         while (!states.empty() && size() + state_size_new > limit_size) {
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
+            const void * addr = (const void*)&states.front();
+            const size_t tok = states.front().prompt.n_tokens();
+            states.pop_front();
 
             if (pc_instr_enabled()) {
-                SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=size-limit\n",
-                        (const void*)&states.front(), (size_t)states.front().prompt.n_tokens());
+                SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=size-limit remaining=%zu total=%.3f MiB\n",
+                        addr, tok, states.size(), size() / (1024.0 * 1024.0));
             }
-            states.pop_front();
         }
     }
 
@@ -1819,8 +1823,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     // Instrumentation: log creation
     if (pc_instr_enabled()) {
-        SRV_INF("PCACHE_CREATE addr=%p tok=%zu\n", 
-                (const void*)&states.back(), (size_t)states.back().prompt.n_tokens());
+        SRV_INF("PCACHE_CREATE addr=%p tok=%zu size=%.3f MiB entries=%zu total=%.3f MiB\n",
+                (const void*)&states.back(), (size_t)states.back().prompt.n_tokens(),
+                states.back().size() / (1024.0 * 1024.0), states.size(), size() / (1024.0 * 1024.0));
     }
 
     return &states.back();
@@ -1899,12 +1904,14 @@ void server_prompt_cache::update() {
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+            const void * addr = (const void*)&states.front();
+            const size_t tok = states.front().prompt.n_tokens();
+            states.pop_front();
 
             if (pc_instr_enabled()) {
-                SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=size-limit\n",
-                        (const void*)&states.front(), (size_t)states.front().prompt.n_tokens());
+                SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=size-limit remaining=%zu total=%.3f MiB\n",
+                        addr, tok, states.size(), size() / (1024.0 * 1024.0));
             }
-            states.pop_front();
         }
     }
 
@@ -1918,12 +1925,14 @@ void server_prompt_cache::update() {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+            const void * addr = (const void*)&states.front();
+            const size_t tok = states.front().prompt.n_tokens();
+            states.pop_front();
 
             if (pc_instr_enabled()) {
-                SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=token-limit\n",
-                        (const void*)&states.front(), (size_t)states.front().prompt.n_tokens());
+                SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=token-limit remaining=%zu total=%.3f MiB\n",
+                        addr, tok, states.size(), size() / (1024.0 * 1024.0));
             }
-            states.pop_front();
         }
     }
 
