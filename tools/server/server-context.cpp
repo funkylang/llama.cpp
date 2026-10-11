@@ -2688,7 +2688,7 @@ private:
 
             auto it_prev = slot.prompt.checkpoints.begin();
             for (auto it = std::next(slot.prompt.checkpoints.begin());
-                    std::next(it) != slot.prompt.checkpoints.end(); ++it, it_prev = it) {
+                    std::next(it) != slot.prompt.checkpoints.end(); it_prev = it, ++it) {
                 const int64_t gap_left  = it->n_tokens - it_prev->n_tokens;
                 const int64_t gap_right = std::next(it)->n_tokens - it->n_tokens;
                 const int64_t cost      = gap_left + gap_right;
