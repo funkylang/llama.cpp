@@ -1837,12 +1837,8 @@ bool server_prompt_cache::restore_entry(server_prompt & prompt, std::list<server
         return true; // nothing to restore
     }
 
-    // Instrumentation: log hit
-    if (pc_instr_enabled()) {
-        SRV_INF("PCACHE_HIT addr=%p tok=%zu matched=%d type=%s slot=%d\n",
-                (const void*)&(*it_best), (size_t)it_best->prompt.n_tokens(), matched_len,
-                is_move ? "move" : "copy", id_slot);
-    }
+    const void * addr = (const void*)&(*it_best);
+    const size_t tok = (size_t)it_best->prompt.n_tokens();
 
     if (is_move) {
         // The whole prompt is consumed: relocate the state into the slot and free it from the cache.
@@ -1895,6 +1891,12 @@ bool server_prompt_cache::restore_entry(server_prompt & prompt, std::list<server
         }
 
         prompt = it_best->prompt.clone(); // COPY: original stays in the cache
+    }
+
+    // Instrumentation: log hit after restore, so counters reflect resulting cache state
+    if (pc_instr_enabled()) {
+        SRV_INF("PCACHE_HIT addr=%p tok=%zu matched=%d type=%s slot=%d entries=%zu total=%.3f MiB\n",
+                addr, tok, matched_len, is_move ? "move" : "copy", id_slot, states.size(), size() / (1024.0 * 1024.0));
     }
 
     return true;
