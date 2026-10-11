@@ -1683,6 +1683,39 @@ private:
 
         bool update_cache = false;
 
+        // read-only diagnostic: report what the prompt cache would match (LLAMA_PROMPT_CACHE_INSTRUMENT)
+        auto scan_prompt_cache = [&](server_slot & log_slot, size_t lcp_to_compare) {
+            if (!pc_instr_enabled() || task.id_slot != -1 || !prompt_cache) {
+                return;
+            }
+
+            size_t best_lcp = 0;
+            const server_prompt_cache_state * best_entry = nullptr;
+            for (const auto & st : prompt_cache->states) {
+                if (st.data.main.empty()) {
+                    continue; // entry already consumed (moved to a slot)
+                }
+                const size_t lcp = st.prompt.tokens.get_common_prefix(task.tokens);
+                if (lcp > best_lcp) {
+                    best_lcp = lcp;
+                    best_entry = &st;
+                }
+            }
+
+            std::string type = "none";
+            if (best_entry && best_lcp > 0) {
+                const bool is_all = best_entry->prompt.checkpoints.empty() ?
+                    (best_lcp >= best_entry->prompt.tokens.size()) :
+                    (best_lcp >= best_entry->prompt.checkpoints.back().n_tokens);
+                type = is_all ? "all" : "part";
+            }
+
+            SLT_INF(log_slot, "PCACHE_SCAN source=cache type=%s match_len=%zu entry_tok=%zu %s\n",
+                    type.c_str(), best_lcp,
+                    best_entry ? (size_t) best_entry->prompt.n_tokens() : 0,
+                    (best_entry && best_lcp > lcp_to_compare) ? "(better than slot)" : "");
+        };
+
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
             ret = get_slot_by_id(task.id_slot);
@@ -1733,9 +1766,24 @@ private:
             if (ret != nullptr) {
                 const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
 
+                // Classification for diagnostics: is this a continuation or divergence?
+                const bool is_continuation =
+                    ret->prompt.checkpoints.empty() ?
+                        (lcp_len_best >= ret->prompt.tokens.size()) :
+                        (lcp_len_best >= ret->prompt.checkpoints.back().n_tokens);
+
                 if (task.id_slot == -1) {
-                    SLT_INF(*ret, "selected slot by LCP similarity: prompt=%zu, cached=%zu, match=%zu\n",
-                            task.tokens.size(), ret->prompt.tokens.size(), lcp_len_best);
+                    SLT_INF(*ret, "selected slot by LCP similarity: prompt=%zu, cached=%zu, match=%zu [%s]\n",
+                            task.tokens.size(), ret->prompt.tokens.size(), lcp_len_best,
+                            is_continuation ? "ALL" : "PART");
+
+                    if (pc_instr_enabled()) {
+                        SLT_INF(*ret, "PCACHE_MATCH type=%s source=slot match_len=%zu f_keep=%.3f\n",
+                                is_continuation ? "all" : "part", lcp_len_best, f_keep);
+
+                        // read-only scan: what would the prompt cache match? (diagnostic only)
+                        scan_prompt_cache(*ret, lcp_len_best);
+                    }
                 }
 
                 // if we are about to lose a large portion of the existing context - save it in the prompt cache
@@ -1764,6 +1812,9 @@ private:
 
             if (ret != nullptr) {
                 SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 "\n", t_last);
+
+                // no slot matched: report what the prompt cache would match (diagnostic only)
+                scan_prompt_cache(*ret, 0);
 
                 update_cache = true;
             }
@@ -1814,6 +1865,21 @@ private:
 
             if (slot.prompt.n_tokens() > 0) {
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
+
+                // diagnostic: is the purged state recoverable from the prompt cache?
+                bool recoverable = false;
+                if (pc_instr_enabled() && prompt_cache) {
+                    for (const auto & st : prompt_cache->states) {
+                        if (!st.data.main.empty() &&
+                            st.prompt.tokens.get_common_prefix(slot.prompt.tokens) == slot.prompt.tokens.size()) {
+                            recoverable = true;
+                            break;
+                        }
+                    }
+
+                    SLT_INF(slot, "PCACHE_EVICT source=kv-pressure prompt=%zu recoverable=%s\n",
+                            (size_t) slot.prompt.tokens.size(), recoverable ? "yes" : "NO");
+                }
 
                 slot.prompt_clear();
 
