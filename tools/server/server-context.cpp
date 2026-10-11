@@ -2641,7 +2641,7 @@ private:
 
         const int n_cols = 8;
         msg += "\n";
-        const size_t row_indent = msg.size() - 1 + 11; // spaces before the first number of each grid row (+11 for alignment)
+        const size_t row_indent = 64; // spaces before the first number of each grid row
         size_t pos = 0;
         for (const auto & ckpt : slot.prompt.checkpoints) {
             if (pos % n_cols == 0) {
@@ -2650,7 +2650,8 @@ private:
             }
             const bool marked = (ckpt.id_task == del_id_task) && (ckpt.n_tokens == del_n_tokens);
             const std::string tok_str = std::to_string(ckpt.n_tokens);
-            msg += " " + std::string(width - tok_str.size(), ' ') + tok_str + (marked ? "*" : "");
+            msg += " " + std::string(width - tok_str.size(), ' ') + tok_str +
+                   (marked ? "*" : pos % n_cols == n_cols ? "" : " ");
             pos++;
         }
         SLT_INF(slot, "%s\n", msg.c_str());
