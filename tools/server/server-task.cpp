@@ -1924,7 +1924,18 @@ bool server_prompt_cache::restore_entry(server_prompt & prompt, std::list<server
     if (pc_instr_enabled()) {
         SRV_INF("PCACHE_HIT addr=%p tok=%zu matched=%d type=%s slot=%d entries=%zu total=%zu MiB\n",
                 addr, tok, matched_len, is_move ? "move" : "copy", id_slot, states.size(),
-                static_cast<size_t>(size() / (1024.0 * 1024.0)));
+                static_cast<size_t>(this->size() / (1024.0 * 1024.0)));
+
+        // For MOVE operations, the entry was consumed and erased from the cache; log the deletion after the hit
+        if (is_move) {
+            std::ostringstream os;
+            os << "PCACHE_DELETE addr=" << addr
+               << " tok=" << tok
+               << " reason=consumed"
+               << " remaining=" << states.size()
+               << " total=" << static_cast<size_t>(this->size() / (1024.0 * 1024.0)) << " MiB";
+            SRV_INF("%s", state_dump(os.str()).c_str());
+        }
     }
 
     return true;
