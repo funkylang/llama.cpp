@@ -2670,8 +2670,8 @@ private:
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
         if (pc_instr_enabled()) {
-            SLT_INF(slot, "CKPT_CREATE id_task=%d tok=%" PRId64 "\n",
-                    cur.id_task, cur.n_tokens);
+            SLT_INF(slot, "CKPT_CREATE id_task=%d tok=%" PRId64 " total=%zu\n",
+                    cur.id_task, cur.n_tokens, slot.prompt.checkpoints.size());
         }
     }
 
