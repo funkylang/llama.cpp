@@ -1711,7 +1711,7 @@ private:
             SLT_INF(log_slot, "PCACHE_SCAN source=cache addr=%p type=%s match_len=%zu entry_tok=%zu %s\n",
                     (const void*) best_entry, type.c_str(), best_lcp,
                     best_entry ? (size_t) best_entry->prompt.n_tokens() : 0,
-                    (best_entry && best_lcp > lcp_to_compare) ? "(better than slot)" : "");
+                    (best_entry && best_lcp > lcp_to_compare) ? "use" : "");
         };
 
         // if a specific slot is requested, use it (still goes through cache update logic below)
