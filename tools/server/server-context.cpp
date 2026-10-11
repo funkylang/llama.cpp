@@ -1787,8 +1787,10 @@ private:
                     }
                 }
 
-                // if we are about to lose a large portion of the existing context - save it in the prompt cache
-                if (f_keep < 0.5f) {
+                // if this is not a plain continuation, the slot's existing state would be displaced -
+                // save it to the prompt cache first so its conversation can be restored later
+                // (unconditional save on displacement: concept-eviction.txt step 1)
+                if (!is_continuation) {
                     update_cache = true;
                 }
             }
