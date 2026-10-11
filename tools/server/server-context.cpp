@@ -2617,7 +2617,7 @@ private:
 
         const int n_cols = 8;
         msg += "\n";
-        const size_t row_indent = msg.size() - 1 + 9; // spaces before the first number of each grid row (+9 for alignment)
+        const size_t row_indent = msg.size() - 1 + 11; // spaces before the first number of each grid row (+11 for alignment)
         size_t pos = 0;
         for (const auto & ckpt : slot.prompt.checkpoints) {
             if (pos % n_cols == 0) {
@@ -2655,7 +2655,7 @@ private:
         }
 
         // evict BEFORE adding the new checkpoint so the list never exceeds n_ctx_checkpoints;
-        // the internal checkpoint whose nearest neighbour is closest gets dropped (first and
+        // the internal checkpoint minimizing gap_left + gap_right gets dropped (first and
         // last are protected). Ties break to the earliest candidate. std::list makes erasing cheap.
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             int64_t best_dist = -1;
@@ -2664,17 +2664,17 @@ private:
             auto it_prev = slot.prompt.checkpoints.begin();
             for (auto it = std::next(slot.prompt.checkpoints.begin());
                     std::next(it) != slot.prompt.checkpoints.end(); ++it, it_prev = it) {
-                const int64_t dist = std::min(
-                        it->n_tokens - it_prev->n_tokens,
-                        std::next(it)->n_tokens - it->n_tokens);
+                const int64_t gap_left  = it->n_tokens - it_prev->n_tokens;
+                const int64_t gap_right = std::next(it)->n_tokens - it->n_tokens;
+                const int64_t cost      = gap_left + gap_right;
 
-                if (best_dist < 0 || dist < best_dist) { // ties keep the earliest candidate
-                    best_dist = dist;
+                if (best_dist < 0 || cost < best_dist) { // ties keep the earliest candidate
+                    best_dist = cost;
                     best_it = it;
                 }
             }
 
-            SLT_TRC(slot, "erasing context checkpoint with closest neighbour (n_tokens = %" PRId64 ", dist = %" PRId64 ", size = %.3f MiB)\n",
+            SLT_TRC(slot, "erasing context checkpoint with minimal neighbour gap sum (n_tokens = %" PRId64 ", gap_left + gap_right = %" PRId64 ", size = %.3f MiB)\n",
                     best_it->n_tokens, best_dist, (float) best_it->size() / 1024 / 1024);
 
             if (pc_instr_enabled()) {
