@@ -1704,7 +1704,7 @@ private:
             if (best_entry && best_lcp > 0) {
                 const bool is_all = best_entry->prompt.checkpoints.empty() ?
                     (best_lcp >= best_entry->prompt.tokens.size()) :
-                    (best_lcp >= best_entry->prompt.checkpoints.back().n_tokens);
+                    (best_lcp >= static_cast<size_t>(best_entry->prompt.checkpoints.back().n_tokens));
                 type = is_all ? "all" : "part";
             }
 
@@ -1768,7 +1768,7 @@ private:
                 const bool is_continuation =
                     ret->prompt.checkpoints.empty() ?
                         (lcp_len_best >= ret->prompt.tokens.size()) :
-                        (lcp_len_best >= ret->prompt.checkpoints.back().n_tokens);
+                        (lcp_len_best >= static_cast<size_t>(ret->prompt.checkpoints.back().n_tokens));
 
                 if (task.id_slot == -1) {
                     SLT_INF(*ret, "selected slot by LCP similarity: prompt=%zu, cached=%zu, match=%zu [%s]\n",
