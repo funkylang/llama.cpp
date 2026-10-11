@@ -1703,11 +1703,15 @@ json server_task_result_apply_lora::to_json() {
 //
 
 // Instrumentation: LLAMA_PROMPT_CACHE_INSTRUMENT (any non-empty value enables)
-std::string server_prompt_cache::state_dump() const {
-    // Every line carries the full indent so all lines align in the log, where the
-    // framework only prefixes the first physical line of a multi-line message.
-    const size_t row_indent = 38; // aligns with the log prefix (timestamp, level, "srv", function)
+// One multi-line message per cache operation — the header line, then one aligned row
+// per cache entry — built as a single string and emitted via one log call, so only
+// the header gets the log prefix (same pattern as log_checkpoint_delete).
+std::string server_prompt_cache::state_dump(const std::string & header) const {
+    // Every row carries the full indent so all addresses align under the header data,
+    // which starts after the log prefix (timestamp, level, "srv", function name).
+    const size_t row_indent = 38;
     std::stringstream ss;
+    ss << header << "\n";
     for (const auto & state : states) {
         ss << std::string(row_indent, ' ')
            << (const void*)&state << "  "
@@ -1842,10 +1846,14 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     // Instrumentation: log creation
     if (pc_instr_enabled()) {
-        SRV_INF("PCACHE_CREATE addr=%p tok=%zu size=%.3f MiB entries=%zu total=%.3f MiB\n",
-                (const void*)&states.back(), (size_t)states.back().prompt.n_tokens(),
-                states.back().size() / (1024.0 * 1024.0), states.size(), size() / (1024.0 * 1024.0));
-        SRV_INF("%s", state_dump().c_str());
+        std::ostringstream os;
+        os << "PCACHE_CREATE addr=" << (const void*)&states.back()
+           << " tok=" << states.back().prompt.n_tokens()
+           << " size=" << std::fixed << std::setprecision(3)
+           << states.back().size() / (1024.0 * 1024.0)
+           << " MiB entries=" << states.size()
+           << " total=" << size() / (1024.0 * 1024.0) << " MiB";
+        SRV_INF("%s", state_dump(os.str()).c_str());
     }
 
     return &states.back();
@@ -1917,9 +1925,6 @@ bool server_prompt_cache::restore_entry(server_prompt & prompt, std::list<server
     if (pc_instr_enabled()) {
         SRV_INF("PCACHE_HIT addr=%p tok=%zu matched=%d type=%s slot=%d entries=%zu total=%.3f MiB\n",
                 addr, tok, matched_len, is_move ? "move" : "copy", id_slot, states.size(), size() / (1024.0 * 1024.0));
-        if (is_move) {
-            SRV_INF("%s", state_dump().c_str());
-        }
     }
 
     return true;
@@ -1934,9 +1939,14 @@ void server_prompt_cache::update() {
             states.pop_front();
 
             if (pc_instr_enabled()) {
-                SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=size-limit remaining=%zu total=%.3f MiB\n",
-                        addr, tok, states.size(), size() / (1024.0 * 1024.0));
-                SRV_INF("%s", state_dump().c_str());
+                std::ostringstream os;
+                os << "PCACHE_DELETE addr=" << addr
+                   << " tok=" << tok
+                   << " reason=size-limit"
+                   << " remaining=" << states.size()
+                   << " total=" << std::fixed << std::setprecision(3)
+                   << size() / (1024.0 * 1024.0) << " MiB";
+                SRV_INF("%s", state_dump(os.str()).c_str());
             }
         }
     }
@@ -1956,9 +1966,14 @@ void server_prompt_cache::update() {
             states.pop_front();
 
             if (pc_instr_enabled()) {
-                SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=token-limit remaining=%zu total=%.3f MiB\n",
-                        addr, tok, states.size(), size() / (1024.0 * 1024.0));
-                SRV_INF("%s", state_dump().c_str());
+                std::ostringstream os;
+                os << "PCACHE_DELETE addr=" << addr
+                   << " tok=" << tok
+                   << " reason=token-limit"
+                   << " remaining=" << states.size()
+                   << " total=" << std::fixed << std::setprecision(3)
+                   << size() / (1024.0 * 1024.0) << " MiB";
+                SRV_INF("%s", state_dump(os.str()).c_str());
             }
         }
     }
