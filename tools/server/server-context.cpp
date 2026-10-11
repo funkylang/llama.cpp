@@ -2591,9 +2591,24 @@ private:
 
     // instrumentation (LLAMA_PROMPT_CACHE_INSTRUMENT): single message per eviction —
     // header line, then all checkpoint positions as a right-aligned grid (8 columns),
-    // evicted entry marked with *, rows indented to align under the numbers
+    // evicted entry marked with *, rows indented to align under the numbers.
+    // Grid only shown for capacity-based evictions (reason contains "too-many" or "spacing");
+    // other reasons (e.g. "invalidated") just log the header without the table.
     void log_checkpoint_delete(const server_slot & slot, int del_id_task, int64_t del_n_tokens,
                                const std::string & reason) const {
+        // check if this is a capacity-based eviction that warrants showing the grid
+        bool show_grid = (reason.find("too-many") != std::string::npos) ||
+                         (reason.find("spacing") != std::string::npos);
+
+        std::string msg = "CKPT_DELETE id_task=" + std::to_string(del_id_task)
+                        + " tok=" + std::to_string(del_n_tokens) + " reason=" + reason;
+
+        if (!show_grid) {
+            // no grid for non-capacity evictions
+            SLT_INF(slot, "%s\n", msg.c_str());
+            return;
+        }
+
         size_t width = 0;
         for (const auto & ckpt : slot.prompt.checkpoints) {
             width = std::max(width, std::to_string(ckpt.n_tokens).size());
@@ -2601,8 +2616,6 @@ private:
         width = std::max(width, std::to_string(del_n_tokens).size());
 
         const int n_cols = 8;
-        std::string msg = "CKPT_DELETE id_task=" + std::to_string(del_id_task)
-                        + " tok=" + std::to_string(del_n_tokens) + " reason=" + reason;
         msg += "\n";
         const size_t row_indent = msg.size() - 1; // spaces before the first number of each grid row
         size_t pos = 0;
@@ -2684,7 +2697,8 @@ private:
                     best_it->n_tokens, best_dist, (float) best_it->size() / 1024 / 1024);
 
             if (pc_instr_enabled()) {
-                log_checkpoint_delete(slot, best_it->id_task, best_it->n_tokens, "spacing");
+                log_checkpoint_delete(slot, best_it->id_task, best_it->n_tokens,
+                        "too-many (" + std::to_string(slot.prompt.checkpoints.size()) + ")");
             }
 
             slot.prompt.checkpoints.erase(best_it);
