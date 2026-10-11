@@ -2601,12 +2601,12 @@ private:
                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
                 it != slot.prompt.checkpoints.end(); ) {
             if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
-                SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                        it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
+                SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                        it->n_tokens, (float) it->size() / 1024 / 1024);
 
                 if (pc_instr_enabled()) {
-                    SLT_INF(slot, "CKPT_DELETE id_task=%d pos_min=%d pos_max=%d tok=%" PRId64 " reason=too-close\n",
-                            it->id_task, (int)it->pos_min, (int)it->pos_max, it->n_tokens);
+                    SLT_INF(slot, "CKPT_DELETE id_task=%d tok=%" PRId64 " reason=too-many (%zu)\n",
+                            it->id_task, it->n_tokens, slot.prompt.checkpoints.size());
                 }
 
                 it = slot.prompt.checkpoints.erase(it);
@@ -2621,12 +2621,12 @@ private:
             // make room for the new checkpoint, if needed
             const auto & cur = slot.prompt.checkpoints.front();
 
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+            SLT_WRN(slot, "erasing old context checkpoint (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                    cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
             if (pc_instr_enabled()) {
-                SLT_INF(slot, "CKPT_DELETE id_task=%d pos_min=%d pos_max=%d tok=%" PRId64 " reason=limit\n",
-                        cur.id_task, (int)cur.pos_min, (int)cur.pos_max, cur.n_tokens);
+                SLT_INF(slot, "CKPT_DELETE id_task=%d tok=%" PRId64 " reason=limit\n",
+                        cur.id_task, cur.n_tokens);
             }
 
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
@@ -2640,8 +2640,8 @@ private:
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
 
                     if (pc_instr_enabled()) {
-                        SLT_INF(slot, "CKPT_DELETE id_task=%d pos_min=%d pos_max=%d tok=%" PRId64 " reason=superseded\n",
-                                it->id_task, (int)it->pos_min, (int)it->pos_max, it->n_tokens);
+                        SLT_INF(slot, "CKPT_DELETE id_task=%d tok=%" PRId64 " reason=superseded\n",
+                                it->id_task, it->n_tokens);
                     }
 
                     it = slot.prompt.checkpoints.erase(it);
@@ -2666,13 +2666,12 @@ private:
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
         SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                "created context checkpoint %d of %d (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
         if (pc_instr_enabled()) {
-            SLT_INF(slot, "CKPT_CREATE id_task=%d pos_min=%d pos_max=%d tok=%" PRId64 "\n",
-                    cur.id_task, (int)cur.pos_min, (int)cur.pos_max, cur.n_tokens);
+            SLT_INF(slot, "CKPT_CREATE id_task=%d tok=%" PRId64 "\n",
+                    cur.id_task, cur.n_tokens);
         }
     }
 
@@ -3534,8 +3533,8 @@ private:
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
 
-                    SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
-                            ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
+                    SLT_DBG(slot, "created speculative checkpoint (n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
+                            slot.prompt.n_tokens(),
                             (float) ckpt.size() / 1024 / 1024,
                             (float) ckpt.data_dft.size() / 1024 / 1024);
                 }
@@ -3823,7 +3822,7 @@ private:
                                         slot.prompt.checkpoints.rend(),
                                         [&](const auto & cur) {
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
-                                            SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
+                                            SLT_TRC(slot, "checking checkpoint tok=%" PRId64 " against %d...\n", cur.n_tokens, pos_min_thold);
                                             // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
                                             if (cur.pos_max > pos_next) {
                                                 return false;
@@ -3853,11 +3852,11 @@ private:
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        SLT_TRC(slot, "restored context checkpoint (n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
 
                                         if (pc_instr_enabled()) {
-                                            SLT_INF(slot, "CKPT_USE id_task=%d pos_min=%d pos_max=%d tok=%" PRId64 "\n",
-                                                    it->id_task, (int)it->pos_min, (int)it->pos_max, it->n_tokens);
+                                            SLT_INF(slot, "CKPT_USE id_task=%d tok=%" PRId64 "\n",
+                                                    it->id_task, it->n_tokens);
                                         }
                                     }
 
@@ -3875,11 +3874,11 @@ private:
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next) {
-                                        SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                        SLT_TRC(slot, "erased invalidated context checkpoint (n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
 
                                         if (pc_instr_enabled()) {
-                                            SLT_INF(slot, "CKPT_DELETE id_task=%d pos_min=%d pos_max=%d tok=%" PRId64 " reason=invalidated\n",
-                                                    cur.id_task, (int)cur.pos_min, (int)cur.pos_max, cur.n_tokens);
+                                            SLT_INF(slot, "CKPT_DELETE id_task=%d tok=%" PRId64 " reason=invalidated\n",
+                                                    cur.id_task, cur.n_tokens);
                                         }
 
                                         it = slot.prompt.checkpoints.erase(it);
@@ -4153,7 +4152,7 @@ private:
                         !near_prompt_start &&
                         !near_prompt_end &&
                         (slot.prompt.checkpoints.empty() || n_tokens_start >= slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step));
-                    SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
+                    SLT_DBG(slot, "main/do_checkpoint = %s\n", do_checkpoint ? "yes" : "no");
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
@@ -4550,7 +4549,7 @@ private:
 
                         const auto & ckpt = slot.spec_ckpt;
 
-                        SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
+                        SLT_DBG(slot, "restoring speculative checkpoint (size = %zu)\n", ckpt.size());
 
                         GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
 
