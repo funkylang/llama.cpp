@@ -1748,8 +1748,8 @@ private:
 
                 if (is_all) {
                     ret = &slot; // early winner: the conversation is already in live memory
-                    SLT_INF(slot, "selected slot by ALL match (continuation): prompt=%zu, match=%zu\n",
-                            task.tokens.size(), lcp_len);
+                    SLT_INF(slot, "selected slot %d (ALL): prompt=%zu, slot=%zu, match=%zu\n",
+                            slot.id, task.tokens.size(), tokens.size(), lcp_len);
                     early_winner = true;
                     break;
                 }
@@ -1843,8 +1843,8 @@ private:
             const int64_t t_start = ggml_time_us();
 
             if (best.slot == ret && best.qualified) {
-                SLT_INF(*ret, "selected slot by PART match (displaced, covers checkpoint): prompt=%zu, match=%zu\n",
-                        task.tokens.size(), best.lcp);
+                SLT_INF(*ret, "selected slot %d (PART): prompt=%zu, slot=%zu, match=%zu\n",
+                        ret->id, task.tokens.size(), ret->prompt.tokens.size(), best.lcp);
             }
 
             ret->prompt_save(*prompt_cache);
