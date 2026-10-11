@@ -679,6 +679,10 @@ struct server_prompt_cache {
                        int matched_len);
 
     void update();
+
+    // Instrumentation (LLAMA_PROMPT_CACHE_INSTRUMENT): body of the PCACHE_* dump message —
+    // one aligned row per entry after the operation: addr, tokens, size in MiB, snapshots.
+    std::string state_dump() const;
 };
 
 // Instrumentation: LLAMA_PROMPT_CACHE_INSTRUMENT (any non-empty value enables)

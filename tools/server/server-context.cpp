@@ -3914,8 +3914,8 @@ private:
                                         SLT_TRC(slot, "restored context checkpoint (n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
 
                                         if (pc_instr_enabled()) {
-                                            SLT_INF(slot, "CKPT_USE id_task=%d tok=%" PRId64 "\n",
-                                                    it->id_task, it->n_tokens);
+                                            SLT_INF(slot, "CKPT_USE id_task=%d tok=%" PRId64 " match=%d\n",
+                                                    it->id_task, it->n_tokens, n_past);
                                         }
                                     }
 

@@ -11,6 +11,7 @@
 #include "server-common.h"
 
 #include <cstdlib>
+#include <iomanip>
 #include <sstream>
 
 //
@@ -1702,6 +1703,20 @@ json server_task_result_apply_lora::to_json() {
 //
 
 // Instrumentation: LLAMA_PROMPT_CACHE_INSTRUMENT (any non-empty value enables)
+std::string server_prompt_cache::state_dump() const {
+    std::stringstream ss;
+    for (const auto & state : states) {
+        ss << (const void*)&state << "  "
+           << std::setw(6) << std::right << state.prompt.n_tokens() << " tokens"
+           << "  "
+           << std::setw(10) << std::right << std::fixed << std::setprecision(3)
+           << state.size() / (1024.0 * 1024.0) << " MiB"
+           << "  "
+           << std::setw(3) << std::right << state.prompt.checkpoints.size() << " snapshots\n";
+    }
+    return ss.str();
+}
+
 bool pc_instr_enabled() {
     static const bool enabled = [] {
         const char * v = getenv("LLAMA_PROMPT_CACHE_INSTRUMENT");
@@ -1826,6 +1841,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         SRV_INF("PCACHE_CREATE addr=%p tok=%zu size=%.3f MiB entries=%zu total=%.3f MiB\n",
                 (const void*)&states.back(), (size_t)states.back().prompt.n_tokens(),
                 states.back().size() / (1024.0 * 1024.0), states.size(), size() / (1024.0 * 1024.0));
+        SRV_INF("%s", state_dump().c_str());
     }
 
     return &states.back();
@@ -1897,6 +1913,9 @@ bool server_prompt_cache::restore_entry(server_prompt & prompt, std::list<server
     if (pc_instr_enabled()) {
         SRV_INF("PCACHE_HIT addr=%p tok=%zu matched=%d type=%s slot=%d entries=%zu total=%.3f MiB\n",
                 addr, tok, matched_len, is_move ? "move" : "copy", id_slot, states.size(), size() / (1024.0 * 1024.0));
+        if (is_move) {
+            SRV_INF("%s", state_dump().c_str());
+        }
     }
 
     return true;
@@ -1913,6 +1932,7 @@ void server_prompt_cache::update() {
             if (pc_instr_enabled()) {
                 SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=size-limit remaining=%zu total=%.3f MiB\n",
                         addr, tok, states.size(), size() / (1024.0 * 1024.0));
+                SRV_INF("%s", state_dump().c_str());
             }
         }
     }
@@ -1934,6 +1954,7 @@ void server_prompt_cache::update() {
             if (pc_instr_enabled()) {
                 SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=token-limit remaining=%zu total=%.3f MiB\n",
                         addr, tok, states.size(), size() / (1024.0 * 1024.0));
+                SRV_INF("%s", state_dump().c_str());
             }
         }
     }
