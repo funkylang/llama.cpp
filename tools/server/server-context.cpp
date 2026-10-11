@@ -2617,7 +2617,7 @@ private:
 
         const int n_cols = 8;
         msg += "\n";
-        const size_t row_indent = msg.size() - 1; // spaces before the first number of each grid row
+        const size_t row_indent = msg.size() - 1 + 9; // spaces before the first number of each grid row (+9 for alignment)
         size_t pos = 0;
         for (const auto & ckpt : slot.prompt.checkpoints) {
             if (pos % n_cols == 0) {
@@ -2654,29 +2654,10 @@ private:
             }
         }
 
-        auto & cur = slot.prompt.checkpoints.emplace_back();
-
-        cur.id_task = id_task;
-
-        // [TAG_CHECKPOINTS_FIX_POS_MIN]
-        // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
-        //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
-        cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
-
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        // stash the draft's speculative state with the checkpoint
-        common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
-
-        // keep the list at or below capacity: while over the limit, delete the internal
-        // checkpoint (never first, never last) whose nearest neighbour is closest to it;
-        // on ties take the earliest candidate. Runs after insertion so the new
-        // checkpoint is protected as "last"; std::list makes erasing cheap.
-        while (slot.prompt.checkpoints.size() > (size_t) params_base.n_ctx_checkpoints) {
-            if (slot.prompt.checkpoints.size() < 3) {
-                break; // degenerate list: only first and last exist, neither is deletable
-            }
-
+        // evict BEFORE adding the new checkpoint so the list never exceeds n_ctx_checkpoints;
+        // the internal checkpoint whose nearest neighbour is closest gets dropped (first and
+        // last are protected). Ties break to the earliest candidate. std::list makes erasing cheap.
+        while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             int64_t best_dist = -1;
             auto best_it = slot.prompt.checkpoints.end();
 
@@ -2703,6 +2684,20 @@ private:
 
             slot.prompt.checkpoints.erase(best_it);
         }
+
+        auto & cur = slot.prompt.checkpoints.emplace_back();
+
+        cur.id_task = id_task;
+
+        // [TAG_CHECKPOINTS_FIX_POS_MIN]
+        // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
+        //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
+        cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+
+        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        // stash the draft's speculative state with the checkpoint
+        common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
