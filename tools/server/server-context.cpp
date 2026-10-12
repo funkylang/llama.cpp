@@ -1771,8 +1771,11 @@ private:
             }
         }
 
-        // scan the prompt cache for a better candidate than any live slot
+        // scan the prompt cache for a better candidate than any live slot.
+        // cache_best always tracks the LONGEST qualified entry seen so far;
+        // entry_beats_slots flips ret to null once some entry out-ranks all slots.
         pc_candidate cache_best;
+        bool entry_beats_slots = false;
         if (use_cache && !early_winner && task.id_slot == -1) {
             for (auto it = prompt_cache->states.begin(); it != prompt_cache->states.end(); ++it) {
                 const auto & st = *it;
@@ -1795,12 +1798,18 @@ private:
                 c.qualified = qualified;
                 c.is_all    = is_all;
 
-                if (consider_better(c, best)) {
-                    cache_best = c;
-                    ret        = nullptr; // winner is a cache entry, not a live slot
-                } else {
-                    cache_best = c; // remember the longest qualified entry for diagnostics
+                if (!cache_best.qualified || consider_better(c, cache_best)) {
+                    cache_best = c; // longest qualified entry so far
+                    if (consider_better(c, best)) {
+                        entry_beats_slots = true;
+                    }
+                } else if (consider_better(cache_best, best)) {
+                    entry_beats_slots = true;
                 }
+            }
+
+            if (entry_beats_slots) {
+                ret = nullptr; // winner is a cache entry, not a live slot
             }
 
             // (a cache-entry win logs PCACHE_HIT inside restore_entry; no separate SCAN needed)
