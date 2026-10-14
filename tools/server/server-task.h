@@ -670,13 +670,20 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    // Restore a pre-selected cache entry into a slot (KV state + prompt).
-    // is_move=true  : the whole prompt is consumed -> clear/erase the entry (MOVE).
-    // is_move=false : only a prefix is used as a new prompt -> keep the entry in the cache (COPY).
+    // Extract an entry from the cache by iterator (safe against concurrent eviction).
+    // Erases the entry from states and returns it so the caller can hold it safely.
+    server_prompt_cache_state extract_entry(std::list<server_prompt_cache_state>::iterator it);
+
+    // Restore a pre-extracted cache entry into a slot (KV state + prompt).
+    // is_move=true  : the whole prompt is consumed -> clear the entry data (MOVE).
+    // is_move=false : only a prefix is used as a new prompt -> keep the entry for reuse (COPY).
     // matched_len   : LCP of the incoming prompt vs this entry, for PCACHE_HIT logging only.
-    bool restore_entry(server_prompt & prompt, std::list<server_prompt_cache_state>::iterator it_entry,
+    bool restore_entry(server_prompt & prompt, server_prompt_cache_state & extracted,
                        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool is_move,
                        int matched_len);
+
+    // Re-insert a previously-extracted entry back into the cache (at the back, for LRU).
+    void append_entry(server_prompt_cache_state && state);
 
     void update();
 

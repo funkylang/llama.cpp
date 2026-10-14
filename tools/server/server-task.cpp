@@ -1858,19 +1858,59 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::restore_entry(server_prompt & prompt, std::list<server_prompt_cache_state>::iterator it_best,
+
+server_prompt_cache_state server_prompt_cache::extract_entry(std::list<server_prompt_cache_state>::iterator it) {
+    if (it == states.end()) {
+        return server_prompt_cache_state(); // empty state
+    }
+
+    // Instrumentation: log extraction
+    const void * addr = (const void*)&(*it);
+    const size_t tok = (size_t)it->prompt.n_tokens();
+    
+    if (pc_instr_enabled()) {
+        SRV_INF("PCACHE_EXTRACT addr=%p tok=%zu entries_before=%zu\n",
+                addr, tok, states.size());
+    }
+
+    // Extract the entry from the list and return it
+    server_prompt_cache_state extracted = std::move(*it);
+    states.erase(it);
+
+    return extracted;
+}
+
+void server_prompt_cache::append_entry(server_prompt_cache_state && state) {
+    if (state.prompt.n_tokens() == 0) {
+        return; // nothing to append
+    }
+
+    // Move the entry back into the list at the back (for LRU behavior)
+    states.push_back(std::move(state));
+
+    // Instrumentation: log re-insertion
+    if (pc_instr_enabled()) {
+        const void * addr = (const void*)&states.back();
+        const size_t tok = states.back().prompt.n_tokens();
+        SRV_INF("PCACHE_APPEND addr=%p tok=%zu entries_after=%zu\n",
+                addr, tok, states.size());
+    }
+}
+
+bool server_prompt_cache::restore_entry(server_prompt & prompt, server_prompt_cache_state & extracted,
         llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool is_move, int matched_len) {
-    if (it_best == states.end()) {
+    if (extracted.prompt.n_tokens() == 0) {
         return true; // nothing to restore
     }
 
-    const void * addr = (const void*)&(*it_best);
-    const size_t tok = (size_t)it_best->prompt.n_tokens();
+    const void * addr = (const void*)&extracted;
+    const size_t tok = (size_t)extracted.prompt.n_tokens();
 
     if (is_move) {
-        // The whole prompt is consumed: relocate the state into the slot and free it from the cache.
+        // The whole prompt is consumed: relocate the state into the slot, then clear it.
+        // The entry has already been extracted from states by extract_entry().
 
-        auto & data = it_best->data.main;
+        auto & data = extracted.data.main;
         const size_t size = data.size();
         const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
         if (n != size) {
@@ -1880,9 +1920,9 @@ bool server_prompt_cache::restore_entry(server_prompt & prompt, std::list<server
         data.clear();
         data.shrink_to_fit();
 
-        if (!it_best->data.drft.empty()) {
+        if (!extracted.data.drft.empty()) {
             GGML_ASSERT(ctx_dft);
-            auto & drft = it_best->data.drft;
+            auto & drft = extracted.data.drft;
             const size_t dsize = drft.size();
             const size_t dn = llama_state_seq_set_data_ext(ctx_dft, drft.data(), dsize, id_slot, 0);
             if (dn != dsize) {
@@ -1893,31 +1933,31 @@ bool server_prompt_cache::restore_entry(server_prompt & prompt, std::list<server
             drft.shrink_to_fit();
         }
 
-        prompt = std::move(it_best->prompt);
-        states.erase(it_best);
+        prompt = std::move(extracted.prompt);
     } else {
-        // Only a prefix is used as a new prompt: copy the state into the slot, keep the entry in the cache.
+        // Only a prefix is used as a new prompt: copy the state into the slot, keep extracted data for reuse.
+        // The entry will be re-appended to states by the caller via append_entry().
 
-        if (!it_best->data.main.empty()) {
-            const size_t size = it_best->data.main.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, it_best->data.main.data(), size, id_slot, 0);
+        if (!extracted.data.main.empty()) {
+            const size_t size = extracted.data.main.size();
+            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, extracted.data.main.data(), size, id_slot, 0);
             if (n != size) {
                 SRV_ERR("failed to restore state with size %zu\n", size);
                 return false;
             }
         }
 
-        if (!it_best->data.drft.empty()) {
+        if (!extracted.data.drft.empty()) {
             GGML_ASSERT(ctx_dft);
-            const size_t size = it_best->data.drft.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_dft, it_best->data.drft.data(), size, id_slot, 0);
+            const size_t size = extracted.data.drft.size();
+            const size_t n = llama_state_seq_set_data_ext(ctx_dft, extracted.data.drft.data(), size, id_slot, 0);
             if (n != size) {
                 SRV_WRN("failed to restore draft state with size %zu\n", size);
                 return false;
             }
         }
 
-        prompt = it_best->prompt.clone(); // COPY: original stays in the cache
+        prompt = extracted.prompt.clone(); // COPY: original stays in the caller's local var, to be re-appended
     }
 
     // Instrumentation: log hit after restore, so counters reflect resulting cache state

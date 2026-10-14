@@ -331,14 +331,28 @@ struct server_slot {
         return true;
     }
 
+    // NOTE: This method is now deprecated - use extract_entry + restore_entry directly.
+    // Kept for backwards compatibility only; prefer the new pattern in get_available_slot.
     bool prompt_load(server_prompt_cache & prompt_cache,
                      std::list<server_prompt_cache_state>::iterator it_entry, bool is_move, int matched_len) {
-        bool res = prompt_cache.restore_entry(prompt, it_entry, ctx_tgt, ctx_dft, id, is_move, matched_len);
+        // Extract the entry first to safely handle concurrent modifications
+        server_prompt_cache_state extracted = prompt_cache.extract_entry(it_entry);
+        
+        bool res = prompt_cache.restore_entry(prompt, extracted, ctx_tgt, ctx_dft, id, is_move, matched_len);
+        
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+            // On failure, return the entry back to the cache
+            prompt_cache.append_entry(std::move(extracted));
+            return false;
         }
-
-        return res;
+        
+        if (!is_move) {
+            // For COPY operations: re-append the entry at the back of the list (LRU behavior)
+            prompt_cache.append_entry(std::move(extracted));
+        }
+        
+        return true;
     }
 
     void prompt_clear() {
@@ -1819,6 +1833,11 @@ private:
         if (ret == nullptr && use_cache && cache_best.qualified) {
             // Winner = a cache entry. Find a free slot, else LRU-evict a used one,
             // save its displaced state first, then move/copy the winning entry in.
+            
+            // IMPORTANT: Extract the winning entry FIRST (before prompt_save),
+            // so it cannot be accidentally evicted during the subsequent save operation.
+            server_prompt_cache_state winning_entry = prompt_cache->extract_entry(cache_best.entry_it);
+
             int64_t t_last = -1;
             for (server_slot & slot : slots) {
                 if (slot.is_processing()) {
@@ -1836,15 +1855,34 @@ private:
                 const int64_t t_start = ggml_time_us();
 
                 // unconditional save of the displaced state (concept-cache-mgmt R3)
+                // This is now safe - our winning_entry is not in the states list to be evicted.
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, cache_best.entry_it, cache_best.is_all, (int) cache_best.lcp)) {
+                // Restore from our safely-held copy, not from a list iterator
+                bool load_ok = prompt_cache->restore_entry(
+                    ret->prompt, 
+                    winning_entry, 
+                    ret->ctx_tgt, 
+                    ret->ctx_dft, 
+                    ret->id, 
+                    cache_best.is_all, 
+                    (int) cache_best.lcp);
+
+                if (!load_ok) {
                     ret->prompt_clear();
+                    // On failure, re-append the extracted entry (it wasn't consumed)
+                    prompt_cache->append_entry(std::move(winning_entry));
+                } else if (!cache_best.is_all) {
+                    // For COPY operations: re-append the entry at the back of the list (LRU behavior)
+                    prompt_cache->append_entry(std::move(winning_entry));
                 }
 
                 prompt_cache->update();
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+            } else {
+                // No slot found: re-append the extracted entry back (we couldn't use it)
+                prompt_cache->append_entry(std::move(winning_entry));
             }
         } else if (ret != nullptr && use_cache && !early_winner) {
             // Winner = a live slot with a PARTIAL match (not an ALL continuation):
