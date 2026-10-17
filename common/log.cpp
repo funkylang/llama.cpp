@@ -168,6 +168,7 @@ struct common_log {
     // default capacity
     common_log(size_t capacity = 512) {
         file       = nullptr;
+        stdo       = true;
         colors     = false;
         prefix     = false;
         timestamps = false;
@@ -196,6 +197,7 @@ private:
 
     FILE * file;
 
+    bool stdo;
     bool colors;
     bool prefix;
     bool timestamps;
@@ -211,7 +213,9 @@ private:
     bool print_entry(const common_log_entry & e) const {
         if (e.is_end) return true;
 
-        e.print();
+        if (stdo) {
+            e.print();
+        }
         if (file) {
             e.print(file);
         }
@@ -406,6 +410,14 @@ public:
         resume();
     }
 
+    void set_stdo(bool enabled) {
+        pause();
+
+        stdo = enabled;
+
+        resume();
+    }
+
     bool get_colors() const {
         return colors;
     }
@@ -501,6 +513,10 @@ void common_log_add_json(struct common_log * log, const char * type, const commo
 
 void common_log_set_file(struct common_log * log, const char * file) {
     log->set_file(file);
+}
+
+void common_log_set_stdo(struct common_log * log, bool enabled) {
+    log->set_stdo(enabled);
 }
 
 void common_log_set_colors(struct common_log * log, log_colors colors) {
