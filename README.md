@@ -17,6 +17,8 @@
 
 </div>
 
+🔧 **[funkylang fork — local extensions for concurrency-safe caching & observability →](extensions.md)**
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:
