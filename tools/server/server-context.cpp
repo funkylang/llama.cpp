@@ -5070,6 +5070,10 @@ private:
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
                 }
 
+                // keep the invariant required by pre_decode(): when spec_draft is empty
+                // (i.e. after this acceptance), spec_i_batch must be empty too
+                slot.spec_i_batch.clear();
+
                 GGML_ASSERT(accepted.size() >= 1);
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
