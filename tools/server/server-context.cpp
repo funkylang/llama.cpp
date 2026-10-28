@@ -1475,8 +1475,10 @@ private:
         }
 
         // setup slots
-        SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
-                params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
+        const uint32_t kv_pool = params_base.n_kv_cache > 0 ?
+            GGML_PAD(params_base.n_kv_cache, 256u) : n_ctx_slot();
+        SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_pool = %u tokens\n",
+                params_base.n_parallel, n_ctx_slot(), kv_pool);
 
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
