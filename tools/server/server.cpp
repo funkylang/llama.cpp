@@ -10,6 +10,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "fork-version.h"
 #include "llama.h"
 #include "log.h"
 
@@ -105,6 +106,9 @@ int llama_server(int argc, char ** argv) {
     common_params params;
 
     common_init();
+
+    // fork version - printed as the first message so the running build is identifiable
+    SRV_INF("llama.cpp fork version: %s\n", FORK_VERSION);
 
     // start the stream session manager GC right after common init, before any HTTP route can
     // touch it. lifecycle is symmetric, stop_gc() runs in clean_up() before backend free
