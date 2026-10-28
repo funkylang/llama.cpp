@@ -1658,6 +1658,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED_PER_SLOT").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        { "--kv-cache-size" }, "N",
+        "physical KV cache size in tokens (default: 0 = use ctx-size).\n"
+        "allows larger pool than per-slot limit for multi-agent scenarios",
+        [](common_params & params, int value) {
+            params.kv_cache_size = value;
+        }
+    ).set_env("LLAMA_ARG_KV_CACHE_SIZE").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION
