@@ -25,6 +25,9 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+
+    // explicit physical KV cache size in tokens (unified mode only; 0 = derive from context params)
+    uint32_t n_kv_cache;
 };
 
 enum llama_memory_status {

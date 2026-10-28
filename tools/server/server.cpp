@@ -186,6 +186,10 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
                 params.kv_unified_per_slot, params.n_ctx);
     }
 
+    if (params.n_kv_cache > 0 && !params.kv_unified) {
+        SRV_WRN("%s", "--kv-cache-size is ignored without --kv-unified\n");
+    }
+
     // for consistency between server router mode and single-model mode, we set the same model name as alias
     auto model_name = params.model.get_name();
     if (params.model_alias.empty() && !model_name.empty()) {

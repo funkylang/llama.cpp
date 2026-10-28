@@ -386,17 +386,8 @@ llama_context::llama_context(
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
-    // If kv_cache_size is set, use it for physical allocation but keep n_ctx_seq as the per-slot limit
-    if (params.kv_cache_size > 0 && static_cast<uint32_t>(params.kv_cache_size) > cparams.n_ctx) {
-        LLAMA_LOG_INFO("%s: using kv_cache_size (%d) for physical pool instead of n_ctx (%u)\n",
-                       __func__, params.kv_cache_size, cparams.n_ctx);
-        cparams.n_ctx = GGML_PAD(params.kv_cache_size, 256);
-    }
-
     if (cparams.kv_unified) {
-        // For unified mode: n_ctx_seq should stay at the original per-slot limit, not grow with physical pool
-        // This keeps ROPE working correctly while allowing larger physical KV cache
-        cparams.n_ctx_seq = params.kv_cache_size > 0 ? GGML_PAD(params.n_ctx, 256) : cparams.n_ctx;
+        cparams.n_ctx_seq = cparams.n_ctx;
     } else {
         cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
         cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, 256);
@@ -498,6 +489,7 @@ llama_context::llama_context(
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.n_kv_cache=*/ static_cast<uint32_t>(params.n_kv_cache),
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -4035,7 +4027,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
-        /*.kv_cache_size               =*/ 0,
+        /*.n_kv_cache                  =*/ 0,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
