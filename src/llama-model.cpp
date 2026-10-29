@@ -2771,18 +2771,6 @@ float llama_model::get_rope_freq_scale(const llama_cparams & cparams, int il) co
 ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int il) const {
     const uint32_t n_ctx_seq = cparams.n_ctx_seq;
 
-    // [ROPE-DEBUG] log once per distinct selection (diagnostic: kv-cache-size crash investigation)
-    if (il == 0) {
-        const char * mode = layers[il].rope_freqs != nullptr ? "FREQS" :
-                            (n_ctx_seq > hparams.n_ctx_orig_yarn ? "LONG" : "short");
-        static std::set<std::string> logged;
-        const std::string key = std::string(mode) + ":" + std::to_string(n_ctx_seq);
-        if (logged.insert(key).second) {
-            LLAMA_LOG_INFO("%s: arch=%d rope mode='%s' n_ctx_seq=%u n_ctx_orig_yarn=%u n_ctx_train=%u kv_unified=%d\n",
-                    __func__, arch, mode, n_ctx_seq, hparams.n_ctx_orig_yarn, hparams.n_ctx_train, cparams.kv_unified);
-        }
-    }
-
     // choose long/short freq factors based on the context size
     if (layers[il].rope_freqs != nullptr) {
         return layers[il].rope_freqs;

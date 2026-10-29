@@ -4423,6 +4423,16 @@ struct ggml_tensor * ggml_rope_ext(
         float                 attn_factor,
         float                 beta_fast,
         float                 beta_slow) {
+    // [ROPE-DEBUG] log once per run - params are fixed from cparams (diagnostic: kv-cache-size crash investigation)
+    static volatile int rope_debug_logged = 0;
+    if (__atomic_load_n(&rope_debug_logged, __ATOMIC_RELAXED) == 0 &&
+        __atomic_compare_exchange_n(&rope_debug_logged, &(int){0}, 1, true,
+                                    __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+        GGML_LOG_INFO("[ROPE-DEBUG] ggml_rope_ext: mode=%d n_ctx_orig=%d freq_base=%.3f freq_scale=%g ext_factor=%g attn_factor=%g beta_fast=%g beta_slow=%g\n",
+                      mode, n_ctx_orig, freq_base, freq_scale,
+                      ext_factor, attn_factor, beta_fast, beta_slow);
+    }
+
     return ggml_rope_impl(
         ctx, a, b, c, n_dims, NULL, mode, n_ctx_orig, freq_base, freq_scale,
         ext_factor, attn_factor, beta_fast, beta_slow, false
