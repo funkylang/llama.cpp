@@ -1898,6 +1898,30 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -1;
     }
 
+    // [POS-DEBUG] warn when positions exceed trained context (diagnostic: kv-cache-size crash investigation)
+    {
+        const uint32_t n_ctx_limit = std::min(cparams.n_ctx_seq, hparams.n_ctx_train);
+        if (n_ctx_limit > 0) {
+            bool exceeded = false;
+            llama_pos max_pos = 0;
+            for (const auto & tok : batch_inp.tokens) {
+                for (auto pos : tok.pos) {
+                    if (pos > max_pos) {
+                        max_pos = pos;
+                    }
+                    if (pos >= n_ctx_limit && !exceeded) {
+                        LLAMA_LOG_WARN("%s: position %d exceeds limit %u (n_ctx_seq=%u, n_ctx_train=%u) - possible RoPE extrapolation\n",
+                                __func__, pos, n_ctx_limit, cparams.n_ctx_seq, hparams.n_ctx_train);
+                        exceeded = true;
+                    }
+                }
+            }
+            if (!exceeded && max_pos > 0 && (max_pos % 100000) == 0) {
+                LLAMA_LOG_INFO("%s: max position reached %d\n", __func__, max_pos);
+            }
+        }
+    }
+
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
