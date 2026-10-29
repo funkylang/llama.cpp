@@ -426,6 +426,16 @@ llama_context::llama_context(
                 __func__, cparams.n_ctx_seq, hparams.n_ctx_train);
     }
 
+    // [ROPE-PARAMS] startup instrumentation for kv-cache-size crash investigation:
+    // fully resolved rope/YARN parameters at startup (final cparams, then model defaults)
+    LLAMA_LOG_INFO("[ROPE-PARAMS] final: scaling=%d freq_base=%.3f freq_scale=%g n_ctx_orig_yarn=%u n_ctx_seq=%u ext_factor=%g attn_factor=%g beta_fast=%g beta_slow=%g\n",
+                   (int)cparams.rope_scaling_type, cparams.rope_freq_base, cparams.rope_freq_scale,
+                   cparams.n_ctx_orig_yarn, cparams.n_ctx_seq, cparams.yarn_ext_factor,
+                   cparams.yarn_attn_factor, cparams.yarn_beta_fast, cparams.yarn_beta_slow);
+    LLAMA_LOG_INFO("[ROPE-PARAMS] model: scaling_train=%d freq_base_train=%.3f freq_scale_train=%g n_ctx_orig_yarn_hp=%u n_ctx_train=%u rope_yarn_log_mul=%g rope_attn_factor=%g\n",
+                   (int)hparams.rope_scaling_type_train, hparams.rope_freq_base_train, hparams.rope_freq_scale_train,
+                   hparams.n_ctx_orig_yarn, hparams.n_ctx_train, hparams.rope_yarn_log_mul, hparams.rope_attn_factor);
+
     if (!hparams.vocab_only) {
         // GPU backends
         for (const auto & dev : model.devices) {
