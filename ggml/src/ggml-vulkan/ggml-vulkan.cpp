@@ -8250,18 +8250,6 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
 
-    // [FA-DEBUG] log when KV dimension is large (diagnostic: kv-cache-size crash investigation)
-    if (KV >= 100000 || nem1 >= 100000) {
-        static int fa_debug_count = 0;
-        if (fa_debug_count < 20 || (fa_debug_count % 500 == 0)) {
-            fprintf(stderr, "[FA-DEBUG] N=%lld KV=%lld nem0=%lld nem1=%lld use_mask_opt=%d use_sparse=%d path=%d aligned=%d Br=%u Bc=%u\n",
-                    (long long)N, (long long)KV, (long long)nem0, (long long)nem1,
-                    (int)use_mask_opt, (int)use_sparse, (int)tuning_params.path, (int)aligned,
-                    fa_pipeline_state.Br, fa_pipeline_state.Bc);
-            fa_debug_count++;
-        }
-    }
-
     vk_pipeline pipeline = nullptr;
 
     bool xe_fa_opt = false;
