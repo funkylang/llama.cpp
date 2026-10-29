@@ -2875,6 +2875,36 @@ bool llama_kv_cache_context::apply() {
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
 
+    // [KV-LEAK] trace get_n_kv inputs to locate the ~2x runtime factor observed with large pools:
+    // compare high-water mark (used_max_p1) vs actual used count vs region capacity.
+    {
+        static uint64_t s_last_sig = 0;
+
+        const auto & si = sinfos[i_cur];
+
+        uint64_t max_hwm = 0, max_used = 0, max_cap = 0;
+
+        for (uint32_t s = 0; s < si.n_stream(); ++s) {
+            const auto & c = kv->get_cells(si.strm[s]);
+
+            max_hwm  = std::max<uint64_t>(max_hwm,  (uint64_t)c.used_max_p1());
+            max_used = std::max<uint64_t>(max_used, (uint64_t)c.get_used());
+            max_cap  = std::max<uint64_t>(max_cap,  (uint64_t)c.size());
+        }
+
+        const uint64_t sig = ((uint64_t)n_kv << 32) | (max_hwm & 0xffffffff);
+
+        if (sig != s_last_sig) {
+            s_last_sig = sig;
+
+            fprintf(stderr, "[KV-LEAK] N_KV: pool=%u n_kv=%u hwm_max=%llu used_max=%llu cap_max=%llu\n",
+                    kv->get_size(), n_kv,
+                    (unsigned long long)max_hwm,
+                    (unsigned long long)max_used,
+                    (unsigned long long)max_cap);
+        }
+    }
+
     return true;
 }
 
