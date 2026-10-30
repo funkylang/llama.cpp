@@ -6,10 +6,15 @@
 
 #include "llama.h"
 
-#include <cstdint>
-#include <map>
-#include <vector>
+#ifdef __cplusplus
+#  include <cstdint>
+#  include <map>
+#  include <vector>
+#else
+#  include <stdint.h>
+#endif
 
+#ifdef __cplusplus
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,
@@ -98,11 +103,19 @@ LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llam
 // Useful for testing purposes.
 LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
 
+#endif // __cplusplus
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
+#ifdef __cplusplus
+extern "C" {
+#endif
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
+#ifdef __cplusplus
+} // extern "C"
+#endif
 
+#ifdef __cplusplus
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).
@@ -127,11 +140,20 @@ LLAMA_API const char * llama_model_decision_label(const struct llama_model * mod
 
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
+#endif // __cplusplus
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
+#ifdef __cplusplus
+} // extern "C"
+#endif
 
+#ifdef __cplusplus
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
@@ -164,3 +186,4 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
 
 // realtime models: number of tokens the output lags behind the audio input, used by mtmd; 0 if not applicable
 LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
+#endif // __cplusplus

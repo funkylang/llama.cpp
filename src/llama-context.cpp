@@ -4335,9 +4335,15 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     return ctx->get_embeddings_seq(seq_id);
 }
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
 }
+#ifdef __cplusplus
+} // extern "C"
+#endif
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
@@ -4355,6 +4361,9 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     return ctx->get_memory();
 }
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 float * llama_get_embeddings_nextn(llama_context * ctx) {
     ctx->synchronize();
 
@@ -4366,6 +4375,9 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
 
     return ctx->get_embeddings_nextn_ith(i);
 }
+#ifdef __cplusplus
+} // extern "C"
+#endif
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
     ctx->synchronize();
