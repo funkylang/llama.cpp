@@ -2877,15 +2877,21 @@ bool llama_kv_cache_context::apply() {
 
     // [KV-LEAK] trace get_n_kv inputs to locate the ~2x runtime factor observed with large pools:
     // compare high-water mark (used_max_p1) vs actual used count vs region capacity.
-    {
+    // silent unless LLAMA_KV_LEAK_TRACE is set.
+    if (kv_leak_trace_enabled()) {
         static uint64_t s_last_sig = 0;
 
         const auto & si = sinfos[i_cur];
 
         uint64_t max_hwm = 0, max_used = 0, max_cap = 0;
+        uint64_t min_first = UINT64_MAX;
 
         for (uint32_t s = 0; s < si.n_stream(); ++s) {
             const auto & c = kv->get_cells(si.strm[s]);
+
+            if (c.get_used() > 0) {
+                min_first = std::min<uint64_t>(min_first, (uint64_t)c.used_min());
+            }
 
             max_hwm  = std::max<uint64_t>(max_hwm,  (uint64_t)c.used_max_p1());
             max_used = std::max<uint64_t>(max_used, (uint64_t)c.get_used());
@@ -2897,9 +2903,10 @@ bool llama_kv_cache_context::apply() {
         if (sig != s_last_sig) {
             s_last_sig = sig;
 
-            fprintf(stderr, "[KV-LEAK] N_KV: pool=%u n_kv=%u hwm_max=%llu used_max=%llu cap_max=%llu\n",
+            fprintf(stderr, "[KV-LEAK] N_KV: pool=%u n_kv=%u first_idx=%llu last_idx=%llu used=%llu cap=%llu\n",
                     kv->get_size(), n_kv,
-                    (unsigned long long)max_hwm,
+                    (unsigned long long)(min_first == UINT64_MAX ? 0 : min_first),
+                    (unsigned long long)(max_hwm ? max_hwm - 1 : 0),
                     (unsigned long long)max_used,
                     (unsigned long long)max_cap);
         }

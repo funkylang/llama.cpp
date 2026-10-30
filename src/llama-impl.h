@@ -2,6 +2,7 @@
 
 #include "ggml.h" // for ggml_log_level
 
+#include <cstdlib>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -109,3 +110,10 @@ std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 
 // arrays are rendered only until the result is longer than max_len
 std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i, size_t max_len = SIZE_MAX);
+
+// [KV-LEAK] fork instrumentation gate (2026-10-30): KV pool dimension tracers print to stderr
+// only when LLAMA_KV_LEAK_TRACE is set in the environment; silent by default.
+inline bool kv_leak_trace_enabled() {
+    static const bool enabled = ::getenv("LLAMA_KV_LEAK_TRACE") != nullptr;
+    return enabled;
+}

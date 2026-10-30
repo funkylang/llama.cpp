@@ -415,7 +415,6 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
-        int32_t n_kv_cache; // physical KV cache size in tokens (0 = derived from context params)
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -426,6 +425,11 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // fork extension (appended to the end only): physical unified KV pool size in tokens.
+        // 0 = derived from the context params as usual. Callers must initialize via
+        // llama_context_default_params() (or zero-init); the library's initializer keeps it at 0.
+        uint32_t n_kv_cache;
     };
 
     struct llama_model_tensor_override {

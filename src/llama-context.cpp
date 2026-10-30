@@ -120,14 +120,16 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
 // [KV-LEAK] diagnostics for the kv-cache-size crash investigation (2026-10-29):
 // traces the effective KV dimensions of attention graphs as built at RESERVE and RUNTIME
 // time, to determine whether the pool size leaks into compute node shapes.
-// prints to stderr directly: visible regardless of the -lv setting, no impact on other levels.
+// silent unless LLAMA_KV_LEAK_TRACE is set; when active, prints to stderr directly
+// so it is visible regardless of the -lv setting, with no impact on other levels.
 static void llama_kv_leak_trace_graph(
         const char * tag,
         ggml_cgraph * gf,
         uint32_t      n_tokens,
         uint32_t      n_ctx_train,
         uint64_t *    dedup_dim) {
-    if (!gf) {
+    static const bool enabled = kv_leak_trace_enabled();
+    if (!enabled || !gf) {
         return;
     }
 
@@ -143,7 +145,7 @@ static void llama_kv_leak_trace_graph(
             max_kv_dim = std::max<uint64_t>(max_kv_dim, (uint64_t) node->src[1]->ne[1]);
         }
 
-        if (node->name && strcmp(node->name, "attn_inp_kq_mask") == 0) {
+        if (strcmp(node->name, "attn_inp_kq_mask") == 0) {
             max_mask = std::max<uint64_t>(max_mask, (uint64_t) node->ne[0]);
         }
     }
@@ -542,7 +544,7 @@ llama_context::llama_context(
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
-            /*.n_kv_cache=*/ static_cast<uint32_t>(params.n_kv_cache),
+            /*.n_kv_cache=*/ params.n_kv_cache,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -4089,10 +4091,10 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
-        /*.n_kv_cache                  =*/ 0,
-        /*.sampler                     =*/ nullptr,
-        /*.n_sampler                   =*/ 0,
+        /*.samplers                    =*/ nullptr,
+        /*.n_samplers                  =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.n_kv_cache                  =*/ 0,
     };
 
     return result;
