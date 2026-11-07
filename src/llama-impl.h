@@ -117,11 +117,3 @@ inline bool kv_leak_trace_enabled() {
     static const bool enabled = ::getenv("LLAMA_KV_LEAK_TRACE") != nullptr;
     return enabled;
 }
-
-// [UBATCH-TRACE] fork instrumentation gate (2026-11-08): per-ubatch trace of graph
-// build/reuse decisions in llama_context::process_ubatch. Prints to stderr only
-// when LLAMA_UBATCH_TRACE is set; silent by default.
-inline bool ubatch_trace_enabled() {
-    static const bool enabled = ::getenv("LLAMA_UBATCH_TRACE") != nullptr;
-    return enabled;
-}

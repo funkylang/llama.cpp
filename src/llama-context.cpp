@@ -1578,6 +1578,15 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// [UBATCH-TRACE] fork instrumentation gate (2026-11-08): per-ubatch trace of graph
+// build/reuse decisions in llama_context::process_ubatch. Prints to stderr only
+// when LLAMA_UBATCH_TRACE is set; silent by default. File-local so the env check
+// happens exactly once, process-wide.
+static bool ubatch_trace_enabled() {
+    static const bool enabled = ::getenv("LLAMA_UBATCH_TRACE") != nullptr;
+    return enabled;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
