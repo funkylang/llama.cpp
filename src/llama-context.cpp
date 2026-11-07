@@ -1587,11 +1587,33 @@ static bool ubatch_trace_enabled() {
     return enabled;
 }
 
+// [UBATCH-STAGE] fork instrumentation (2026-11-08): print wall-clock ms via stderr
+static double ubatch_stage_now() {
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    return (double) now.tv_sec * 1000.0 + (double) now.tv_nsec / 1e6;
+}
+
+// [UBATCH-STAGE] monotonic ubatch counter shared with the stage line
+static uint64_t ubatch_stage_seq() {
+    static uint64_t n = 0;
+    return ++n;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    if (mctx && !mctx->apply()) {
-        LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
-        ret = GGML_STATUS_FAILED;
-        return nullptr;
+    // [UBATCH-STAGE] fork instrumentation (2026-11-08): per-stage timing of the
+    // ubatch pipeline (apply / graph build / graph alloc / set inputs / launch).
+    const bool stage_traced = ubatch_trace_enabled();
+    double st_apply_us = 0.0, st_build_us = 0.0, st_alloc_us = 0.0, st_inputs_us = 0.0, st_launch_us = 0.0;
+
+    {
+        double t0 = ubatch_stage_now();
+        if (mctx && !mctx->apply()) {
+            LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        st_apply_us = ubatch_stage_now() - t0;
     }
 
     auto * res = get_gf_res_prev();
@@ -1668,10 +1690,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
-
-        gf = model.build_graph(gparams);
-
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        {
+            double t0 = ubatch_stage_now();
+            gf = model.build_graph(gparams);
+            st_build_us = ubatch_stage_now() - t0;
+        }
 
         // [KV-LEAK] trace the KV dimensions of the runtime graph (deduped per context type)
         llama_kv_leak_trace_graph(
@@ -1685,10 +1708,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
-            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
-            ret = GGML_STATUS_ALLOC_FAILED;
-            return nullptr;
+        {
+            double t0 = ubatch_stage_now();
+            if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+            st_alloc_us = ubatch_stage_now() - t0;
         }
 
         gf_res_prev_active = res;
@@ -1696,19 +1723,43 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // set the input data for the input tensors
     {
-        //const auto t_start_us = ggml_time_us();
-
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        double t0 = ubatch_stage_now();
         res->set_inputs(&ubatch);
-
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        st_inputs_us = ubatch_stage_now() - t0;
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
-    if (status != GGML_STATUS_SUCCESS) {
-        LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
-        ret = status;
-        return nullptr;
+    {
+        double t0 = ubatch_stage_now();
+        const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+        st_launch_us = ubatch_stage_now() - t0;
+        if (status != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+            ret = status;
+            return nullptr;
+        }
+    }
+
+    // [UBATCH-STAGE] fork instrumentation: emit per-stage timings
+    if (stage_traced) {
+        struct timespec now;
+        struct tm tm_buf;
+        char ts[16];
+        clock_gettime(CLOCK_REALTIME, &now);
+        localtime_r(&now.tv_sec, &tm_buf);
+        strftime(ts, sizeof ts, "%H:%M:%S", &tm_buf);
+
+        fprintf(stderr,
+                "%s.%03ld [UBATCH-STAGE] %s seq=%llu tokens=%u apply=%.1fms build=%.1fms alloc=%.1fms inputs=%.1fms launch=%.1fms\n",
+                ts, now.tv_nsec / 1000000L,
+                (gtype == LLM_GRAPH_TYPE_DECODER_MTP ? "mtp" : "main"),
+                (unsigned long long) ubatch_stage_seq(),
+                (uint32_t) ubatch.n_tokens,
+                st_apply_us / 1000.0,
+                st_build_us / 1000.0,
+                st_alloc_us / 1000.0,
+                st_inputs_us / 1000.0,
+                st_launch_us / 1000.0);
     }
 
     ret = GGML_STATUS_SUCCESS;
