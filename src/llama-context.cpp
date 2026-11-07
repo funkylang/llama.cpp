@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -17,6 +18,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -1589,6 +1591,54 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+
+    // [UBATCH-TRACE] fork instrumentation (2026-11-08): per-ubatch trace of the
+    // graph build/reuse decision; enabled with LLAMA_UBATCH_TRACE. Fields:
+    //  - main/mtp : primary or MTP context
+    //  - seq      : global ubatch sequence number (monotonic, all contexts)
+    //  - tokens   : ubatch token count
+    //  - n_out    : outputs requested in this ubatch (affects graph topology!)
+    //  - n_kv     : effective padded KV length the mask/graph is sized for
+    //  - BUILD/REUSE: fresh graph construction (expensive) vs cached graph
+    {
+        static uint64_t seq = 0;
+        ++seq;
+
+        if (ubatch_trace_enabled()) {
+            const bool will_reuse = !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams);
+
+            // n_outputs is still the PREVIOUS ubatch's value at this point; compute the current one the same way decode() does below
+            int32_t n_out_cur = 0;
+            const bool out_all = cparams.embeddings || !cparams.causal_attn;
+            if (out_all) {
+                n_out_cur = (int32_t) ubatch.n_tokens;
+            } else {
+                for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
+                    n_out_cur += (ubatch.output[i] != 0);
+                }
+            }
+
+            struct timespec now;
+            struct tm tm_buf;
+            char ts[16];
+            clock_gettime(CLOCK_REALTIME, &now);
+            localtime_r(&now.tv_sec, &tm_buf);
+            strftime(ts, sizeof ts, "%H:%M:%S", &tm_buf);
+
+            uint32_t n_kv_out = 0;
+            if (auto * kv_ctx = dynamic_cast<llama_kv_cache_context *>(mctx)) {
+                n_kv_out = kv_ctx->get_n_kv();
+            }
+
+            fprintf(stderr, "%s.%03ld [UBATCH-TRACE] %s seq=%llu tokens=%u n_out=%d n_kv=%u %s\n",
+                    ts, now.tv_nsec / 1000000L,
+                    (gtype == LLM_GRAPH_TYPE_DECODER_MTP ? "mtp" : "main"),
+                    (unsigned long long) seq,
+                    (uint32_t) ubatch.n_tokens,
+                    n_out_cur, (unsigned) n_kv_out,
+                    will_reuse ? "REUSE" : "BUILD");
+        }
+    }
 
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
