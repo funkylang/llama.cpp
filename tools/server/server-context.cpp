@@ -740,7 +740,12 @@ struct server_slot {
     void print_timings_pp() const {
         const double t_prompt_total = stats.t_prompt_ms();
 
-        // no wall-clock throttle: every n_print_interval boundary must show up (fork 2026-11-08)
+        // no wall-clock throttle: every n_print_interval boundary must show up (fork 2026-11-08);
+        // but skip the initial round where nothing has been processed yet (0/N, t=0.00 is noise)
+        if (stats.n_prompt_processed <= 0) {
+            return;
+        }
+
         const double n_prompt_second = stats.n_prompt_tps();
         const int64_t total_processed = (int64_t) stats.n_prompt_cached + (int64_t) stats.n_prompt_processed;
 
