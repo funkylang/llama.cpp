@@ -1594,6 +1594,10 @@ static double ubatch_stage_now() {
     return (double) now.tv_sec * 1000.0 + (double) now.tv_nsec / 1e6;
 }
 
+// [UBATCH-STAGE] global entry timestamp per context type for total duration
+static double ubatch_stage_entry_main = 0.0;
+static double ubatch_stage_entry_mtp = 0.0;
+
 // [UBATCH-STAGE] monotonic ubatch counter shared with the stage line
 static uint64_t ubatch_stage_seq() {
     static uint64_t n = 0;
@@ -1605,6 +1609,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // ubatch pipeline (apply / graph build / graph alloc / set inputs / launch).
     const bool stage_traced = ubatch_trace_enabled();
     double st_apply_us = 0.0, st_build_us = 0.0, st_alloc_us = 0.0, st_inputs_us = 0.0, st_launch_us = 0.0;
+    
+    // [UBATCH-STAGE] capture entry time for total duration calculation
+    if (stage_traced) {
+        double t_entry_ms = ubatch_stage_now();
+        if (gtype == LLM_GRAPH_TYPE_DECODER_MTP) ubatch_stage_entry_mtp = t_entry_ms;
+        else ubatch_stage_entry_main = t_entry_ms;
+    }
 
     {
         double t0 = ubatch_stage_now();
@@ -1671,18 +1682,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
-        //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
-
-        // with pipeline parallelism, the previous graph_compute_async may still be running
-        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
-        }
-
-        n_reused++;
-    } else {
+    double st_buildreuse_us = 0.0;
+    {
+        double t0 = ubatch_stage_now();
+        if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+            //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+            
+            // with pipeline parallelism, the previous graph_compute_async may still be running
+            // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
+            // that the previous compute is still reading.
+            if (cparams.pipeline_parallel) {
+                ggml_backend_sched_synchronize(sched.get());
+            }
+            
+            n_reused++;
+        } else {
         gf_res_prev_active = nullptr;
         res->reset();
 
@@ -1720,6 +1734,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         gf_res_prev_active = res;
     }
+    
+    st_buildreuse_us = ubatch_stage_now() - t0;
+}  // end build/reuse timing block
 
     // set the input data for the input tensors
     {
@@ -1749,17 +1766,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         localtime_r(&now.tv_sec, &tm_buf);
         strftime(ts, sizeof ts, "%H:%M:%S", &tm_buf);
 
+        double total_ms = ubatch_stage_now() - (gtype == LLM_GRAPH_TYPE_DECODER_MTP ? ubatch_stage_entry_mtp : ubatch_stage_entry_main);
+
         fprintf(stderr,
-                "%s.%03ld [UBATCH-STAGE] %s seq=%llu tokens=%u apply=%.1fms build=%.1fms alloc=%.1fms inputs=%.1fms launch=%.1fms\n",
+                "%s.%03ld [UBATCH-STAGE] %s seq=%llu tokens=%u apply=%.1fms buildreuse=%.1fms build=%.1fms alloc=%.1fms inputs=%.1fms launch=%.1fms TOTAL=%.1fms\n",
                 ts, now.tv_nsec / 1000000L,
                 (gtype == LLM_GRAPH_TYPE_DECODER_MTP ? "mtp" : "main"),
                 (unsigned long long) ubatch_stage_seq(),
                 (uint32_t) ubatch.n_tokens,
                 st_apply_us / 1000.0,
+                st_buildreuse_us / 1000.0,
                 st_build_us / 1000.0,
                 st_alloc_us / 1000.0,
                 st_inputs_us / 1000.0,
-                st_launch_us / 1000.0);
+                st_launch_us / 1000.0,
+                total_ms);
     }
 
     ret = GGML_STATUS_SUCCESS;
