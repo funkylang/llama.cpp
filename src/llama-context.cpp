@@ -1759,6 +1759,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // [UBATCH-STAGE] fork instrumentation: emit per-stage timings
     if (stage_traced) {
+        double t0 = ubatch_stage_now();
+        
         struct timespec now;
         struct tm tm_buf;
         char ts[16];
@@ -1766,21 +1768,28 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         localtime_r(&now.tv_sec, &tm_buf);
         strftime(ts, sizeof ts, "%H:%M:%S", &tm_buf);
 
-        double total_ms = ubatch_stage_now() - (gtype == LLM_GRAPH_TYPE_DECODER_MTP ? ubatch_stage_entry_mtp : ubatch_stage_entry_main);
+        double t1 = ubatch_stage_now();
+        
+        double total_ms = t0 - (gtype == LLM_GRAPH_TYPE_DECODER_MTP ? ubatch_stage_entry_mtp : ubatch_stage_entry_main);
+        
+        // Sum of all measured stages in ms
+        double stages_sum_ms = (st_apply_us + st_buildreuse_us + st_inputs_us + st_launch_us) / 1000.0;
+        double unmeasured_ms = total_ms - stages_sum_ms;
+        double fprintf_time_ms = t1 - t0;
 
         fprintf(stderr,
-                "%s.%03ld [UBATCH-STAGE] %s seq=%llu tokens=%u apply=%.1fms buildreuse=%.1fms build=%.1fms alloc=%.1fms inputs=%.1fms launch=%.1fms TOTAL=%.1fms\n",
+                "%s.%03ld [UBATCH-STAGE] %s seq=%llu tokens=%u apply=%.1fms buildreuse=%.1fms inputs=%.1fms launch=%.1fms TOTAL=%.1fms UNMEASURED=%.1fms FPRINTF=%.3fms\n",
                 ts, now.tv_nsec / 1000000L,
                 (gtype == LLM_GRAPH_TYPE_DECODER_MTP ? "mtp" : "main"),
                 (unsigned long long) ubatch_stage_seq(),
                 (uint32_t) ubatch.n_tokens,
                 st_apply_us / 1000.0,
                 st_buildreuse_us / 1000.0,
-                st_build_us / 1000.0,
-                st_alloc_us / 1000.0,
                 st_inputs_us / 1000.0,
                 st_launch_us / 1000.0,
-                total_ms);
+                total_ms,
+                unmeasured_ms,
+                fprintf_time_ms);
     }
 
     ret = GGML_STATUS_SUCCESS;
