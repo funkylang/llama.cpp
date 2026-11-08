@@ -1594,6 +1594,14 @@ static double ubatch_stage_now() {
     return (double) now.tv_sec * 1000.0 + (double) now.tv_nsec / 1e6;
 }
 
+// [UBATCH-STAGE] monotonic variant: immune to NTP steps; used to verify TOTAL
+// is not an artifact of a wall-clock adjustment mid-call
+static double ubatch_stage_mono_now() {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (double) now.tv_sec * 1000.0 + (double) now.tv_nsec / 1e6;
+}
+
 // [UBATCH-STAGE] global entry timestamp per context type for total duration
 static double ubatch_stage_entry_main = 0.0;
 static double ubatch_stage_entry_mtp = 0.0;
@@ -1608,13 +1616,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // [UBATCH-STAGE] fork instrumentation (2026-11-08): per-stage timing of the
     // ubatch pipeline (apply / graph build / graph alloc / set inputs / launch).
     const bool stage_traced = ubatch_trace_enabled();
-    double st_apply_us = 0.0, st_build_us = 0.0, st_alloc_us = 0.0, st_inputs_us = 0.0, st_launch_us = 0.0;
-    
-    // [UBATCH-STAGE] capture entry time for total duration calculation
+    double st_apply_us = 0.0, st_inputs_us = 0.0, st_launch_us = 0.0;
+    double st_c1_ms = 0.0, st_c2_ms = 0.0, st_c3_ms = 0.0;  // [UBATCH-STAGE] cumulative offsets from entry
+
+    // [UBATCH-STAGE] function-local entry (wall + monotonic); cumulative offsets
+    // after each stage block (c1/c2/c3) expose gaps BETWEEN the stage timers
+    double st_entry_wall  = 0.0;
+    double st_entry_mono  = 0.0;
     if (stage_traced) {
-        double t_entry_ms = ubatch_stage_now();
-        if (gtype == LLM_GRAPH_TYPE_DECODER_MTP) ubatch_stage_entry_mtp = t_entry_ms;
-        else ubatch_stage_entry_main = t_entry_ms;
+        st_entry_wall = ubatch_stage_now();
+        st_entry_mono = ubatch_stage_mono_now();
+        if (gtype == LLM_GRAPH_TYPE_DECODER_MTP) ubatch_stage_entry_mtp = st_entry_wall;
+        else ubatch_stage_entry_main = st_entry_wall;
     }
 
     {
@@ -1626,6 +1639,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
         st_apply_us = ubatch_stage_now() - t0;
     }
+    if (stage_traced) st_c1_ms = ubatch_stage_now() - st_entry_wall;  // cumulative after apply
 
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
@@ -1704,11 +1718,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
-        {
-            double t0 = ubatch_stage_now();
-            gf = model.build_graph(gparams);
-            st_build_us = ubatch_stage_now() - t0;
-        }
+        gf = model.build_graph(gparams);
 
         // [KV-LEAK] trace the KV dimensions of the runtime graph (deduped per context type)
         llama_kv_leak_trace_graph(
@@ -1722,14 +1732,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        {
-            double t0 = ubatch_stage_now();
-            if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
-                LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
-                ret = GGML_STATUS_ALLOC_FAILED;
-                return nullptr;
-            }
-            st_alloc_us = ubatch_stage_now() - t0;
+        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
         }
 
         gf_res_prev_active = res;
@@ -1737,6 +1743,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     
     st_buildreuse_us = ubatch_stage_now() - t0;
 }  // end build/reuse timing block
+if (stage_traced) st_c2_ms = ubatch_stage_now() - st_entry_wall;  // cumulative after buildreuse
 
     // set the input data for the input tensors
     {
@@ -1745,6 +1752,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
         st_inputs_us = ubatch_stage_now() - t0;
     }
+    if (stage_traced) st_c3_ms = ubatch_stage_now() - st_entry_wall;  // cumulative after set_inputs
 
     {
         double t0 = ubatch_stage_now();
@@ -1771,14 +1779,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         double t1 = ubatch_stage_now();
         
         double total_ms = t0 - (gtype == LLM_GRAPH_TYPE_DECODER_MTP ? ubatch_stage_entry_mtp : ubatch_stage_entry_main);
-        
+        double mono_total_ms = ubatch_stage_mono_now() - st_entry_mono;  // [UBATCH-STAGE] NTP-step immune
+
         // Sum of all measured stages in ms
         double stages_sum_ms = (st_apply_us + st_buildreuse_us + st_inputs_us + st_launch_us) / 1000.0;
         double unmeasured_ms = total_ms - stages_sum_ms;
         double fprintf_time_ms = t1 - t0;
 
         fprintf(stderr,
-                "%s.%03ld [UBATCH-STAGE] %s seq=%llu tokens=%u apply=%.1fms buildreuse=%.1fms inputs=%.1fms launch=%.1fms TOTAL=%.1fms UNMEASURED=%.1fms FPRINTF=%.3fms\n",
+                "%s.%03ld [UBATCH-STAGE] %s seq=%llu tokens=%u apply=%.1fms buildreuse=%.1fms inputs=%.1fms launch=%.1fms TOTAL=%.1fms UNMEASURED=%.1fms FPRINTF=%.3fms c1=%.2f c2=%.2f c3=%.2f MONO=%.1f\n",
                 ts, now.tv_nsec / 1000000L,
                 (gtype == LLM_GRAPH_TYPE_DECODER_MTP ? "mtp" : "main"),
                 (unsigned long long) ubatch_stage_seq(),
@@ -1789,7 +1798,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 st_launch_us / 1000.0,
                 total_ms,
                 unmeasured_ms,
-                fprintf_time_ms);
+                fprintf_time_ms,
+                st_c1_ms,
+                st_c2_ms,
+                st_c3_ms,
+                mono_total_ms);
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2037,6 +2050,12 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    // [UBATCH-STAGE] decode-level wall timer (2026-11-08): captures the FULL decode()
+    // span including balloc->init; DECODE-TOTAL minus sum of STAGE TOTALs = time
+    // outside process_ubatch (batch prep, init_batch, sched_reserve, extraction)
+    double dec_entry_wall = 0.0;
+    if (ubatch_trace_enabled()) dec_entry_wall = ubatch_stage_now();
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2434,6 +2453,20 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    // [UBATCH-STAGE] emit total decode() wall time; DECODE-TOTAL minus the sum of
+    // STAGE TOTALs for this call's ubatches = time spent outside process_ubatch
+    if (dec_entry_wall > 0.0) {
+        double dec_total_ms = ubatch_stage_now() - dec_entry_wall;
+        struct timespec nowd;
+        struct tm tmd;
+        char tsd[16];
+        clock_gettime(CLOCK_REALTIME, &nowd);
+        localtime_r(&nowd.tv_sec, &tmd);
+        strftime(tsd, sizeof tsd, "%H:%M:%S", &tmd);
+        fprintf(stderr, "%s.%03ld [DECODE-TOTAL] tokens=%u %.1fms\n",
+                tsd, nowd.tv_nsec / 1000000L, n_tokens_all, dec_total_ms);
+    }
 
     return 0;
 }
