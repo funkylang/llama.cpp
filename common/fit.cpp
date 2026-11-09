@@ -876,6 +876,352 @@ static void common_params_fit_impl(
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
 }
 
+// [FORK] pure computation behind common_fit_max_kv_cache(): solve the maximum unified KV pool
+// size from two no_alloc probes taken at N0 and N1 cells. Kept separate for unit testing -
+// it has no device/model dependencies, everything is measured into the dmds vectors by the caller.
+static uint32_t common_fit_max_kv_cache_solve(
+        const std::vector<llama_device_memory_data> & dmds_low,
+        const std::vector<llama_device_memory_data> & dmds_high,
+                                uint32_t N0, uint32_t N1,
+                                const size_t * margins,      // per-device margin to keep free (bytes)
+                                double vram_fraction,        // hard cap: max usage of each device's total memory
+                                bool verbose) {
+    if (dmds_low.empty() || dmds_low.size() != dmds_high.size()) {
+        return 0;
+    }
+
+    const size_t nd = dmds_low.size() - 1; // devices only; the host entry (last) is excluded on purpose:
+                                           // auto-maximizing into system RAM stays an explicit option
+    uint32_t n_max = UINT32_MAX;
+    bool have_constraint = false;
+
+    if (verbose) {
+        LOG_INF("%s: maximizing the unified KV pool [MiB]:\n", __func__);
+    }
+    for (size_t id = 0; id < nd; id++) {
+        const auto & lo = dmds_low[id].mb;
+        const auto & hi = dmds_high[id].mb;
+
+        if (lo.model != hi.model || lo.compute != hi.compute) {
+            if (verbose) {
+                LOG_WRN("%s: model/compute bytes differ between probes on device %zu (%" PRId64 "/%" PRId64 " vs %" PRId64 "/%" PRId64 "), giving up\n",
+                        __func__, id, lo.model/1048576, lo.compute/1048576, hi.model/1048576, hi.compute/1048576);
+            }
+            return 0;
+        }
+
+        const int64_t delta_ctx = (int64_t) hi.context - (int64_t) lo.context;
+        const int64_t dns       = (int64_t) (N1 - N0);
+        if (delta_ctx < 0 || delta_ctx % dns != 0) {
+            if (verbose) {
+                LOG_WRN("%s: unexpected non-affine context size on device %zu (%" PRId64 " -> %" PRId64 "), giving up\n",
+                        __func__, id, (int64_t) lo.context/1048576, (int64_t) hi.context/1048576);
+            }
+            return 0;
+        }
+        const int64_t rate  = delta_ctx / dns;
+        const int64_t fixed = rate > 0 ? (int64_t) lo.context - rate * (int64_t) N0 : (int64_t) lo.context;
+
+        if (rate == 0) {
+            continue; // this device hosts no KV layers: no pool constraint
+        }
+
+        const llama_device_memory_data & dmd = dmds_low[id];
+        if (dmd.total <= 0 || dmd.free <= 0 || dmd.free > dmd.total) {
+            if (verbose) {
+                LOG_WRN("%s: device %zu does not report valid memory but hosts KV layers, giving up\n", __func__, id);
+            }
+            return 0;
+        }
+
+        // what this device may still allocate for the pool:
+        //   - hard cap so total usage never exceeds vram_fraction of the device (driver headroom)
+        //   - limited by measured free memory, minus the margins to keep for other purposes
+        const int64_t used        = dmd.total > dmd.free ? dmd.total - dmd.free : 0;
+        const int64_t cap_driver  = (int64_t) ((double) dmd.total * vram_fraction) - used;
+        const int64_t margin_i    = margins != nullptr ? (int64_t) margins[id] : 0;
+        const int64_t cap_free    = (int64_t) dmd.free - margin_i;
+        const int64_t pool_room   = std::min(cap_driver, cap_free);
+
+        // model weights + compute buffers + cell-independent state are consumed before the pool
+        const int64_t non_pool    = (int64_t) lo.model + (int64_t) lo.compute + fixed;
+
+        uint32_t n_dev = 0;
+        if (non_pool < pool_room) {
+            const int64_t cells = (pool_room - non_pool) / rate;
+            n_dev = (uint32_t) (cells / 256u * 256u);
+        }
+
+        if (verbose) {
+            LOG_INF("%s:   - device %zu: total %6" PRId64 " MiB, free %6" PRId64 " MiB, non-pool %6" PRId64 " MiB, rate %" PRId64 " B/cell -> max %9u cells\n",
+                    __func__, id, dmd.total/1048576, dmd.free/1048576, non_pool/1048576, rate, n_dev);
+        }
+
+        have_constraint = true;
+        n_max = std::min(n_max, n_dev);
+    }
+
+    if (!have_constraint) {
+        if (verbose) {
+            LOG_WRN("%s: no device with a VRAM constraint hosts KV layers, pool maximization skipped\n", __func__);
+        }
+        return 0;
+    }
+    if (n_max < N0) {
+        return 0; // not even one padding unit of pool fits anywhere
+    }
+
+    return n_max;
+}
+
+uint32_t common_fit_max_kv_cache(
+        const char * path_model,
+        llama_model_params * mparams,
+        llama_context_params * cparams,
+        size_t * margins,
+        const common_fit_extra_model * extra,
+        double vram_fraction,
+        ggml_log_level log_level) {
+    if (mparams == nullptr || cparams == nullptr || !cparams->kv_unified) {
+        return 0; // pool math is only defined for unified mode
+    }
+
+    typedef std::vector<llama_device_memory_data> dmds_t;
+
+    // two probes one padding unit apart decompose the per-device context bytes into
+    // fixed + rate * n_cells; what they measure is what create_memory() allocates,
+    // so SWA/MLA/hybrid quirks are handled by construction
+    const uint32_t N0 = 256;
+    const uint32_t N1 = 2 * 256;
+
+    auto probe = [&](uint32_t n_pool) -> dmds_t {
+        llama_context_params cp_copy = *cparams;
+        cp_copy.n_kv_cache = n_pool;
+
+        std::vector<ggml_backend_dev_t> devs_main;
+        uint32_t hp_ngl = 0, hp_nct = 0, hp_nex = 0;
+
+        dmds_t dmds;
+        try {
+            dmds = common_get_device_memory_data_impl(
+                path_model, mparams, &cp_copy, devs_main, hp_ngl, hp_nct, hp_nex, log_level);
+        } catch (const std::runtime_error & e) {
+            LOG_ERR("%s: probing failed for the main model: %s\n", __func__, e.what());
+            return {};
+        }
+
+        if (extra != nullptr && devs_main.empty() == false) {
+            // the extra (e.g. MTP) context competes for the same devices; its pool follows
+            // the probed size so its KV rows are part of the measured rate
+            const uint32_t n_pool_saved = extra->cparams->n_kv_cache;
+            extra->cparams->n_kv_cache = n_pool;
+
+            std::vector<ggml_backend_dev_t> devs_extra;
+            uint32_t ngl_e = 0, nct_e = 0, nex_e = 0;
+            dmds_t measured;
+            try {
+                measured = common_get_device_memory_data_impl(
+                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_e, nct_e, nex_e, log_level);
+            } catch (const std::runtime_error & e) {
+                LOG_WRN("%s: probing failed for the extra model, continuing without it: %s\n", __func__, e.what());
+            }
+            extra->cparams->n_kv_cache = n_pool_saved;
+
+            if (!measured.empty()) {
+                // fold the extra model's memory into the matching devices (same mapping as add_extra_memory)
+                dmds_t merged(devs_main.size() + 1);
+                merged.back().mb = measured.back().mb;
+                for (size_t je = 0; je < devs_extra.size(); je++) {
+                    for (size_t id = 0; id < devs_main.size(); id++) {
+                        if (devs_extra[je] == devs_main[id]) {
+                            merged[id].mb.model   += measured[je].mb.model;
+                            merged[id].mb.context += measured[je].mb.context;
+                            merged[id].mb.compute += measured[je].mb.compute;
+                            break;
+                        }
+                    }
+                }
+                if (extra->shares_model) {
+                    for (llama_device_memory_data & dmd : merged) {
+                        dmd.mb.model = 0; // weights already counted in the main model
+                    }
+                }
+                for (size_t id = 0; id < dmds.size() && id < merged.size(); id++) {
+                    dmds[id].mb.model   += merged[id].mb.model;
+                    dmds[id].mb.context += merged[id].mb.context;
+                    dmds[id].mb.compute += merged[id].mb.compute;
+                }
+            }
+        }
+
+        return dmds;
+    };
+
+    LOG_TRC("%s: probing for the maximum KV pool size (n_kv_cache = %u / %u)\n", __func__, N0, N1);
+    const dmds_t dmds_low  = probe(N0);
+    if (dmds_low.empty()) {
+        return 0;
+    }
+    const dmds_t dmds_high = probe(N1);
+    if (dmds_high.empty() || dmds_high.size() != dmds_low.size()) {
+        LOG_ERR("%s: inconsistent probe sizes (%zu vs %zu devices), giving up\n", __func__,
+                dmds_high.size(), dmds_low.size());
+        return 0;
+    }
+
+    const uint32_t n_max = common_fit_max_kv_cache_solve(dmds_low, dmds_high, N0, N1, margins, vram_fraction, /* verbose = */ true);
+    if (n_max > 0) {
+        LOG_INF("%s: maximum unified KV pool size is %u cells\n", __func__, n_max);
+    }
+    return n_max;
+}
+
+bool common_fit_auto_split(
+        const char * path_model,
+        llama_model_params * mparams,
+        llama_context_params * cparams,
+        float * tensor_split,
+        const common_fit_extra_model * extra,
+        ggml_log_level log_level) {
+
+    // Step 1: Get initial device memory data to find out how many devices we have
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0, hp_nct = 0, hp_nex = 0;
+    auto dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+
+    const size_t nd = devs.size();
+    if (nd == 0 || nd > llama_max_devices()) {
+        LOG_WRN("%s: no GPU devices found or too many devices (%zu), aborting auto split\n", __func__, nd);
+        return false;
+    }
+
+    // Step 2: Compute tensor_split proportional to VRAM
+    double sum_vram = 0.0;
+    std::vector<double> vram_nd(nd);
+    for (size_t id = 0; id < nd; id++) {
+        size_t free, total;
+        ggml_backend_dev_memory(devs[id], &free, &total);
+        vram_nd[id] = static_cast<double>(total);
+        sum_vram += vram_nd[id];
+    }
+
+    if (sum_vram <= 0) {
+        LOG_WRN("%s: total VRAM is zero or negative, aborting auto split\n", __func__);
+        return false;
+    }
+
+    for (size_t id = 0; id < nd; id++) {
+        tensor_split[id] = static_cast<float>(vram_nd[id] / sum_vram);
+    }
+
+    LOG_INF("%s: computing proportional VRAM tensor split:\n", __func__);
+    for (size_t id = 0; id < nd; id++) {
+        LOG_INF("%s:   - device %zu: %6.1f MiB (%5.2f%%)\n",
+                __func__, id, vram_nd[id]/(1024*1024), 100.0*tensor_split[id]);
+    }
+
+    // Step 3: Analytic calculation to find maximum n_gpu_layers that allows KV pool >= 256 cells
+    
+    // Model bytes per layer from metadata (sum across all devices to get total)
+    size_t model_bytes_total = 0;
+    for (size_t id = 0; id < nd; id++) {
+        model_bytes_total += dmds_full[id].mb.model;
+    }
+    size_t model_bytes_per_layer = hp_ngl > 0 ? model_bytes_total / hp_ngl : 0;
+    
+    // Compute overhead: use a conservative fraction of model memory (typical for inference)
+    // Based on observation: compute is usually 5-15% of model size
+    const double COMPUTE_FRACTION = 0.10;  // 10% overhead estimate
+    
+    LOG_INF("%s: analytic calculation with model_bytes_per_layer=%zu bytes, compute_fraction=%.2f\n",
+            __func__, model_bytes_per_layer, COMPUTE_FRACTION);
+
+    // For each device i with tensor_split weight s_i, at n_gpu_layers = g:
+    // - layers on device i ≈ g * s_i (proportional distribution)
+    // - model_bytes_i = model_bytes_per_layer * (g * s_i)
+    // - compute_i ≈ COMPUTE_FRACTION * model_bytes_i
+    
+    // For KV pool with N cells and per-device rate r_i:
+    // - Each device's capacity: cap_i = min(free_mem_i, 0.97 * total_mem_i)
+    // - Constraint: model_bytes_i + compute_i + fixed_i + r_i * N <= cap_i
+    
+    // We need to estimate r_i (KV rate per cell on device i)
+    // For hybrid models, only attention layers have KV cache
+    // Approximate: r_i ≈ (KV bytes per layer) * (s_i * hp_ngl attention layers on this device)
+    
+    // Get the context data from our probe (sum across all devices to get total)
+    size_t context_bytes_total = 0;
+    for (size_t id = 0; id < nd; id++) {
+        context_bytes_total += dmds_full[id].mb.context;
+    }
+    uint32_t current_n_ctx = cparams->n_ctx > 0 ? cparams->n_ctx : hp_nct;
+    
+    // Estimate KV rate per cell (total across all devices)
+    size_t kv_rate_per_cell_total = (current_n_ctx > 0 && context_bytes_total > 0) ? context_bytes_total / current_n_ctx : 0;
+    
+    LOG_INF("%s: estimated kv_rate_per_cell_total=%zu bytes\n", __func__, kv_rate_per_cell_total);
+
+    // For device i, its share of KV rate is proportional to its tensor_split weight
+    std::vector<size_t> kv_rate_per_device(nd);
+    for (size_t id = 0; id < nd; id++) {
+        kv_rate_per_device[id] = (kv_rate_per_cell_total * vram_nd[id]) / sum_vram;
+    }
+
+    // Now solve for maximum g (n_gpu_layers) such that all devices can support N >= 256 cells
+    uint32_t max_ngl = hp_ngl;
+    
+    for (uint32_t g = max_ngl; g >= 1; g--) {
+        bool fits = true;
+        
+        for (size_t id = 0; id < nd && fits; id++) {
+            // Calculate device i's memory usage at n_gpu_layers = g
+            double layers_on_dev = g * vram_nd[id] / sum_vram;  // proportional distribution
+            size_t model_bytes_i = (size_t)(model_bytes_per_layer * layers_on_dev);
+            size_t compute_i = (size_t)(COMPUTE_FRACTION * model_bytes_i);
+            
+            // Get device's capacity
+            size_t free_mem, total_mem;
+            ggml_backend_dev_memory(devs[id], &free_mem, &total_mem);
+            size_t cap = std::min(free_mem, (size_t)(0.97 * total_mem));
+            
+            // Check if pool of 256 cells fits:
+            // model_bytes_i + compute_i + fixed_i + kv_rate_per_device[i] * 256 <= cap
+            size_t pool_bytes_needed = kv_rate_per_device[id] * 256;
+            size_t total_needed = model_bytes_i + compute_i + pool_bytes_needed;
+            
+            LOG_TRC("%s:   - testing g=%u on device %zu: needed=%zu vs cap=%zu\n",
+                    __func__, g, id, total_needed, cap);
+            
+            if (total_needed > cap) {
+                fits = false;
+            }
+        }
+        
+        if (fits) {
+            LOG_INF("%s: found n_gpu_layers=%u that allows pool >= 256 cells\n", __func__, g);
+            break;
+        } else {
+            max_ngl = g - 1;  // try fewer layers next
+        }
+    }
+
+    if (max_ngl == 0) {
+        LOG_WRN("%s: cannot fit any GPU layers with a usable KV pool, aborting auto split\n", __func__);
+        return false;
+    }
+
+    // Step 4: Update mparams with the optimal settings
+    mparams->n_gpu_layers = static_cast<int32_t>(max_ngl);
+    if (nd > 1) {
+        mparams->tensor_split = tensor_split;
+    }
+
+    LOG_INF("%s: optimized n_gpu_layers=%u with tensor_split for %zu devices\n",
+            __func__, max_ngl, nd);
+
+    return true;
+}
+
 enum common_params_fit_status common_fit_params(
         const char * path_model,
         llama_model_params * mparams,
@@ -888,9 +1234,57 @@ enum common_params_fit_status common_fit_params(
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
+    bool auto_split_done = false;
+    
     try {
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
-        LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
+        // [FORK] Auto-split optimization: compute optimal n_gpu_layers and tensor_split
+        // if the user hasn't explicitly set them and we're using unified KV cache
+        if (cparams->kv_unified && cparams->n_kv_cache == 0) {
+            const auto default_mparams = llama_model_default_params();
+            
+            bool user_set_ngl = (mparams->n_gpu_layers != default_mparams.n_gpu_layers);
+            bool user_set_split = false;
+            if (mparams->tensor_split) {
+                for (size_t i = 0; i < llama_max_devices(); i++) {
+                    if (mparams->tensor_split[i] != 0.0f) {
+                        user_set_split = true;
+                        break;
+                    }
+                }
+            }
+            
+            // Only auto-split if user hasn't set placement parameters
+            if (!user_set_ngl && !user_set_split) {
+                LOG_INF("%s: attempting auto-split optimization for unified KV cache\n", __func__);
+                
+                auto_split_done = common_fit_auto_split(
+                    path_model, mparams, cparams, tensor_split, extra, log_level);
+            }
+        }
+        
+        if (!auto_split_done) {
+            // Normal fit procedure for non-unified KV or user-set parameters
+            common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
+            LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
+        } else {
+            LOG_INF("%s: auto-split optimization completed, skipping standard fit procedure\n", __func__);
+            
+            // Still need to maximize KV pool with the optimized placement
+            constexpr double VRAM_FRACTION = 0.97;
+            const uint32_t n_max = common_fit_max_kv_cache(path_model, mparams, cparams, margins, extra, VRAM_FRACTION, log_level);
+            
+            if (n_max > 0) {
+                cparams->n_kv_cache = n_max;
+                if (cparams->n_ctx > n_max) {
+                    LOG_WRN("%s: n_ctx (%" PRIu32 ") exceeds the maximum unified KV pool size (%" PRIu32 " cells), reducing it\n",
+                            __func__, cparams->n_ctx, n_max);
+                    cparams->n_ctx = n_max;
+                }
+            } else {
+                LOG_WRN("%s: not even a single padding unit of the unified KV pool fits with auto-split, leaving pool size to context params\n",
+                        __func__);
+            }
+        }
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
         status = COMMON_PARAMS_FIT_STATUS_FAILURE;
