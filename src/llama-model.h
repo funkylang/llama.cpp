@@ -897,7 +897,10 @@ struct llama_model {
 
     ggml_tensor * get_rope_factors(const llama_cparams & cparams, int il) const;
 
-    llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
+    // [FORK] hp_override: null = use model hparams; non-null = use this copy instead
+    // (KV pool fit scratch builds run the layout logic with no_alloc forced on)
+    llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams,
+            const llama_hparams * hp_override = nullptr) const;
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 

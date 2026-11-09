@@ -2783,7 +2783,12 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
-llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
+llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams,
+        const llama_hparams * hp_override) const {
+    // [FORK] hp_override: scratch builds (KV pool fit) run the identical layout logic with
+    // no_alloc forced on; all hparams reads below are routed through it
+    const llama_hparams & hp = hp_override ? *hp_override : hparams;
+
     llama_memory_i * res;
 
     // explicit physical KV pool size (--kv-cache-size), unified mode only: the shared pool may be
@@ -2792,7 +2797,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         GGML_PAD(params.n_kv_cache, 256u) : cparams.n_ctx_seq;
 
     // the non-causal LFM2 decision graph reads the whole prompt in one batch, nothing is kept
-    if (arch == LLM_ARCH_LFM2 && !hparams.causal_attn && hparams.n_layer_decision > 0) {
+    if (arch == LLM_ARCH_LFM2 && !hp.causal_attn && hp.n_layer_decision > 0) {
         return nullptr;
     }
 
@@ -2822,7 +2827,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             {
                 // sparse (MSA) layers carry an indexer key cache, but leading dense layers do not
                 llama_kv_cache::layer_filter_cb filter_idx =
-                    [&](int32_t il) { return (uint32_t) il >= hparams.n_layer_dense_lead; };
+                    [&](int32_t il) { return (uint32_t) il >= hp.n_layer_dense_lead; };
 
                 res = new llama_kv_cache_msa(
                         *this,
@@ -2834,8 +2839,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         attn_kv_size,
                         cparams.n_seq_max,
                         1,
-                        hparams.n_swa,
-                        hparams.swa_type,
+                        hp.n_swa,
+                        hp.swa_type,
                         nullptr,
                         filter_idx,
                         nullptr);
@@ -2843,16 +2848,16 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_DEEPSEEK32:
             {
-                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0) {
+                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hp.n_layer_nextn > 0) {
                     // The NextN/MTP draft head runs dense MLA (no DSA indexer), so the
                     // MTP context uses a plain attention KV cache holding only the
                     // nextn layer(s) - same pattern as the hybrid Qwen3.5 MTP context.
                     llama_kv_cache::layer_filter_cb filter =
-                        [&](uint32_t il) { return il >= hparams.n_layer(); };
+                        [&](uint32_t il) { return il >= hp.n_layer(); };
 
                     res = new llama_kv_cache(
                             *this,
-                            hparams,
+                            hp,
                             params.type_k,
                             params.type_v,
                             !cparams.flash_attn,
@@ -2861,8 +2866,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             attn_kv_size,
                             cparams.n_seq_max,
                             1,
-                            hparams.n_swa,
-                            hparams.swa_type,
+                            hp.n_swa,
+                            hp.swa_type,
                             nullptr,
                             filter,
                             nullptr,
@@ -2871,10 +2876,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // Main context: DSA cache for the trunk layers only - the nextn
                     // layer(s) are never attended by the trunk graph.
                     llama_kv_cache::layer_filter_cb filter_mla = nullptr;
-                    if (hparams.n_layer_nextn > 0) {
-                        filter_mla = [&](uint32_t il) { return il < hparams.n_layer(); };
+                    if (hp.n_layer_nextn > 0) {
+                        filter_mla = [&](uint32_t il) { return il < hp.n_layer(); };
                     }
-                    llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return il < hparams.n_layer() && (arch != LLM_ARCH_GLM_DSA || hparams.is_indexer_full(il)); };
+                    llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return il < hp.n_layer() && (arch != LLM_ARCH_GLM_DSA || hp.is_indexer_full(il)); };
 
                     res = new llama_kv_cache_dsa(
                             *this,
@@ -2886,8 +2891,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             attn_kv_size,
                             cparams.n_seq_max,
                             1,
-                            hparams.n_swa,
-                            hparams.swa_type,
+                            hp.n_swa,
+                            hp.swa_type,
                             filter_mla,
                             filter_lid,
                             nullptr);
@@ -2898,22 +2903,22 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 // KDA layers are recurrent, the DSA layers use a K-only MLA cache plus an indexer cache.
                 // tThe Nextn block is never attended by the trunk graph
                 llama_memory_hybrid_idx::layer_filter_cb filter_attn = [&](uint32_t il) {
-                    return il < hparams.n_layer() && !hparams.is_recr(il);
+                    return il < hp.n_layer() && !hp.is_recr(il);
                 };
                 llama_memory_hybrid_idx::layer_filter_cb filter_idx = [&](uint32_t il) {
-                    return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
+                    return il < hp.n_layer() && !hp.is_recr(il) && hp.is_indexer_full(il);
                 };
                 llama_memory_hybrid_idx::layer_filter_cb filter_recr = [&](uint32_t il) {
-                    return il < hparams.n_layer() && hparams.is_recr(il);
+                    return il < hp.n_layer() && hp.is_recr(il);
                 };
 
                 // the draft head is a single DSA layer
                 if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-                    if (hparams.n_layer_nextn == 0) {
+                    if (hp.n_layer_nextn == 0) {
                         throw std::runtime_error("GLM5-Next MTP requires the NextN block, convert without --no-mtp");
                     }
-                    filter_attn = [&](uint32_t il) { return il >= hparams.n_layer(); };
-                    filter_idx  = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    filter_attn = [&](uint32_t il) { return il >= hp.n_layer(); };
+                    filter_idx  = [&](uint32_t il) { return il >= hp.n_layer(); };
                     filter_recr = [&](uint32_t)    { return false; };
                 }
 
@@ -2924,8 +2929,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     /* attn_v_trans      */ !cparams.flash_attn,
                     /* attn_kv_size      */ attn_kv_size,
                     /* attn_n_pad        */ 1,
-                    /* attn_n_swa        */ hparams.n_swa,
-                    /* attn_swa_type     */ hparams.swa_type,
+                    /* attn_n_swa        */ hp.n_swa,
+                    /* attn_swa_type     */ hp.swa_type,
                     /* recurrent_type_r  */ GGML_TYPE_F32,
                     /* recurrent_type_s  */ GGML_TYPE_F32,
                     /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
@@ -2939,11 +2944,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             } break;
         case LLM_ARCH_HY_V4:
             {
-                if (hparams.indexer_top_k == 0) {
+                if (hp.indexer_top_k == 0) {
                     // full-attention checkpoint: no indexer, so no indexer key cache
                     res = new llama_kv_cache(
                             *this,
-                            hparams,
+                            hp,
                             params.type_k,
                             params.type_v,
                             !cparams.flash_attn,
@@ -2952,15 +2957,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             attn_kv_size,
                             cparams.n_seq_max,
                             1,
-                            hparams.n_swa,
-                            hparams.swa_type,
+                            hp.n_swa,
+                            hp.swa_type,
                             nullptr,
                             nullptr,
                             nullptr,
                             nullptr);
                 } else {
                     // only "full" layers own an indexer, so the shared layers need no indexer cache
-                    llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return hparams.is_indexer_full(il); };
+                    llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return hp.is_indexer_full(il); };
 
                     res = new llama_kv_cache_dsa(
                             *this,
@@ -2972,8 +2977,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             attn_kv_size,
                             cparams.n_seq_max,
                             1,
-                            hparams.n_swa,
-                            hparams.swa_type,
+                            hp.n_swa,
+                            hp.swa_type,
                             nullptr,
                             filter_lid,
                             nullptr);
@@ -2981,16 +2986,16 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             } break;
         case LLM_ARCH_DOTS3NOTE:
             {
-                GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
+                GGML_ASSERT(hp.swa_type != LLAMA_SWA_TYPE_NONE);
 
-                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0) {
+                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hp.n_layer_nextn > 0) {
                     // MTP draft context: plain attention KV cache holding only the nextn layer
                     llama_kv_cache::layer_filter_cb filter =
-                        [&](uint32_t il) { return il >= hparams.n_layer(); };
+                        [&](uint32_t il) { return il >= hp.n_layer(); };
 
                     res = new llama_kv_cache(
                             *this,
-                            hparams,
+                            hp,
                             params.type_k,
                             params.type_v,
                             !cparams.flash_attn,
@@ -2999,8 +3004,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             attn_kv_size,
                             cparams.n_seq_max,
                             1,
-                            hparams.n_swa,
-                            hparams.swa_type,
+                            hp.n_swa,
+                            hp.swa_type,
                             nullptr,
                             filter,
                             nullptr,
@@ -3008,10 +3013,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 } else {
                     // main context: DSA cache for the trunk full-attention layers plus a window-sized SWA cache
                     llama_kv_cache::layer_filter_cb filter_mla = nullptr;
-                    if (hparams.n_layer_nextn > 0) {
-                        filter_mla = [&](uint32_t il) { return il < hparams.n_layer(); };
+                    if (hp.n_layer_nextn > 0) {
+                        filter_mla = [&](uint32_t il) { return il < hp.n_layer(); };
                     }
-                    llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return il < hparams.n_layer() && hparams.is_indexer_full(il); };
+                    llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return il < hp.n_layer() && hp.is_indexer_full(il); };
 
                     res = new llama_kv_cache_dsa_iswa(
                             *this,
@@ -3032,11 +3037,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             } break;
         case LLM_ARCH_DEEPSEEK4:
             {
-                GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
+                GGML_ASSERT(hp.swa_type != LLAMA_SWA_TYPE_NONE);
 
                 if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
                     const llama_memory_i::layer_filter_cb filter_mtp = [&](int32_t il) {
-                        return il >= (int32_t) hparams.n_layer();
+                        return il >= (int32_t) hp.n_layer();
                     };
 
                     res = new llama_kv_cache_iswa(
@@ -3076,8 +3081,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_DFLASH:
             {
                 // DSV4 DSpark stages store a single MLA-style K per position (window = the draft ring)
-                if (hparams.dsv4_hc_mult > 0) {
-                    GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
+                if (hp.dsv4_hc_mult > 0) {
+                    GGML_ASSERT(hp.swa_type != LLAMA_SWA_TYPE_NONE);
 
                     res = new llama_kv_cache_iswa(
                             *this,
@@ -3136,37 +3141,37 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_recr = [&](uint32_t) { return true; };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
                         filter_attn = [&](uint32_t il) {
-                            return !hparams.is_recr(il) && hparams.n_ff(il) == 0;
+                            return !hp.is_recr(il) && hp.n_ff(il) == 0;
                         };
                         filter_recr = [&](uint32_t il) {
-                            return hparams.is_recr(il) && hparams.n_ff(il) == 0;
+                            return hp.is_recr(il) && hp.n_ff(il) == 0;
                         };
                     } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
                         filter_attn = [&](uint32_t il) {
-                            return il < hparams.n_layer() && !hparams.is_recr(il);
+                            return il < hp.n_layer() && !hp.is_recr(il);
                         };
                         filter_recr = [&](uint32_t il) {
-                            return il < hparams.n_layer() && hparams.is_recr(il);
+                            return il < hp.n_layer() && hp.is_recr(il);
                         };
 
-                        if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
+                        if (arch == LLM_ARCH_QWEN4EXP && hp.indexer_head_size > 0) {
                             // QSA runs on the dense-attention layers only
                             filter_idx = [&](uint32_t il) {
-                                return il < hparams.n_layer() && !hparams.is_recr(il);
+                                return il < hp.n_layer() && !hp.is_recr(il);
                             };
                         }
 
                         // the MTP draft context holds the MTP block alone: its attention and indexer, no recurrent layer
                         if (arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-                            filter_attn = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                            filter_attn = [&](uint32_t il) { return il >= hp.n_layer(); };
                             filter_recr = [&](uint32_t)    { return false; };
                             if (filter_idx) {
-                                filter_idx = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                                filter_idx = [&](uint32_t il) { return il >= hp.n_layer(); };
                             }
                         }
                     }
 
-                    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                    if (hp.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
                             /* model             */ *this,
@@ -3195,8 +3200,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_v_trans      */ !cparams.flash_attn,
                             /* attn_kv_size      */ attn_kv_size,
                             /* attn_n_pad        */ 1,
-                            /* attn_n_swa        */ hparams.n_swa,
-                            /* attn_swa_type     */ hparams.swa_type,
+                            /* attn_n_swa        */ hp.n_swa,
+                            /* attn_swa_type     */ hp.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
                             /* recurrent_type_v  */ GGML_TYPE_F32,
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
@@ -3215,8 +3220,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_v_trans      */ !cparams.flash_attn,
                             /* attn_kv_size      */ attn_kv_size,
                             /* attn_n_pad        */ 1,
-                            /* attn_n_swa        */ hparams.n_swa,
-                            /* attn_swa_type     */ hparams.swa_type,
+                            /* attn_n_swa        */ hp.n_swa,
+                            /* attn_swa_type     */ hp.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
                             /* recurrent_type_v  */ GGML_TYPE_F32,
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
@@ -3234,10 +3239,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                     if (arch == LLM_ARCH_GEMMA3N || arch == LLM_ARCH_GEMMA4) {
                         reuse = [&](uint32_t il) {
-                            GGML_ASSERT(hparams.n_layer_kv_from_start >= 2);
+                            GGML_ASSERT(hp.n_layer_kv_from_start >= 2);
 
-                            if (il >= (uint32_t)hparams.n_layer_kv_from_start) {
-                                return hparams.n_layer_kv_from_start - (hparams.is_swa(il) ? 2 : 1);
+                            if (il >= (uint32_t)hp.n_layer_kv_from_start) {
+                                return hp.n_layer_kv_from_start - (hp.is_swa(il) ? 2 : 1);
                             }
 
                             return -1;
@@ -3245,21 +3250,21 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
 
                     if (mtp_on_hybrid_qwen || mtp_on_hybrid_nemotron) {
-                        filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                        filter = [&](uint32_t il) { return il >= hp.n_layer(); };
                     }
 
                     // don't filter when n_layer_nextn is repurposed for a router layer the trunk attends
                     // or when a model is entirely n_layer_nextn layers and has no trunk
-                    if (hparams.n_layer_nextn > 0 && hparams.n_layer() > 0 && hparams.router_layer < 0) {
+                    if (hp.n_layer_nextn > 0 && hp.n_layer() > 0 && hp.router_layer < 0) {
                         if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-                            filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                            filter = [&](uint32_t il) { return il >= hp.n_layer(); };
                         } else {
-                            filter = [&](uint32_t il) { return il <  hparams.n_layer(); };
+                            filter = [&](uint32_t il) { return il <  hp.n_layer(); };
                         }
                     }
 
-                    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-                        GGML_ASSERT(hparams.is_swa_any());
+                    if (hp.swa_type != LLAMA_SWA_TYPE_NONE) {
+                        GGML_ASSERT(hp.is_swa_any());
 
                         if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
                             llama_memory_t mem_other = llama_get_memory(cparams.ctx_other);
@@ -3267,7 +3272,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             share = [&](int32_t il) {
                                 const llama_model * model_other = llama_get_model(cparams.ctx_other);
 
-                                if (hparams.is_swa(il)) {
+                                if (hp.is_swa(il)) {
                                     return llama_model_n_layer(model_other) - 2;
                                 }
 
@@ -3309,11 +3314,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     share);
                         }
                     } else {
-                        GGML_ASSERT(!hparams.is_swa_any());
+                        GGML_ASSERT(!hp.is_swa_any());
 
                         res = new llama_kv_cache(
                                 *this,
-                                hparams,
+                                hp,
                                 params.type_k,
                                 params.type_v,
                                 !cparams.flash_attn,
@@ -3322,8 +3327,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 attn_kv_size,
                                 cparams.n_seq_max,
                                 1,
-                                hparams.n_swa,
-                                hparams.swa_type,
+                                hp.n_swa,
+                                hp.swa_type,
                                 nullptr,
                                 filter,
                                 nullptr,
@@ -3996,6 +4001,180 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
 
 uint32_t llama_model_n_tokens_delay(const struct llama_model * model) {
     return model->hparams.n_tokens_delay;
+}
+
+//
+// [FORK] KV pool fit
+// Computes the maximum unified KV cache pool that fits the devices' VRAM given the
+// model's current layer placement. Pure computation: it runs the real memory layout
+// logic (create_memory) with no_alloc forced on a scratch copy of the hparams, so
+// memory_breakdown() reports exact would-be allocation sizes without allocating
+// device memory.
+//
+
+static std::map<ggml_backend_buffer_type_t, size_t> kv_fit_scratch_breakdown(
+        const llama_model & model, uint32_t n_kv_probe,
+        ggml_type type_k, ggml_type type_v, bool flash_attn) {
+
+    // force no_alloc through an hparams copy: the constructors take their zero-byte
+    // buffer path and memory_breakdown() computes instead of reading allocations
+    llama_hparams hp = model.hparams;
+    hp.no_alloc = true;
+
+    llama_memory_params params_mem = {
+        /*.type_k    =*/ type_k,
+        /*.type_v    =*/ type_v,
+        /*.swa_full  =*/ false, // context default
+        /*.ctx_type  =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
+        /*.mem_other =*/ nullptr,
+        /*.n_kv_cache=*/ n_kv_probe,
+    };
+
+    llama_cparams cp{};
+    cp.n_seq_max   = 1;
+    cp.offload_kqv = true; // fit models fully offloaded KV (fllama / llama-server mode)
+    cp.flash_attn  = flash_attn;
+    cp.kv_unified  = true;
+    cp.ctx_type    = LLAMA_CONTEXT_TYPE_DEFAULT;
+
+    llama_memory_i * mem = model.create_memory(params_mem, cp, &hp);
+    if (!mem) {
+        return {}; // arch without memory (e.g. non-causal LFM2): nothing to fit
+    }
+    std::map<ggml_backend_buffer_type_t, size_t> br = mem->memory_breakdown();
+    delete mem;
+    return br;
+}
+
+// map a backend buffer type to its ggml device index; -1 for host or unmatched bufts
+static int32_t kv_fit_dev_index(ggml_backend_buffer_type_t buft) {
+    if (buft == nullptr || buft == ggml_backend_cpu_buffer_type()) {
+        return -1;
+    }
+    const size_t n = ggml_backend_dev_count();
+    for (size_t i = 0; i < n; ++i) {
+        if (ggml_backend_dev_buffer_type(ggml_backend_dev_get(i)) == buft) {
+            return (int32_t) i;
+        }
+    }
+    return -1;
+}
+
+int32_t llama_model_fit_kv_cache(
+        const struct llama_model * model,
+        ggml_type type_k, ggml_type type_v,
+        int32_t kv_unified, int32_t flash_attn,
+        double vram_fraction,
+        struct llama_kv_fit_data * out) {
+
+    if (!model || !out || !out->dev || kv_unified != 1) {
+        return 0;
+    }
+
+    // two scratch probes one padding unit apart decompose bytes(n) = fixed + rate*n
+    const uint32_t N0 = 256;
+    const uint32_t N1 = 2 * 256;
+
+    auto br0 = kv_fit_scratch_breakdown(*model, N0, type_k, type_v, flash_attn != 0);
+    auto br1 = kv_fit_scratch_breakdown(*model, N1, type_k, type_v, flash_attn != 0);
+    if (br1.empty()) {
+        return 0; // nothing allocates KV memory at all
+    }
+
+    struct term { size_t fixed; size_t rate; };
+    std::map<int32_t, term> dev_terms; // ggml device index (-1 = host) -> affine terms
+
+    for (const auto & kv : br1) {
+        const size_t b0  = br0.count(kv.first) ? br0[kv.first] : 0;
+        const size_t b1  = kv.second;
+        const size_t dns = N1 - N0;
+        if (b1 < b0 || (b1 - b0) % dns != 0) {
+            LLAMA_LOG_WARN("%s: unexpected non-affine size delta for buft %s (%zu -> %zu)\n",
+                    __func__, ggml_backend_buft_name(kv.first), b0, b1);
+            return 0;
+        }
+        const size_t rate  = (b1 - b0) / dns;
+        const size_t fixed = rate > 0 ? b0 - rate * N0 : b0;
+        term & t = dev_terms[kv_fit_dev_index(kv.first)];
+        t.fixed += fixed;
+        t.rate  += rate;
+    }
+
+    out->n_dev      = 0;
+    out->n_cells    = UINT32_MAX;
+    out->fixed_bytes   = 0;
+    out->bytes_per_cell = 0;
+    out->total_bytes    = 0;
+
+    bool have_constraint = false;
+
+    for (const auto & dt : dev_terms) {
+        struct llama_kv_fit_dev * d = &out->dev[out->n_dev++];
+        d->dev_index      = dt.first;
+        d->has_kv_layers  = dt.second.rate > 0 ? 1 : 0;
+        d->fixed_bytes    = dt.second.fixed;
+        d->bytes_per_cell = dt.second.rate;
+        d->max_cells      = 0;
+        d->total_mem      = 0; // host entries keep 0; devices fill it below
+        d->used_bytes     = 0;
+
+        out->fixed_bytes    += dt.second.fixed;
+        out->bytes_per_cell += dt.second.rate;
+
+        if (dt.first < 0) {
+            continue; // host: no VRAM constraint
+        }
+
+        ggml_backend_dev_t dev = ggml_backend_dev_get(dt.first);
+        size_t free_mem = 0, total_mem = 0;
+        ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+
+        d->total_mem  = total_mem;
+        d->used_bytes = total_mem > free_mem ? total_mem - free_mem : 0;
+
+        const size_t cap = (size_t) ((double) total_mem * vram_fraction);
+        if (d->bytes_per_cell == 0 || d->used_bytes + dt.second.fixed >= cap) {
+            d->max_cells = 0; // device cannot host even a single KV cell
+        } else {
+            const size_t cells = (cap - d->used_bytes - dt.second.fixed) / d->bytes_per_cell;
+            d->max_cells = (uint32_t) (cells / 256u * 256u);
+        }
+
+        if (d->has_kv_layers) {
+            have_constraint = true;
+            out->n_cells = std::min(out->n_cells, d->max_cells);
+        }
+    }
+
+    if (!have_constraint || out->n_cells == 0) {
+        // no GPU constraint or no room anywhere: report an unusable pool, not the sentinel
+        out->n_cells = 0;
+        return 0;
+    }
+
+    out->total_bytes = out->fixed_bytes + out->bytes_per_cell * (size_t) out->n_cells;
+
+    LLAMA_LOG_INFO("%s: pool %u cells (%.2f MiB), fixed %zu B, rate %zu B/cell over %d devices\n",
+            __func__, out->n_cells, out->total_bytes / 1048576.0,
+            out->fixed_bytes, out->bytes_per_cell, out->n_dev);
+
+    return 1;
+}
+
+int32_t llama_model_layer_device(const struct llama_model * model, int32_t il) {
+    if (!model || il < 0 || il >= (int32_t) model->hparams.n_layer_all) {
+        return -1;
+    }
+    ggml_backend_dev_t dev = model->dev_layer(il);
+    if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return -1; // host
+    }
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        if (ggml_backend_dev_get(i) == dev) {
+            return (int32_t) i;
+        }
+    }
+    return -1; // unrecognized: treat as host
 }
 
 uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const llama_token * tokens, uint32_t n_tokens, float * out) {

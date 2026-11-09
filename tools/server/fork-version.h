@@ -3,4 +3,4 @@
 // fork version (funkylang/llama.cpp)
 // updated on every fork commit with the ACTUAL current time at update (strict ordering);
 // printed as the first startup message of llama-server so the running build can be identified
-static const char * FORK_VERSION = "2026-11-08 21:09 UBATCH-STAGE cumulative offsets + DECODE-TOTAL";
+static const char * FORK_VERSION = "2026-11-09 11:15 KV pool fit API (llama_model_fit_kv_cache) for exact per-GPU cache sizing";

@@ -187,3 +187,54 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
 // realtime models: number of tokens the output lags behind the audio input, used by mtmd; 0 if not applicable
 LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
 #endif // __cplusplus
+
+//
+// KV pool fit (fork): compute the maximum unified KV cache pool that fits the devices' VRAM
+// given the model's current layer placement. Pure computation: no allocations, no GPU memory
+// touched. Call after model load and before context creation, with the exact KV types the
+// context will use; result is only valid for that combination.
+//
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// per-device contribution of one KV cell (exact, from the real allocation logic)
+struct llama_kv_fit_dev {
+    int32_t  dev_index;      // ggml device index (-1 = host)
+    int32_t  has_kv_layers;  // 1 if this device hosts KV cache layers
+    uint64_t total_mem;      // device memory, bytes
+    uint64_t used_bytes;     // measured at fit time (weights, other processes, ...)
+    uint64_t fixed_bytes;    // state not scaling with pool size (e.g. recurrent)
+    uint64_t bytes_per_cell; // KV row bytes per cell for this device's layers
+    uint32_t max_cells;      // pool size allowed by this device (padded to 256)
+};
+
+struct llama_kv_fit_data {
+    uint32_t n_cells;             // maximum pool: min over devices, padded to 256
+    uint32_t n_dev;               // number of entries in dev[]
+    size_t   total_bytes;         // fixed_bytes + bytes_per_cell * n_cells (all devices)
+    size_t   fixed_bytes;         // sum of device-independent fixed terms
+    size_t   bytes_per_cell;      // linear coefficient, all devices
+    struct llama_kv_fit_dev * dev;// array of n_dev entries (caller-allocated, see contract)
+};
+
+// out is a caller-allocated struct with dev pre-allocated to at most llama_max_devices()
+// entries; on return out->n_dev is the number of filled entries.
+// flash_attn and type_k/type_v must match what the context will actually use - they change
+// the KV tensor layout. swa_full is taken from the context default (false).
+// Returns 1 on success, 0 if no fit is possible (e.g. nothing offloaded).
+LLAMA_API int32_t llama_model_fit_kv_cache(
+        const struct llama_model * model,
+        enum ggml_type type_k, enum ggml_type type_v,
+        int32_t kv_unified,       // must be 1 for pool math (unified mode)
+        int32_t flash_attn,       // context flash-attn setting
+        double  vram_fraction,    // VRAM utilization cap, e.g. 0.97
+        struct llama_kv_fit_data * out);
+
+// ggml device index of layer il's tensors (-1 = host). Requires a loaded model.
+LLAMA_API int32_t llama_model_layer_device(const struct llama_model * model, int32_t il);
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
