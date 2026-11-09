@@ -4014,7 +4014,8 @@ uint32_t llama_model_n_tokens_delay(const struct llama_model * model) {
 
 static std::map<ggml_backend_buffer_type_t, size_t> kv_fit_scratch_breakdown(
         const llama_model & model, uint32_t n_kv_probe,
-        ggml_type type_k, ggml_type type_v, bool flash_attn) {
+        ggml_type type_k, ggml_type type_v, bool flash_attn,
+        uint32_t n_seq_max, uint32_t n_rs_seq) {
 
     // force no_alloc through an hparams copy: the constructors take their zero-byte
     // buffer path and memory_breakdown() computes instead of reading allocations
@@ -4031,7 +4032,8 @@ static std::map<ggml_backend_buffer_type_t, size_t> kv_fit_scratch_breakdown(
     };
 
     llama_cparams cp{};
-    cp.n_seq_max   = 1;
+    cp.n_seq_max   = n_seq_max > 0 ? n_seq_max : 1;
+    cp.n_rs_seq    = n_rs_seq; // must match the real context or the RS cache is mis-sized
     cp.offload_kqv = true; // fit models fully offloaded KV (fllama / llama-server mode)
     cp.flash_attn  = flash_attn;
     cp.kv_unified  = true;
@@ -4065,6 +4067,7 @@ int32_t llama_model_fit_kv_cache(
         ggml_type type_k, ggml_type type_v,
         int32_t kv_unified, int32_t flash_attn,
         double vram_fraction,
+        uint32_t n_seq_max, uint32_t n_rs_seq,
         struct llama_kv_fit_data * out) {
 
     if (!model || !out || !out->dev || kv_unified != 1) {
@@ -4075,8 +4078,8 @@ int32_t llama_model_fit_kv_cache(
     const uint32_t N0 = 256;
     const uint32_t N1 = 2 * 256;
 
-    auto br0 = kv_fit_scratch_breakdown(*model, N0, type_k, type_v, flash_attn != 0);
-    auto br1 = kv_fit_scratch_breakdown(*model, N1, type_k, type_v, flash_attn != 0);
+    auto br0 = kv_fit_scratch_breakdown(*model, N0, type_k, type_v, flash_attn != 0, n_seq_max, n_rs_seq);
+    auto br1 = kv_fit_scratch_breakdown(*model, N1, type_k, type_v, flash_attn != 0, n_seq_max, n_rs_seq);
     if (br1.empty()) {
         return 0; // nothing allocates KV memory at all
     }

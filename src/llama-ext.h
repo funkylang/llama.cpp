@@ -223,6 +223,9 @@ struct llama_kv_fit_data {
 // entries; on return out->n_dev is the number of filled entries.
 // flash_attn and type_k/type_v must match what the context will actually use - they change
 // the KV tensor layout. swa_full is taken from the context default (false).
+// n_seq_max and n_rs_seq must match the context's real values: hybrid/SSM models allocate
+// a recurrent-state cache sized by mem_size*(1+n_rs_seq) where mem_size=n_seq_max, which is
+// folded into the fixed term - probing with wrong values over-estimates the pool.
 // Returns 1 on success, 0 if no fit is possible (e.g. nothing offloaded).
 LLAMA_API int32_t llama_model_fit_kv_cache(
         const struct llama_model * model,
@@ -230,6 +233,8 @@ LLAMA_API int32_t llama_model_fit_kv_cache(
         int32_t kv_unified,       // must be 1 for pool math (unified mode)
         int32_t flash_attn,       // context flash-attn setting
         double  vram_fraction,    // VRAM utilization cap, e.g. 0.97
+        uint32_t n_seq_max,       // context sequence count
+        uint32_t n_rs_seq,        // recurrent-state rollback snapshots
         struct llama_kv_fit_data * out);
 
 // ggml device index of layer il's tensors (-1 = host). Requires a loaded model.
