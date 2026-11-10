@@ -4,4 +4,4 @@
 // updated on every fork commit with the ACTUAL current time at update (strict ordering);
 // printed as the first startup message of llama-server so the running build can be identified
 
-static const char * FORK_VERSION = "2026-11-10 23:15:58 KV-FIT-DBG: ctx-init substep VRAM trace";
+static const char * FORK_VERSION = "2026-11-11 00:24:33 Respect no_alloc in recurrent memory buffers (pool-fit double-count fix)";
