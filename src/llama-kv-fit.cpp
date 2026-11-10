@@ -32,6 +32,7 @@ static void llama_kv_fit_warmup_devices() {
     }
 
     const size_t ndevs = ggml_backend_dev_count();
+    fprintf(stderr, "[KV-FIT-DBG] warmup: ggml_backend_dev_count() = %zu\n", ndevs);
     for (size_t i = 0; i < ndevs; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (dev == nullptr) {
@@ -56,10 +57,9 @@ static void llama_kv_fit_warmup_devices() {
         size_t total_after = 0, free_after = 0;
         ggml_backend_dev_memory(dev, &free_after, &total_after);
 
-        LLAMA_LOG_INFO("%s: warmed up device %s - VRAM before %lld MiB / after %lld MiB\n",
-                __func__, name,
-                (long long) (total_before/1048576),
-                (long long) (total_after/1048576));
+        fprintf(stderr, "[KV-FIT-DBG] warmup: dev %s (type=%d) alloc_rc=%d VRAM before %lld MiB / after %lld MiB\n",
+                name, (int)type, buf != nullptr,
+                (long long)(total_before/1048576), (long long)(total_after/1048576));
     }
 
     done = true;
@@ -305,8 +305,8 @@ LLAMA_API int32_t llama_kv_fit_max_pool(
             const uint32_t n_pool_saved = extra->cparams->n_kv_cache;
             extra->cparams->n_kv_cache  = n_pool;
 
-            fprintf(stderr, "[KV-FIT-DBG] probe(n_pool=%u): EXTRA/MTP cparams n_seq_max=%u n_ctx=%llu n_kv_cache=%u kv_unified=%d ctx_type=%d\n",
-                    (unsigned)n_pool, (unsigned)extra->cparams->n_seq_max,
+            fprintf(stderr, "[KV-FIT-DBG] probe(n_pool=%u): EXTRA/MTP cparams ptr=%p n_seq_max=%u n_ctx=%llu n_kv_cache=%u kv_unified=%d ctx_type=%d\n",
+                    (unsigned)n_pool, (void*)extra->cparams, (unsigned)extra->cparams->n_seq_max,
                     (unsigned long long)extra->cparams->n_ctx, (unsigned)extra->cparams->n_kv_cache,
                     (int)extra->cparams->kv_unified, (int)extra->cparams->ctx_type);
             std::vector<ggml_backend_dev_t> devs_extra;
