@@ -57,9 +57,9 @@ static void llama_kv_fit_warmup_devices() {
         size_t total_after = 0, free_after = 0;
         ggml_backend_dev_memory(dev, &free_after, &total_after);
 
-        fprintf(stderr, "[KV-FIT-DBG] warmup: dev %s (type=%d) alloc_rc=%d VRAM before %lld MiB / after %lld MiB\n",
+        fprintf(stderr, "[KV-FIT-DBG] warmup: dev %s (type=%d) alloc_rc=%d VRAM before %lld / after %lld\n",
                 name, (int)type, buf != nullptr,
-                (long long)(total_before/1048576), (long long)(total_after/1048576));
+                (long long)total_before, (long long)total_after);
     }
 
     done = true;
@@ -179,7 +179,17 @@ static uint32_t llama_kv_fit_max_pool_solve(
                                 uint32_t N0, uint32_t N1,
                                 const size_t * margins,      // per-device margin to keep free (bytes)
                                 double vram_fraction) {      // hard cap: max usage of each device's total memory
+    fprintf(stderr, "[KV-FIT-DBG] solve: %zu device entries (last = host)\n", dmds_low.size());
+    for (size_t id = 0; id < dmds_low.size(); id++) {
+        fprintf(stderr, "[KV-FIT-DBG] solve entry %zu: model=%lld compute=%lld context(lo/hi)=%lld/%lld total=%lld free=%lld\n",
+                id,
+                (long long)dmds_low[id].mb.model,   (long long)dmds_low[id].mb.compute,
+                (long long)dmds_low[id].mb.context, (long long)dmds_high[id].mb.context,
+                (long long)dmds_low[id].total,      (long long)dmds_low[id].free);
+    }
     if (dmds_low.empty() || dmds_low.size() != dmds_high.size()) {
+        fprintf(stderr, "[KV-FIT-DBG] solve: giving up - probe vectors empty or size mismatch (%zu vs %zu)\n",
+                dmds_low.size(), dmds_high.size());
         return 0;
     }
 
@@ -188,36 +198,37 @@ static uint32_t llama_kv_fit_max_pool_solve(
     uint32_t n_max = UINT32_MAX;
     bool have_constraint = false;
 
-    LLAMA_LOG_INFO("%s: maximizing the unified KV pool [MiB]:\n", __func__);
     for (size_t id = 0; id < nd; id++) {
         const auto & lo = dmds_low[id].mb;
         const auto & hi = dmds_high[id].mb;
 
         if (lo.model != hi.model || lo.compute != hi.compute) {
-            LLAMA_LOG_WARN("%s: model/compute bytes differ between probes on device %zu (%lld/%lld vs %lld/%lld), giving up\n",
-                    __func__, id,
-                    (long long) (lo.model/1048576),   (long long) (lo.compute/1048576),
-                    (long long) (hi.model/1048576),   (long long) (hi.compute/1048576));
+            fprintf(stderr, "[KV-FIT-DBG] solve: giving up - model/compute bytes differ between probes on device %zu (%lld/%lld vs %lld/%lld)\n",
+                    id,
+                    (long long)lo.model,   (long long)lo.compute,
+                    (long long)hi.model,   (long long)hi.compute);
             return 0;
         }
 
         const int64_t delta_ctx = (int64_t) hi.context - (int64_t) lo.context;
         const int64_t dns       = (int64_t) (N1 - N0);
         if (delta_ctx < 0 || delta_ctx % dns != 0) {
-            LLAMA_LOG_WARN("%s: unexpected non-affine context size on device %zu (%lld -> %lld), giving up\n",
-                    __func__, id, (long long) (lo.context/1048576), (long long) (hi.context/1048576));
+            fprintf(stderr, "[KV-FIT-DBG] solve: giving up - non-affine context size on device %zu (%lld -> %lld)\n",
+                    id, (long long)lo.context, (long long)hi.context);
             return 0;
         }
         const int64_t rate  = delta_ctx / dns;
         const int64_t fixed = rate > 0 ? (int64_t) lo.context - rate * (int64_t) N0 : (int64_t) lo.context;
 
         if (rate == 0) {
+            fprintf(stderr, "[KV-FIT-DBG] solve: device %zu hosts no KV layers (rate=0), no constraint\n", id);
             continue; // this device hosts no KV layers: no pool constraint
         }
 
         const llama_device_memory_data & dmd = dmds_low[id];
         if (dmd.total <= 0 || dmd.free <= 0 || dmd.free > dmd.total) {
-            LLAMA_LOG_WARN("%s: device %zu does not report valid memory but hosts KV layers, giving up\n", __func__, id);
+            fprintf(stderr, "[KV-FIT-DBG] solve: giving up - device %zu invalid memory but hosts KV layers (total=%lld free=%lld)\n",
+                    id, (long long)dmd.total, (long long)dmd.free);
             return 0;
         }
 
@@ -239,17 +250,18 @@ static uint32_t llama_kv_fit_max_pool_solve(
             n_dev = (uint32_t) (cells / 256u * 256u);
         }
 
-        LLAMA_LOG_INFO("%s:   - device %zu: total %lld MiB, free %lld MiB, non-pool %lld MiB, rate %lld B/cell -> max %9u cells\n",
-                __func__, id,
-                (long long) (dmd.total/1048576), (long long) (dmd.free/1048576),
-                (long long) (non_pool/1048576),  (long long) rate, n_dev);
+        fprintf(stderr, "[KV-FIT-DBG] solve: device %zu: total=%lld free=%lld used=%lld | cap_driver=%lld cap_free=%lld pool_room=%lld non_pool=%lld fixed=%lld rate=%lld B/cell -> max %9u cells\n",
+                id,
+                (long long)dmd.total,  (long long)dmd.free, (long long)used,
+                (long long)cap_driver, (long long)cap_free, (long long)pool_room,
+                (long long)non_pool,   (long long)fixed, (long long)rate, n_dev);
 
         have_constraint = true;
         n_max = std::min(n_max, n_dev);
     }
 
     if (!have_constraint) {
-        LLAMA_LOG_WARN("%s: no device with a VRAM constraint hosts KV layers, pool maximization skipped\n", __func__);
+        fprintf(stderr, "[KV-FIT-DBG] solve: no device with a VRAM constraint hosts KV layers -> 0\n");
         return 0;
     }
     if (n_max < N0) {
