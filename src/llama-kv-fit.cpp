@@ -18,6 +18,53 @@
 #include <string>
 #include <vector>
 
+// Force GPU backends to fully initialize (e.g. hipInit) before we query VRAM.
+// llama_backend_init() only loads backend *registries*; ROCm/HIP does not report real
+// device memory until a buffer is first allocated on that backend. That first allocation
+// normally happens during model load — but the fit probes run BEFORE any load, so their
+// ggml_backend_dev_memory() reads hit an uninitialized backend and come back 0/0. Allocate
+// and free a tiny buffer on every GPU-like device to bring the runtime up; it stays up for
+// the process lifetime, so this is effectively one-shot.
+static void llama_kv_fit_warmup_devices() {
+    static bool done = false;
+    if (done) {
+        return;
+    }
+
+    const size_t ndevs = ggml_backend_dev_count();
+    for (size_t i = 0; i < ndevs; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (dev == nullptr) {
+            continue;
+        }
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue; // only GPU-like backends need warming up for VRAM reporting
+        }
+
+        size_t total_before = 0, free_before = 0;
+        ggml_backend_dev_memory(dev, &free_before, &total_before);
+
+        const char * name  = ggml_backend_dev_name(dev);
+        const size_t warm  = 4096; // small probe allocation to trigger backend runtime init
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+        ggml_backend_buffer_t buf       = (buft != nullptr) ? ggml_backend_buft_alloc_buffer(buft, warm) : nullptr;
+        if (buf != nullptr) {
+            ggml_backend_buffer_free(buf);
+        }
+
+        size_t total_after = 0, free_after = 0;
+        ggml_backend_dev_memory(dev, &free_after, &total_after);
+
+        LLAMA_LOG_INFO("%s: warmed up device %s - VRAM before %lld MiB / after %lld MiB\n",
+                __func__, name,
+                (long long) (total_before/1048576),
+                (long long) (total_after/1048576));
+    }
+
+    done = true;
+}
+
 // Load a model + context with no_alloc and return the per-device memory
 // breakdown plus each device's total/free memory. The last entry is the host.
 static std::vector<llama_device_memory_data> llama_kv_fit_probe(
@@ -224,6 +271,8 @@ LLAMA_API int32_t llama_kv_fit_max_pool(
         return 0; // pool math is only defined for unified mode
     }
 
+    llama_kv_fit_warmup_devices();
+
     // two probes one padding unit apart decompose the per-device context bytes into
     // fixed + rate * n_cells; what they measure is what create_memory() allocates,
     // so SWA/MLA/hybrid quirks are handled by construction
@@ -238,9 +287,14 @@ LLAMA_API int32_t llama_kv_fit_max_pool(
         uint32_t hp_ngl = 0, hp_nct = 0, hp_nex = 0;
 
         std::vector<llama_device_memory_data> dmds;
+        fprintf(stderr, "[KV-FIT-DBG] probe(n_pool=%u): MAIN cparams n_seq_max=%u n_ctx=%llu n_kv_cache=%u kv_unified=%d ctx_type=%d\n",
+                (unsigned)n_pool, (unsigned)cp_copy.n_seq_max,
+                (unsigned long long)cp_copy.n_ctx, (unsigned)cp_copy.n_kv_cache,
+                (int)cp_copy.kv_unified, (int)cp_copy.ctx_type);
         try {
             dmds = llama_kv_fit_probe(path_model, mparams, &cp_copy, devs_main, hp_ngl, hp_nct, hp_nex);
         } catch (const std::runtime_error & e) {
+            fprintf(stderr, "[KV-FIT-DBG] MAIN probe threw: %s\n", e.what());
             LLAMA_LOG_ERROR("%s: probing failed for the main model: %s\n", __func__, e.what());
             return {};
         }
@@ -251,12 +305,17 @@ LLAMA_API int32_t llama_kv_fit_max_pool(
             const uint32_t n_pool_saved = extra->cparams->n_kv_cache;
             extra->cparams->n_kv_cache  = n_pool;
 
+            fprintf(stderr, "[KV-FIT-DBG] probe(n_pool=%u): EXTRA/MTP cparams n_seq_max=%u n_ctx=%llu n_kv_cache=%u kv_unified=%d ctx_type=%d\n",
+                    (unsigned)n_pool, (unsigned)extra->cparams->n_seq_max,
+                    (unsigned long long)extra->cparams->n_ctx, (unsigned)extra->cparams->n_kv_cache,
+                    (int)extra->cparams->kv_unified, (int)extra->cparams->ctx_type);
             std::vector<ggml_backend_dev_t> devs_extra;
             uint32_t ngl_e = 0, nct_e = 0, nex_e = 0;
             std::vector<llama_device_memory_data> measured;
             try {
                 measured = llama_kv_fit_probe(extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_e, nct_e, nex_e);
             } catch (const std::runtime_error & e) {
+                fprintf(stderr, "[KV-FIT-DBG] EXTRA/MTP probe threw: %s\n", e.what());
                 LLAMA_LOG_WARN("%s: probing failed for the extra model, continuing without it: %s\n", __func__, e.what());
             }
             extra->cparams->n_kv_cache = n_pool_saved;
@@ -316,6 +375,8 @@ LLAMA_API bool llama_kv_fit_auto_split(
         llama_model_params * mparams,
         llama_context_params * cparams,
         float * tensor_split) {
+
+    llama_kv_fit_warmup_devices();
 
     // Step 1: Get initial device memory data to find out how many devices we have
     std::vector<ggml_backend_dev_t> devs;
