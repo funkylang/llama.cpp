@@ -202,13 +202,17 @@ static uint32_t llama_kv_fit_max_pool_solve(
         const auto & lo = dmds_low[id].mb;
         const auto & hi = dmds_high[id].mb;
 
-        if (lo.model != hi.model || lo.compute != hi.compute) {
-            fprintf(stderr, "[KV-FIT-DBG] solve: giving up - model/compute bytes differ between probes on device %zu (%lld/%lld vs %lld/%lld)\n",
-                    id,
-                    (long long)lo.model,   (long long)lo.compute,
-                    (long long)hi.model,   (long long)hi.compute);
+        if (lo.model != hi.model) {
+            fprintf(stderr, "[KV-FIT-DBG] solve: giving up - model bytes differ between probes on device %zu (%lld vs %lld)\n",
+                    id, (long long)lo.model, (long long)hi.model);
             return 0;
         }
+
+        // compute (the scheduler's graph-workspace estimate) may legitimately grow with the
+        // pool size: attention workspaces follow KV tensor length. It is a deterministic
+        // function of the graph, never an external-allocation drift, so take the max instead
+        // of demanding equality. Model bytes are a real allocation measurement and MUST match.
+        const uint64_t compute = std::max(lo.compute, hi.compute);
 
         const int64_t delta_ctx = (int64_t) hi.context - (int64_t) lo.context;
         const int64_t dns       = (int64_t) (N1 - N0);
@@ -242,7 +246,7 @@ static uint32_t llama_kv_fit_max_pool_solve(
         const int64_t pool_room  = std::min(cap_driver, cap_free);
 
         // model weights + compute buffers + cell-independent state are consumed before the pool
-        const int64_t non_pool   = (int64_t) lo.model + (int64_t) lo.compute + fixed;
+        const int64_t non_pool   = (int64_t) lo.model + (int64_t) compute + fixed;
 
         uint32_t n_dev = 0;
         if (non_pool < pool_room) {
