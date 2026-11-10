@@ -45,33 +45,6 @@ void common_fit_print(
                  struct llama_model_params * mparams,
                struct llama_context_params * cparams);
 
-// [FORK] maximize the physical unified KV pool size for the given (already fitted) params.
-//   - probes the model with no_alloc at two pool sizes to derive exact per-device KV rates
-//   - the budget covers model weights, compute buffers and the extra (e.g. MTP) model memory
-//   - hard cap: vram_fraction of each device's total memory (headroom for the driver),
-//     further limited by measured free memory minus margins (co-located processes)
-//   - returns the maximum pool size in cells (256-aligned); 0 if no pool fits at all
-uint32_t common_fit_max_kv_cache(
-                         const char * path_model,
-               struct llama_model_params * mparams,
-             struct llama_context_params * cparams,
-                            size_t * margins,         // per-device margins to keep free (bytes)
-      const struct common_fit_extra_model * extra,           // e.g. MTP context sharing the devices
-                             double vram_fraction,    // hard cap as fraction of total memory
-                     enum ggml_log_level   log_level);
-
-// [FORK] compute optimal tensor_split proportional to VRAM and find best n_gpu_layers via binary search
-//   - tensor_split is set proportionally to device VRAM (bigger GPUs get more layers)
-//   - n_gpu_layers is found via 1D monotone search considering KV pool capacity
-//   - returns: true if a valid split was computed, false otherwise
-bool common_fit_auto_split(
-                         const char * path_model,
-               struct llama_model_params * mparams,
-             struct llama_context_params * cparams,
-                             float * tensor_split,   // writable buffer for proportional split
-      const struct common_fit_extra_model * extra,           // e.g. MTP context
-                     enum ggml_log_level   log_level);
-
 #ifdef __cplusplus
 } // extern "C"
 
