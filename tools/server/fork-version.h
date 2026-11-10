@@ -4,4 +4,4 @@
 // updated on every fork commit with the ACTUAL current time at update (strict ordering);
 // printed as the first startup message of llama-server so the running build can be identified
 
-static const char * FORK_VERSION = "2026-11-10 22:37:30 KV-FIT-DBG: warmup free memory before/after";
+static const char * FORK_VERSION = "2026-11-10 22:53:33 KV-FIT-DBG: probe VRAM trace; drop warmup dummy alloc";

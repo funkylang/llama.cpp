@@ -18,13 +18,12 @@
 #include <string>
 #include <vector>
 
-// Force GPU backends to fully initialize (e.g. hipInit) before we query VRAM.
-// llama_backend_init() only loads backend *registries*; ROCm/HIP does not report real
-// device memory until a buffer is first allocated on that backend. That first allocation
-// normally happens during model load — but the fit probes run BEFORE any load, so their
-// ggml_backend_dev_memory() reads hit an uninitialized backend and come back 0/0. Allocate
-// and free a tiny buffer on every GPU-like device to bring the runtime up; it stays up for
-// the process lifetime, so this is effectively one-shot.
+// Query VRAM on every GPU-like device at fit time. Historical note: an earlier
+// rocky2 run suggested ggml_backend_dev_memory() returns 0/0 before any
+// backend allocation ("lazy hipInit"), so this did a dummy 4 KB alloc+free first.
+// On 2026-11-10 the pre-allocation read already returned real values, and
+// Michael's CUDA experience matches (no allocation needed); the dummy alloc is
+// therefore dropped. If a future run shows total=0 again, restore it.
 static void llama_kv_fit_warmup_devices() {
     static bool done = false;
     if (done) {
@@ -40,29 +39,34 @@ static void llama_kv_fit_warmup_devices() {
         }
         const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
         if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
-            continue; // only GPU-like backends need warming up for VRAM reporting
+            continue; // only GPU-like backends report VRAM worth printing
         }
 
-        size_t total_before = 0, free_before = 0;
-        ggml_backend_dev_memory(dev, &free_before, &total_before);
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
 
-        const char * name  = ggml_backend_dev_name(dev);
-        const size_t warm  = 4096; // small probe allocation to trigger backend runtime init
-        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
-        ggml_backend_buffer_t buf       = (buft != nullptr) ? ggml_backend_buft_alloc_buffer(buft, warm) : nullptr;
-        if (buf != nullptr) {
-            ggml_backend_buffer_free(buf);
-        }
-
-        size_t total_after = 0, free_after = 0;
-        ggml_backend_dev_memory(dev, &free_after, &total_after);
-
-        fprintf(stderr, "[KV-FIT-DBG] warmup: dev %s (type=%d) alloc_rc=%d VRAM total %lld / free before %lld / after %lld\n",
-                name, (int)type, buf != nullptr,
-                (long long)total_before, (long long)free_before, (long long)free_after);
+        fprintf(stderr, "[KV-FIT-DBG] warmup: dev %s (type=%d) VRAM total %lld / free %lld\n",
+                ggml_backend_dev_name(dev), (int)type,
+                (long long)total, (long long)free);
     }
 
     done = true;
+}
+
+// [KV-FIT-DBG] instrumentation: dump raw total/free VRAM of every device, as-is.
+static void llama_kv_fit_dbg_vram_all(const char * tag) {
+    fprintf(stderr, "[KV-FIT-DBG] vram@%s:\n", tag);
+    const size_t ndevs = ggml_backend_dev_count();
+    for (size_t i = 0; i < ndevs; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (dev == nullptr) {
+            continue;
+        }
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        fprintf(stderr, "[KV-FIT-DBG]   %s: total=%lld free=%lld\n",
+                ggml_backend_dev_name(dev), (long long)total, (long long)free);
+    }
 }
 
 // Load a model + context with no_alloc and return the per-device memory
@@ -79,16 +83,22 @@ static std::vector<llama_device_memory_data> llama_kv_fit_probe(
     mparams_copy.no_alloc  = true;
     mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
 
+    fprintf(stderr, "[KV-FIT-DBG] probe enter: mparams=%p no_alloc=%d load_mode=%d n_ctx=%llu kv_cache=%u\n",
+            reinterpret_cast<const void*>(mparams), (int)mparams_copy.no_alloc, (int)mparams_copy.load_mode,
+            (unsigned long long)cparams->n_ctx, (unsigned)cparams->n_kv_cache);
+
     llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
     if (model == nullptr) {
         throw std::runtime_error("failed to load model");
     }
+    llama_kv_fit_dbg_vram_all("after model load");
 
     llama_context * ctx = llama_init_from_model(model, *cparams);
     if (ctx == nullptr) {
         llama_model_free(model);
         throw std::runtime_error("failed to create llama_context from model");
     }
+    llama_kv_fit_dbg_vram_all("after ctx init");
 
     const size_t nd = llama_model_n_devices(model);
     std::vector<llama_device_memory_data> ret(nd + 1);
@@ -166,6 +176,7 @@ static std::vector<llama_device_memory_data> llama_kv_fit_probe(
 
     llama_free(ctx);
     llama_model_free(model);
+    llama_kv_fit_dbg_vram_all("after free");
 
     return ret;
 }
