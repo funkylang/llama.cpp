@@ -57,9 +57,9 @@ static void llama_kv_fit_warmup_devices() {
         size_t total_after = 0, free_after = 0;
         ggml_backend_dev_memory(dev, &free_after, &total_after);
 
-        fprintf(stderr, "[KV-FIT-DBG] warmup: dev %s (type=%d) alloc_rc=%d VRAM before %lld / after %lld\n",
+        fprintf(stderr, "[KV-FIT-DBG] warmup: dev %s (type=%d) alloc_rc=%d VRAM total %lld / free before %lld / after %lld\n",
                 name, (int)type, buf != nullptr,
-                (long long)total_before, (long long)total_after);
+                (long long)total_before, (long long)free_before, (long long)free_after);
     }
 
     done = true;
