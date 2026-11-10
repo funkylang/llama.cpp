@@ -228,6 +228,20 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// [KV-FIT-DBG] TEMPORARY instrumentation (probe-VRAM hunt): raw per-device
+// total/free at each ctx-init substep. REMOVE when resolved.
+static void llama_ctx_dbg_vram(const char * tag) {
+    fprintf(stderr, "[KV-FIT-DBG] ctx-init@%s:\n", tag);
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev) continue;
+        size_t free_mem = 0, total_mem = 0;
+        ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+        fprintf(stderr, "[KV-FIT-DBG]   %s: total=%zu free=%zu\n",
+                ggml_backend_dev_name(dev), total_mem, free_mem);
+    }
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -538,6 +552,8 @@ llama_context::llama_context(
         }
     }
 
+    llama_ctx_dbg_vram("after backends+output");
+
     // init the memory module
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
@@ -551,6 +567,8 @@ llama_context::llama_context(
 
         memory.reset(model.create_memory(params_mem, cparams));
     }
+
+    llama_ctx_dbg_vram("after create_memory");
 
     // init backends
     if (!hparams.vocab_only) {
@@ -621,6 +639,8 @@ llama_context::llama_context(
         }
 
         sched_reserve();
+
+        llama_ctx_dbg_vram("after sched_reserve");
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
