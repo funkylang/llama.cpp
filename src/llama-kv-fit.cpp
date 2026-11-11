@@ -204,8 +204,22 @@ static std::vector<uint64_t> llama_kv_fit_runtime_overhead(
         return overhead;
     }
 
+    // Effective worst-case ubatch: what the scheduler reserves/launches at runtime is
+    // min(n_ctx, n_ubatch). Decode exactly that many tokens so batch-dependent lazy
+    // buffers (cuBLAS/HIPBLASLt workspaces) allocate at their real size. Fall back to a
+    // safe default when the caller leaves it unset.
+    uint32_t n_probe_tok = 4096;
+    if (cparams->n_ubatch > 0) {
+        n_probe_tok = cparams->n_ubatch;
+        if (cparams->n_ctx > 0 && cparams->n_ctx < n_probe_tok) {
+            n_probe_tok = cparams->n_ctx;
+        }
+    }
+
     llama_context_params cp = *cparams;
-    cp.n_kv_cache = 256; // OOM-proof: the measurement pool is tiny by design
+    // OOM-proof: the measurement pool only needs to hold one worst-case ubatch. It stays
+    // tiny compared to the real pool (hundreds of thousands of cells) even at large ubatch.
+    cp.n_kv_cache = std::max<uint32_t>(n_probe_tok, 256);
 
     llama_context * ctx = llama_init_from_model(model, cp);
     if (ctx == nullptr) {
@@ -221,11 +235,11 @@ static std::vector<uint64_t> llama_kv_fit_runtime_overhead(
         free_before[g] = f;
     }
 
-    // Tiny decode: content is irrelevant; the point is to make every kernel type run
-    // once so all lazy buffers are allocated before we read the deltas.
+    // One worst-case decode: content is irrelevant; the point is to make every kernel
+    // type run at full ubatch size so all lazy buffers are allocated before the deltas.
     {
-        llama_token tok = 1; // any in-vocab id works
-        llama_batch batch = llama_batch_get_one(&tok, 4);
+        std::vector<llama_token> toks(n_probe_tok, 1); // any in-vocab ids work
+        llama_batch batch = llama_batch_get_one(toks.data(), (int32_t) n_probe_tok);
         llama_decode(ctx, batch);
     }
 
@@ -233,12 +247,12 @@ static std::vector<uint64_t> llama_kv_fit_runtime_overhead(
     // contexts and kernels (nextn layers), so measure those first-use allocations too.
     if (extra != nullptr && extra->shares_model) {
         llama_context_params cpe = *extra->cparams;
-        cpe.n_kv_cache  = 256;
+        cpe.n_kv_cache  = std::max<uint32_t>(n_probe_tok, 256);
         cpe.ctx_other   = ctx;
         llama_context * mctx = llama_init_from_model(model, cpe);
         if (mctx != nullptr) {
-            llama_token tok = 1;
-            llama_batch batch = llama_batch_get_one(&tok, 4);
+            std::vector<llama_token> toks(n_probe_tok, 1);
+            llama_batch batch = llama_batch_get_one(toks.data(), (int32_t) n_probe_tok);
             llama_decode(mctx, batch);
             llama_free(mctx);
         } else {
