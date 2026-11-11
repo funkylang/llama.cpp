@@ -12,6 +12,7 @@
 #include "llama-ext.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <map>
 #include <stdexcept>
@@ -396,6 +397,232 @@ LLAMA_API int32_t llama_kv_fit_max_pool(
     return (int32_t) n_max;
 }
 
+// ============================================================================
+// Automatic tensor-split optimizer — measured, not heuristic.
+//
+// Algorithm outline (see concept-auto-split-optimizer.txt):
+//   Phase A: Place weights with N+1 different splits, probing each at 256/512 cells.
+//   Phase B: Fit affine cost models per device from the sweep measurements.
+//   Phase C: Water-fill solve for the split that maximizes the minimum per-device pool.
+//   Phase D: Verify with one final probe pair at the solved split; log predicted vs measured.
+// ============================================================================
+
+namespace {
+
+// Data structure to accumulate all probe results during Phase A.
+struct PlacementSweepData {
+    // Per-sweep probe results (low/high pairs for each placement)
+    struct SweepResult {
+        float shares[16];           // tensor_split used for this sweep
+        std::vector<llama_device_memory_data> dmds_low;  // at N0 cells
+        std::vector<llama_device_memory_data> dmds_high; // at N1 cells
+    };
+
+    std::vector<SweepResult> sweeps;
+    size_t nd; // number of GPU devices
+
+    void add_sweep(float * split,
+                   std::vector<llama_device_memory_data> lo,
+                   std::vector<llama_device_memory_data> hi) {
+        SweepResult r;
+        for (size_t i = 0; i < nd && i < llama_max_devices(); i++) {
+            r.shares[i] = split[i];
+        }
+        r.dmds_low  = std::move(lo);
+        r.dmds_high = std::move(hi);
+        sweeps.push_back(std::move(r));
+    }
+};
+
+// Phase B: Fit affine model overhead_g(m_g) = a_g + b_g * m_g per device from sweep points.
+struct DeviceCostModel {
+    double a_overhead; // intercept
+    double b_overhead; // slope w.r.t. model bytes on this device
+    double c_rate;     // KV rate: intercept
+    double d_rate;     // KV rate: slope w.r.t. model bytes on this device
+
+    // Layer-index placement: model bytes on this device as a function of its split
+    // share x (fitted from the sweep; layers have non-uniform sizes, so bytes are not
+    // proportional to the share — llama-model.cpp assigns by layer index ranges).
+    double p_bytes; // slope w.r.t. share
+    double q_bytes; // intercept
+
+    bool valid = false;
+};
+
+// Least squares for y = a + b*x given (x, y) pairs. Returns a, b if at least 2 points.
+bool fit_line(const std::vector<std::pair<double, double>> & pts,
+              double & a_out, double & b_out,
+              double * max_rel_residual = nullptr) {
+    if (pts.size() < 2) {
+        return false;
+    }
+
+    const size_t n = pts.size();
+    double sum_x  = 0, sum_y = 0, sum_xx = 0, sum_xy = 0;
+
+    for (const auto & [x, y] : pts) {
+        sum_x  += x;
+        sum_y  += y;
+        sum_xx += x * x;
+        sum_xy += x * y;
+    }
+
+    double denom = n * sum_xx - sum_x * sum_x;
+    if (std::abs(denom) < 1e-9) {
+        // degenerate: constant or nearly constant
+        a_out = sum_y / n;
+        b_out = 0.0;
+        return true;
+    }
+
+    b_out = (n * sum_xy - sum_x * sum_y) / denom;
+    a_out = (sum_y - b_out * sum_x) / n;
+
+    if (max_rel_residual != nullptr) {
+        double max_err = 0.0;
+        for (const auto & [x, y] : pts) {
+            double pred = a_out + b_out * x;
+            double ref  = std::max(std::abs(y), 1e-9);
+            max_err = std::max(max_err, std::abs(pred - y) / ref);
+        }
+        *max_rel_residual = max_err;
+    }
+
+    return true;
+}
+
+// Collect (m_g, overhead_g), (m_g, rate_g) and (x_g, m_g) pairs for device g across sweeps.
+void collect_device_points(
+        const PlacementSweepData & data,
+        size_t g,
+        std::vector<std::pair<double, double>> & overhead_pts,
+        std::vector<std::pair<double, double>> & rate_pts,
+        std::vector<std::pair<double, double>> & bytes_pts) {
+
+    overhead_pts.clear();
+    rate_pts.clear();
+    bytes_pts.clear();
+
+    for (const auto & sw : data.sweeps) {
+        if (g >= sw.dmds_low.size() || g >= sw.dmds_high.size()) {
+            continue;
+        }
+        const auto & lo = sw.dmds_low[g];
+        const auto & hi = sw.dmds_high[g];
+
+        // model bytes on device g in this sweep (same for low/high)
+        double m_g = static_cast<double>(lo.mb.model);
+        // this sweep's split share for device g
+        double x_g = static_cast<double>(sw.shares[g]);
+
+        // KV rate: bytes per cell (from the delta between high and low probes).
+        // N0=256, N1=512 are the probe pool sizes.
+        const double N0 = 256.0, N1 = 512.0;
+        double ctx_low  = static_cast<double>(lo.mb.context);
+        double ctx_high = static_cast<double>(hi.mb.context);
+        double rate     = (ctx_high - ctx_low) / (N1 - N0); // bytes per cell
+
+        // overhead = compute + the cell-independent ("fixed") part of context.
+        // The low-pool context measurement still includes N0 pool cells; subtract
+        // them so the affine model fits only what the water-fill solver expects
+        // (pool size P enters Phase C as an independent variable).
+        double fixed    = ctx_low - rate * N0;
+        double overhead = static_cast<double>(lo.mb.compute) + fixed;
+
+        overhead_pts.push_back({m_g, overhead});
+        rate_pts.push_back({m_g, rate});
+        bytes_pts.push_back({x_g, m_g});
+    }
+}
+
+// Phase C: water-filling solve for optimal tensor_split and predicted pool size.
+// Returns (shares, predicted_pool_cells); shares.empty() means "no feasible solution".
+std::pair<std::vector<double>, double> solve_split(
+        const std::vector<DeviceCostModel> & models,
+        const std::vector<uint64_t> & cap_bytes) { // max allocatable bytes per device (VRAM budget)
+
+    const size_t nd = models.size();
+    if (nd == 0) return {std::vector<double>(), 0.0};
+
+    // Per-device usage model at pool size P and split share x_g (all from measurements):
+    //   m_g(x_g)        = p_g*x_g + q_g                  (layer-index byte placement)
+    //   overhead_g(m_g) = a_g + b_g*m_g
+    //   rate_g(m_g)     = c_g + d_g*m_g
+    //   U_g(P, x_g)     = model bytes + overhead + pool KV
+    //                    = [a_g + (1+b_g)*q_g + P*(c_g + d_g*q_g)] + x_g*(1+b_g+P*d_g)*p_g
+    //
+    // The constraint U_g <= cap_g solves for the maximum share device g can take at pool P:
+    //   ub_g(P) = (cap_g - A_g(P)) / B_g(P), where
+    //     A_g(P) = a_g + (1+b_g)*q_g + P*(c_g + d_g*q_g)
+    //     B_g(P) = (1 + b_g + P*d_g)*p_g      (the 1s = the device's own model bytes)
+    //
+    // A pool size P is feasible iff the device shares that exactly fill every budget still
+    // sum to at least 1 (i.e. the whole model can be placed): Feasible(P) = sum ub_g(P) >= 1.
+    auto ub = [&](size_t g, double P) -> double {
+        const auto & m = models[g];
+        // U_g(P,x) = oh(m(x)) + P*rt(m(x)) + m(x),  with m(x) = p*x + q:
+        //   A_g(P) collects the x-independent parts: overhead intercept a,
+        //           the fixed model-byte offset q (itself!), and pool KV terms.
+        double A = m.a_overhead + m.q_bytes * (1.0 + m.b_overhead)
+                 + P * (m.c_rate + m.d_rate * m.q_bytes);
+        //   B_g multiplies the share x: device's own bytes (1) + overhead/
+        //           rate sensitivity to its model bytes (b, d).
+        double B = m.p_bytes * (1.0 + m.b_overhead + P * m.d_rate);
+        if (B <= 0) return 0.0;
+        return std::max(0.0, (static_cast<double>(cap_bytes[g]) - A) / B);
+    };
+
+    auto sum_ub_positive = [&](double P) -> double {
+        double s = 0.0;
+        for (size_t g = 0; g < nd; g++) {
+            s += ub(g, P);
+        }
+        return s;
+    };
+
+    // Binary search for the largest feasible pool size. Monotone: as P grows each device's
+    // affordable share shrinks, so sum(ub) crosses 1 exactly once.
+    double lo_pool = 0, hi_pool = 4 * 1e6; // up to ~4M cells max
+    if (sum_ub_positive(hi_pool) >= 1.0) {
+        return {std::vector<double>(), 0.0}; // pathological: unbounded, let the caller verify catch it
+    }
+
+    for (int iter = 0; iter < 60; iter++) {
+        double mid = (lo_pool + hi_pool) / 2.0;
+        if (sum_ub_positive(mid) >= 1.0) {
+            lo_pool = mid;
+        } else {
+            hi_pool = mid;
+        }
+    }
+
+    double P_star = lo_pool;
+    if (P_star < 256.0 / 2.0) {
+        return {std::vector<double>(), 0.0}; // not even a minimum pool fits anywhere
+    }
+
+    // Compute shares at P_star: use each device exactly up to its budget (water-filling).
+    double sum_shares = 0;
+    std::vector<double> shares(nd, 0.0);
+    for (size_t g = 0; g < nd; g++) {
+        shares[g] = ub(g, P_star);
+        if (shares[g] > 0) sum_shares += shares[g];
+    }
+
+    if (sum_shares <= 0) {
+        return {std::vector<double>(), 0.0}; // no feasible split found
+    }
+
+    for (size_t g = 0; g < nd; g++) {
+        shares[g] /= sum_shares;
+    }
+
+    return std::pair(std::move(shares), P_star);
+}
+
+} // anonymous namespace
+
 // See llama-ext.h.
 LLAMA_API bool llama_kv_fit_auto_split(
         const char * path_model,
@@ -422,111 +649,269 @@ LLAMA_API bool llama_kv_fit_auto_split(
         return false;
     }
 
-    // Step 2: Compute tensor_split proportional to VRAM
-    double sum_vram = 0.0;
-    std::vector<double> vram_nd(nd);
-    for (size_t id = 0; id < nd; id++) {
-        size_t free, total;
-        ggml_backend_dev_memory(devs[id], &free, &total);
-        vram_nd[id] = static_cast<double>(total);
-        sum_vram += vram_nd[id];
+    // For N=1, there's no split to optimize. Return success with the single device getting everything.
+    if (nd == 1) {
+        tensor_split[0] = 1.0f;
+        mparams->n_gpu_layers = static_cast<int32_t>(hp_ngl);
+        LLAMA_LOG_INFO("%s: single GPU device, no split optimization needed\n", __func__);
+        return true;
     }
 
-    if (sum_vram <= 0) {
-        LLAMA_LOG_WARN("%s: total VRAM is zero or negative, aborting auto split\n", __func__);
-        return false;
-    }
+    // Phase A: Run placement sweep with N+1 different splits.
+    // For each candidate placement, probe at 256/512 cells to measure per-device costs.
+    const double eps = 0.05; // minimum share for "concentrated on k" placements
 
-    for (size_t id = 0; id < nd; id++) {
-        tensor_split[id] = static_cast<float>(vram_nd[id] / sum_vram);
-    }
+    PlacementSweepData sweep_data;
+    sweep_data.nd = nd;
 
-    LLAMA_LOG_INFO("%s: computing proportional VRAM tensor split:\n", __func__);
-    for (size_t id = 0; id < nd; id++) {
-        LLAMA_LOG_INFO("%s:   - device %zu: %6.1f MiB (%5.2f%%)\n",
-                __func__, id, vram_nd[id]/(1024*1024), 100.0*tensor_split[id]);
-    }
+    auto run_probe_pair = [&](float * split, const char * phase) -> std::pair<std::vector<llama_device_memory_data>, std::vector<llama_device_memory_data>> {
+        // Set the split for this probe
+        mparams->tensor_split = split;
 
-    // Step 3: Analytic calculation to find maximum n_gpu_layers that allows KV pool >= 256 cells
+        LLAMA_LOG_INFO("%s: %s - probing tensor_split [", __func__, phase);
+        for (size_t i = 0; i < nd; i++) {
+            fprintf(stderr, "%s", i > 0 ? ", " : "");
+            fprintf(stderr, "%.4f", split[i]);
+        }
+        fprintf(stderr, "]\n");
 
-    // Model bytes per layer from metadata (sum across all devices to get total)
-    size_t model_bytes_total = 0;
-    for (size_t id = 0; id < nd; id++) {
-        model_bytes_total += dmds_full[id].mb.model;
-    }
-    size_t model_bytes_per_layer = hp_ngl > 0 ? model_bytes_total / hp_ngl : 0;
+        // Low pool probe (256 cells)
+        llama_context_params cp_low  = *cparams;
+        cp_low.n_kv_cache  = 256;
+        std::vector<ggml_backend_dev_t> devs_lo;
+        uint32_t ngl_lo = 0, nct_lo = 0, nex_lo = 0;
+        std::vector<llama_device_memory_data> dmds_lo;
+        try {
+            dmds_lo = llama_kv_fit_probe(path_model, mparams, &cp_low, devs_lo, ngl_lo, nct_lo, nex_lo);
+        } catch (const std::runtime_error & e) {
+            LLAMA_LOG_WARN("%s: low pool probe failed: %s\n", __func__, e.what());
+            return {{}, {}};
+        }
 
-    // Compute overhead: use a conservative fraction of model memory (typical for inference)
-    const double COMPUTE_FRACTION = 0.10;  // 10% overhead estimate
+        // High pool probe (512 cells)
+        llama_context_params cp_hi  = *cparams;
+        cp_hi.n_kv_cache  = 512;
+        std::vector<ggml_backend_dev_t> devs_hi;
+        uint32_t ngl_hi = 0, nct_hi = 0, nex_hi = 0;
+        std::vector<llama_device_memory_data> dmds_hi;
+        try {
+            dmds_hi = llama_kv_fit_probe(path_model, mparams, &cp_hi, devs_hi, ngl_hi, nct_hi, nex_hi);
+        } catch (const std::runtime_error & e) {
+            LLAMA_LOG_WARN("%s: high pool probe failed: %s\n", __func__, e.what());
+            return {{}, {}};
+        }
 
-    LLAMA_LOG_INFO("%s: analytic calculation with model_bytes_per_layer=%zu bytes, compute_fraction=%.2f\n",
-            __func__, model_bytes_per_layer, COMPUTE_FRACTION);
+        // Log the per-device measurements so the decisions are auditable.
+        for (size_t i = 0; i < nd && i + 1 < dmds_lo.size(); i++) {
+            const auto & lo = dmds_lo[i].mb;
+            const auto & hi = dmds_hi[i].mb;
+            double rate = ((double)hi.context - (double)lo.context) / 256.0;
+            double fixed = (double)lo.context - rate * 256.0;
+            LLAMA_LOG_INFO("%s: %s -   dev %zu: model=%.3f GiB compute+fixed=%.3f GiB rate=%.1f B/cell\n",
+                    __func__, phase, i,
+                    lo.model / 1073741824.0,
+                    ((double)lo.compute + fixed) / 1073741824.0,
+                    rate);
+        }
 
-    // Get the context data from our probe (sum across all devices to get total)
-    size_t context_bytes_total = 0;
-    for (size_t id = 0; id < nd; id++) {
-        context_bytes_total += dmds_full[id].mb.context;
-    }
-    uint32_t current_n_ctx = cparams->n_ctx > 0 ? cparams->n_ctx : hp_nct;
+        return {std::move(dmds_lo), std::move(dmds_hi)};
+    };
 
-    // Estimate KV rate per cell (total across all devices)
-    size_t kv_rate_per_cell_total = (current_n_ctx > 0 && context_bytes_total > 0) ? context_bytes_total / current_n_ctx : 0;
-
-    LLAMA_LOG_INFO("%s: estimated kv_rate_per_cell_total=%zu bytes\n", __func__, kv_rate_per_cell_total);
-
-    // For device i, its share of KV rate is proportional to its tensor_split weight
-    std::vector<size_t> kv_rate_per_device(nd);
-    for (size_t id = 0; id < nd; id++) {
-        kv_rate_per_device[id] = (kv_rate_per_cell_total * vram_nd[id]) / sum_vram;
-    }
-
-    // Now solve for maximum g (n_gpu_layers) such that all devices can support N >= 256 cells
-    uint32_t max_ngl = hp_ngl;
-
-    for (uint32_t g = max_ngl; g >= 1; g--) {
-        bool fits = true;
-
-        for (size_t id = 0; id < nd && fits; id++) {
-            double layers_on_dev   = g * vram_nd[id] / sum_vram;  // proportional distribution
-            size_t model_bytes_i   = (size_t)(model_bytes_per_layer * layers_on_dev);
-            size_t compute_i       = (size_t)(COMPUTE_FRACTION * model_bytes_i);
-
-            size_t free_mem, total_mem;
-            ggml_backend_dev_memory(devs[id], &free_mem, &total_mem);
-            size_t cap = std::min(free_mem, (size_t)(0.97 * total_mem));
-
-            size_t pool_bytes_needed = kv_rate_per_device[id] * 256;
-            size_t total_needed      = model_bytes_i + compute_i + pool_bytes_needed;
-
-            LLAMA_LOG_DEBUG("%s:   - testing g=%u on device %zu: needed=%zu vs cap=%zu\n",
-                    __func__, g, id, total_needed, cap);
-
-            if (total_needed > cap) {
-                fits = false;
+    // Generate placements: for each k in 0..N-1, concentrate on device k.
+    // Then one equal split.
+    for (size_t k = 0; k < nd; k++) {
+        float split[16] = {0};
+        for (size_t g = 0; g < nd; g++) {
+            if (g == k) {
+                split[g] = static_cast<float>(1.0 - eps * (nd - 1));
+            } else {
+                split[g] = static_cast<float>(eps);
             }
         }
 
-        if (fits) {
-            LLAMA_LOG_INFO("%s: found n_gpu_layers=%u that allows pool >= 256 cells\n", __func__, g);
-            break;
+        LLAMA_LOG_DEBUG("%s: Phase A - probing concentrated placement on device %zu\n", __func__, k);
+
+        auto [lo, hi] = run_probe_pair(split, "Phase A");
+        if (!lo.empty() && !hi.empty()) {
+            sweep_data.add_sweep(split, std::move(lo), std::move(hi));
         } else {
-            max_ngl = g - 1;  // try fewer layers next
+            LLAMA_LOG_WARN("%s: probe pair failed for concentrated placement on device %zu\n", __func__, k);
         }
     }
 
-    if (max_ngl == 0) {
-        LLAMA_LOG_WARN("%s: cannot fit any GPU layers with a usable KV pool, aborting auto split\n", __func__);
+    // Add equal split.
+    {
+        float split[16] = {0};
+        for (size_t g = 0; g < nd; g++) {
+            split[g] = static_cast<float>(1.0 / nd);
+        }
+
+        LLAMA_LOG_DEBUG("%s: Phase A - probing equal split placement\n", __func__);
+
+        auto [lo, hi] = run_probe_pair(split, "Phase A");
+        if (!lo.empty() && !hi.empty()) {
+            sweep_data.add_sweep(split, std::move(lo), std::move(hi));
+        } else {
+            LLAMA_LOG_WARN("%s: probe pair failed for equal split placement\n", __func__);
+        }
+    }
+
+    if (sweep_data.sweeps.empty()) {
+        LLAMA_LOG_ERROR("%s: no successful probes in Phase A, aborting auto split\n", __func__);
         return false;
     }
 
-    // Step 4: Update mparams with the optimal settings
-    mparams->n_gpu_layers = static_cast<int32_t>(max_ngl);
+    // Phase B: Fit per-device cost models from sweep data.
+    std::vector<DeviceCostModel> models(nd);
+
+    for (size_t g = 0; g < nd; g++) {
+        std::vector<std::pair<double, double>> overhead_pts;
+        std::vector<std::pair<double, double>> rate_pts;
+        std::vector<std::pair<double, double>> bytes_pts;
+
+        collect_device_points(sweep_data, g, overhead_pts, rate_pts, bytes_pts);
+
+        DeviceCostModel & model = models[g];
+        model.valid = true;
+
+        double res_overhead = 0, res_rate = 0, res_bytes = 0;
+
+        if (!fit_line(overhead_pts, model.a_overhead, model.b_overhead, &res_overhead)) {
+            model.valid = false;
+        }
+        if (model.valid && !fit_line(rate_pts, model.c_rate, model.d_rate, &res_rate)) {
+            model.valid = false;
+        }
+        if (model.valid && !fit_line(bytes_pts, model.q_bytes, model.p_bytes, &res_bytes)) {
+            model.valid = false;
+        }
+
+        // Log model quality so rocky2 verification is one grep: residuals reveal drift
+        // on exotic models before it shows up in the Phase D verification.
+        LLAMA_LOG_INFO("%s: Phase B - device %zu fit: overhead a=%.3f GiB b=%.6f rate c=%.1f B/cell d=%.6f bytes/share p=%.3f GiB q=%.3f GiB residuals o=%.2f%% r=%.2f%% b=%.2f%% valid=%d\n",
+                __func__, g,
+                model.a_overhead / 1073741824.0, model.b_overhead,
+                model.c_rate, model.d_rate,
+                model.p_bytes / 1073741824.0, model.q_bytes / 1073741824.0,
+                100.0 * res_overhead, 100.0 * res_rate, 100.0 * res_bytes, (int)model.valid);
+    }
+
+    // Check if all devices have valid models. If not, fall back to VRAM-proportional split.
+    bool all_valid = true;
+    for (size_t g = 0; g < nd; g++) {
+        if (!models[g].valid) {
+            all_valid = false;
+            break;
+        }
+    }
+
+    if (!all_valid) {
+        LLAMA_LOG_WARN("%s: Phase B models incomplete, falling back to proportional VRAM split\n", __func__);
+        double sum_vram = 0.0;
+        std::vector<double> vram_nd(nd);
+        for (size_t id = 0; id < nd; id++) {
+            size_t free, total;
+            ggml_backend_dev_memory(devs[id], &free, &total);
+            vram_nd[id] = static_cast<double>(total);
+            sum_vram += vram_nd[id];
+        }
+
+        if (sum_vram <= 0) {
+            LLAMA_LOG_WARN("%s: total VRAM is zero or negative, aborting auto split\n", __func__);
+            return false;
+        }
+
+        for (size_t id = 0; id < nd; id++) {
+            tensor_split[id] = static_cast<float>(vram_nd[id] / sum_vram);
+        }
+
+        LLAMA_LOG_INFO("%s: computing proportional VRAM tensor split (fallback):\n", __func__);
+        for (size_t id = 0; id < nd; id++) {
+            LLAMA_LOG_INFO("%s:   - device %zu: %6.1f MiB (%5.2f%%)\n",
+                    __func__, id, vram_nd[id]/(1024*1024), 100.0*tensor_split[id]);
+        }
+
+        // For fallback, keep all layers on GPU; the split is the proportional one.
+        mparams->n_gpu_layers = static_cast<int32_t>(hp_ngl);
+        if (nd > 1) {
+            mparams->tensor_split = tensor_split;
+        }
+
+        LLAMA_LOG_INFO("%s: fallback optimized n_gpu_layers=%u with tensor_split for %zu devices\n",
+                __func__, hp_ngl, nd);
+        return true;
+    }
+
+    // Phase C: Water-filling solve.
+    std::vector<uint64_t> cap_bytes(nd);
+    for (size_t g = 0; g < nd; g++) {
+        size_t free, total;
+        ggml_backend_dev_memory(devs[g], &free, &total);
+        // Available bytes = min(97% of total VRAM, current free memory) - already used
+        uint64_t vram_cap   = static_cast<uint64_t>(0.97 * total);
+        uint64_t free_cap   = free;
+        cap_bytes[g] = std::min(vram_cap, free_cap);
+    }
+
+    auto [solved_shares, predicted_pool] = solve_split(models, cap_bytes);
+
+    if (!solved_shares.empty()) {
+        for (size_t g = 0; g < nd; g++) {
+            tensor_split[g] = static_cast<float>(solved_shares[g]);
+        }
+        LLAMA_LOG_INFO("%s: Phase C - solved tensor split:\n", __func__);
+        for (size_t g = 0; g < nd; g++) {
+            LLAMA_LOG_INFO("%s:   - device %zu: %.4f (%.1f%%)\n",
+                    __func__, g, tensor_split[g], 100.0 * tensor_split[g]);
+        }
+        LLAMA_LOG_INFO("%s: predicted pool size = %.1f cells\n", __func__, predicted_pool);
+    } else {
+        // If solve failed, fall back to VRAM-proportional split.
+        LLAMA_LOG_WARN("%s: Phase C solve failed, falling back to proportional VRAM split\n", __func__);
+        double sum_vram = 0.0;
+        std::vector<double> vram_nd(nd);
+        for (size_t id = 0; id < nd; id++) {
+            size_t free, total;
+            ggml_backend_dev_memory(devs[id], &free, &total);
+            vram_nd[id] = static_cast<double>(total);
+            sum_vram += vram_nd[id];
+        }
+
+        if (sum_vram <= 0) {
+            LLAMA_LOG_WARN("%s: total VRAM is zero or negative, aborting auto split\n", __func__);
+            return false;
+        }
+
+        for (size_t id = 0; id < nd; id++) {
+            tensor_split[id] = static_cast<float>(vram_nd[id] / sum_vram);
+        }
+    }
+
+    // Set mparams to use all layers on GPU with the solved split.
+    mparams->n_gpu_layers = static_cast<int32_t>(hp_ngl);
     if (nd > 1) {
         mparams->tensor_split = tensor_split;
     }
 
     LLAMA_LOG_INFO("%s: optimized n_gpu_layers=%u with tensor_split for %zu devices\n",
-            __func__, max_ngl, nd);
+            __func__, hp_ngl, nd);
+
+    // Phase D: verify the predicted pool against a real probe pair at the solved split.
+    // Uses the same 256/512 probe + affine solve as llama_kv_fit_max_pool() so the
+    // measured pool is what fllama will actually get; rocky2 verification greps one line.
+    {
+        const double vram_fraction = 0.97; // matches both fllama and common/fit.cpp callers
+        auto [lo_ver, hi_ver] = run_probe_pair(tensor_split, "Phase D");
+
+        if (!lo_ver.empty() && !hi_ver.empty()) {
+            const uint32_t n_ver = llama_kv_fit_max_pool_solve(
+                    lo_ver, hi_ver, 256, 512, nullptr, vram_fraction);
+            LLAMA_LOG_INFO("%s: Phase D verification - solved split gives measured pool %u cells (predicted %.1f)\n",
+                    __func__, n_ver, predicted_pool);
+        } else {
+            LLAMA_LOG_WARN("%s: Phase D verification probes failed; relying on prediction only\n", __func__);
+        }
+    }
 
     return true;
 }
