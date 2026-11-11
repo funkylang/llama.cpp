@@ -220,6 +220,9 @@ static std::vector<uint64_t> llama_kv_fit_runtime_overhead(
     // OOM-proof: the measurement pool only needs to hold one worst-case ubatch. It stays
     // tiny compared to the real pool (hundreds of thousands of cells) even at large ubatch.
     cp.n_kv_cache = std::max<uint32_t>(n_probe_tok, 256);
+    if (cp.n_batch < n_probe_tok) { // the probe decode below wants all tokens in one batch
+        cp.n_batch = n_probe_tok;
+    }
 
     llama_context * ctx = llama_init_from_model(model, cp);
     if (ctx == nullptr) {
@@ -249,11 +252,40 @@ static std::vector<uint64_t> llama_kv_fit_runtime_overhead(
         llama_context_params cpe = *extra->cparams;
         cpe.n_kv_cache  = std::max<uint32_t>(n_probe_tok, 256);
         cpe.ctx_other   = ctx;
+        if (cpe.n_batch < n_probe_tok) { // keep the probe decode in one batch
+            cpe.n_batch = n_probe_tok;
+        }
         llama_context * mctx = llama_init_from_model(model, cpe);
         if (mctx != nullptr) {
+            // The MTP graph takes a hidden-state input per token (llama-graph.cpp:
+            // llm_graph_input_embd_h::set_input asserts ubatch->embd_state), so this
+            // decode must use the batch_ext API with embd_state set, like fllama does.
+            // Content is irrelevant for the overhead measurement; only the layout matters
+            // (contiguous n_embd_out floats per token).
+            const int32_t n_state = llama_model_n_embd_out(model);
+
             std::vector<llama_token> toks(n_probe_tok, 1);
-            llama_batch batch = llama_batch_get_one(toks.data(), (int32_t) n_probe_tok);
-            llama_decode(mctx, batch);
+            std::vector<float> state((size_t) n_probe_tok * (size_t) n_state, 0.0f);
+
+            llama_batch_ext * bext = llama_batch_ext_init(mctx);
+            for (uint32_t t = 0; t < n_probe_tok; ++t) {
+                const int32_t idx = llama_batch_ext_add_token(bext, 0, toks[t]);
+                if (idx < 0) {
+                    break; // n_tokens_max reached: still a valid (shorter) worst-case probe
+                }
+                const llama_pos pos = (llama_pos) t;
+                llama_batch_ext_set_pos(bext, idx, &pos);
+
+                struct llama_embd embd;
+                embd.data   = state.data() + (size_t) t * n_state;
+                embd.n_rows = 1;
+                embd.n_embd = (size_t) n_state;
+                llama_batch_ext_set_embd_state(bext, idx, embd);
+
+                llama_batch_ext_set_output_logits(bext, idx, true);
+            }
+            llama_process(mctx, LLAMA_PROCESS_TYPE_DECODE, bext);
+            llama_batch_ext_free(bext);
             llama_free(mctx);
         } else {
             LLAMA_LOG_WARN("%s: runtime overhead probe could not init the extra context\n", __func__);
