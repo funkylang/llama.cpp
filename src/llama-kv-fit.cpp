@@ -842,13 +842,13 @@ LLAMA_API bool llama_kv_fit_auto_split(
         return true;
     }
 
-    // Phase C: Water-filling solve.
+    // Phase C: Water-filling solve. Use a slightly more conservative VRAM fraction
+    // (0.95 vs the standard 0.97) for extra safety margin while validating on rocky2.
     std::vector<uint64_t> cap_bytes(nd);
     for (size_t g = 0; g < nd; g++) {
         size_t free, total;
         ggml_backend_dev_memory(devs[g], &free, &total);
-        // Available bytes = min(97% of total VRAM, current free memory) - already used
-        uint64_t vram_cap   = static_cast<uint64_t>(0.97 * total);
+        uint64_t vram_cap   = static_cast<uint64_t>(0.95 * total);
         uint64_t free_cap   = free;
         cap_bytes[g] = std::min(vram_cap, free_cap);
     }
@@ -900,7 +900,7 @@ LLAMA_API bool llama_kv_fit_auto_split(
     // Uses the same 256/512 probe + affine solve as llama_kv_fit_max_pool() so the
     // measured pool is what fllama will actually get; rocky2 verification greps one line.
     {
-        const double vram_fraction = 0.97; // matches both fllama and common/fit.cpp callers
+        const double vram_fraction = 0.95; // conservative margin (see Phase C)
         auto [lo_ver, hi_ver] = run_probe_pair(tensor_split, "Phase D");
 
         if (!lo_ver.empty() && !hi_ver.empty()) {

@@ -4,4 +4,4 @@
 // updated on every fork commit with the ACTUAL current time at update (strict ordering);
 // printed as the first startup message of llama-server so the running build can be identified
 
-static const char * FORK_VERSION = "2026-11-11 10:22:30 Automatic tensor-split optimizer from measured sweep replaces heuristic";
+static const char * FORK_VERSION = "2026-11-11 10:55:25 Conservative VRAM fraction for auto-split (0.95)";
