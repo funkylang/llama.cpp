@@ -4,4 +4,4 @@
 // updated on every fork commit with the ACTUAL current time at update (strict ordering);
 // printed as the first startup message of llama-server so the running build can be identified
 
-static const char * FORK_VERSION = "2026-11-11 20:03:12 KV-fit auto-split: free-VRAM split replaces water-fill optimizer";
+static const char * FORK_VERSION = "2026-11-11 20:41:40 KV-fit: step-by-step measured/derived logging (fprintf, no INFO noise)";

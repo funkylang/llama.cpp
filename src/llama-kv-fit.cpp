@@ -351,14 +351,9 @@ static uint32_t llama_kv_fit_max_pool_solve(
                                 const uint64_t * runtime_overhead, // raw measured ctx-init+decode bytes per device
                                 uint32_t n_probe_cells,        // pool size of the measurement contexts
                                 double vram_fraction) {      // hard cap: max usage of each device's total memory
-    fprintf(stderr, "[KV-FIT-DBG] solve: %zu device entries (last = host)\n", dmds_low.size());
-    for (size_t id = 0; id < dmds_low.size(); id++) {
-        fprintf(stderr, "[KV-FIT-DBG] solve entry %zu: model=%lld compute=%lld context(lo/hi)=%lld/%lld total=%lld free=%lld\n",
-                id,
-                (long long)dmds_low[id].mb.model,   (long long)dmds_low[id].mb.compute,
-                (long long)dmds_low[id].mb.context, (long long)dmds_high[id].mb.context,
-                (long long)dmds_low[id].total,      (long long)dmds_low[id].free);
-    }
+    fprintf(stderr, "[KV-FIT-DBG] solve: %zu entries (last = host), N0=%u N1=%u vram_fraction=%.2f rt_overhead=%s\n",
+            dmds_low.size(), N0, N1, vram_fraction,
+            runtime_overhead != nullptr ? "measured" : "none");
     if (dmds_low.empty() || dmds_low.size() != dmds_high.size()) {
         fprintf(stderr, "[KV-FIT-DBG] solve: giving up - probe vectors empty or size mismatch (%zu vs %zu)\n",
                 dmds_low.size(), dmds_high.size());
@@ -367,6 +362,21 @@ static uint32_t llama_kv_fit_max_pool_solve(
 
     const size_t nd = dmds_low.size() - 1; // devices only; the host entry (last) is excluded on purpose:
                                            // auto-maximizing into system RAM stays an explicit option
+    for (size_t id = 0; id < nd; id++) { // GPU devices only (host excluded)
+        const auto & lmb = dmds_low[id].mb;
+        const auto & hmb = dmds_high[id].mb;
+        fprintf(stderr, "[KV-FIT-DBG] dev%zu -- measured:\n", id);
+        fprintf(stderr, "[KV-FIT-DBG]   model    = %lld B\n", (long long)lmb.model);
+        fprintf(stderr, "[KV-FIT-DBG]   compute  = %lld B\n", (long long)lmb.compute);
+        fprintf(stderr, "[KV-FIT-DBG]   ctx@%u   = %lld B\n", N0, (long long)lmb.context);
+        fprintf(stderr, "[KV-FIT-DBG]   ctx@%u   = %lld B\n", N1, (long long)hmb.context);
+        fprintf(stderr, "[KV-FIT-DBG]   total    = %lld B\n", (long long)dmds_low[id].total);
+        fprintf(stderr, "[KV-FIT-DBG]   free     = %lld B\n", (long long)dmds_low[id].free);
+        if (runtime_overhead != nullptr) {
+            fprintf(stderr, "[KV-FIT-DBG]   rt_raw   = %lld B (ctx-init+decode window)\n",
+                    (long long)runtime_overhead[id]);
+        }
+    }
     uint32_t n_max = UINT32_MAX;
     bool have_constraint = false;
 
@@ -441,13 +451,23 @@ static uint32_t llama_kv_fit_max_pool_solve(
             n_dev = (uint32_t) (cells / 256u * 256u);
         }
 
-        fprintf(stderr, "[KV-FIT-DBG] solve: device %zu: total=%lld free=%lld used=%lld | cap_driver=%lld cap_free=%lld pool_room=%lld non_pool=%lld fixed=%lld rt_raw=%lld rt_used=%lld rate=%lld B/cell -> max %9u cells\n",
-                id,
-                (long long)dmd.total,  (long long)dmd.free, (long long)used,
-                (long long)cap_driver, (long long)cap_free, (long long)pool_room,
-                (long long)non_pool,   (long long)fixed,
-                (long long)(runtime_overhead != nullptr ? runtime_overhead[id] : 0),
-                (long long)rt_oh_used, (long long)rate, n_dev);
+        fprintf(stderr, "[KV-FIT-DBG] dev%zu -- derived:\n", id);
+        fprintf(stderr, "[KV-FIT-DBG]   rate       = (ctx@%u - ctx@%u) / (%u-%u) = (%lld-%lld)/%lld = %lld B/cell\n",
+                N1, N0, N1, N0, (long long)hi.context, (long long)lo.context, (long long)dns, (long long)rate);
+        fprintf(stderr, "[KV-FIT-DBG]   fixed      = ctx@%u - rate*%u = %lld B\n", N0, N0, (long long)fixed);
+        fprintf(stderr, "[KV-FIT-DBG]   used       = total - free = %lld B\n", (long long)used);
+        fprintf(stderr, "[KV-FIT-DBG]   cap_driver = total*%.*f - used = %lld B\n", 2, vram_fraction, (long long)cap_driver);
+        fprintf(stderr, "[KV-FIT-DBG]   cap_free   = free - margin = %lld B\n", (long long)cap_free);
+        fprintf(stderr, "[KV-FIT-DBG]   pool_room  = min(cap_driver, cap_free) = %lld B\n", (long long)pool_room);
+        if (runtime_overhead != nullptr) {
+            fprintf(stderr, "[KV-FIT-DBG]   rt_used    = rt_raw - rate*n_probe(%u) = %lld B\n",
+                    n_probe_cells, (long long)rt_oh_used);
+            fprintf(stderr, "[KV-FIT-DBG]   non_pool   = model + rt_used = %lld B\n", (long long)non_pool);
+        } else {
+            fprintf(stderr, "[KV-FIT-DBG]   non_pool   = model + compute + fixed = %lld B\n", (long long)non_pool);
+        }
+        fprintf(stderr, "[KV-FIT-DBG]   max cells  = (pool_room - non_pool) / rate = (%lld-%lld)/%lld -> %u cells\n",
+                (long long)pool_room, (long long)non_pool, (long long)rate, n_dev);
 
         have_constraint = true;
         n_max = std::min(n_max, n_dev);
@@ -559,7 +579,7 @@ LLAMA_API int32_t llama_kv_fit_max_pool(
         return dmds;
     };
 
-    LLAMA_LOG_DEBUG("%s: probing for the maximum KV pool size (n_kv_cache = %u / %u)\n", __func__, N0, N1);
+    fprintf(stderr, "[KV-FIT-DBG] probing max KV pool at n_kv_cache = %u / %u\n", N0, N1);
     const std::vector<llama_device_memory_data> dmds_low  = probe(N0);
     if (dmds_low.empty()) {
         return 0;
@@ -593,7 +613,7 @@ LLAMA_API int32_t llama_kv_fit_max_pool(
     const uint32_t n_max = llama_kv_fit_max_pool_solve(
             dmds_low, dmds_high, N0, N1, margins, rt.overhead.data(), rt.probe_cells, vram_fraction);
     if (n_max > 0) {
-        LLAMA_LOG_INFO("%s: maximum unified KV pool size is %u cells\n", __func__, n_max);
+        fprintf(stderr, "[KV-FIT-DBG] ==> conclusion: max unified KV pool = %u cells\n", n_max);
     }
     return (int32_t) n_max;
 }
@@ -644,7 +664,7 @@ LLAMA_API bool llama_kv_fit_auto_split(
     if (nd == 1) {
         tensor_split[0] = 1.0f;
         mparams->n_gpu_layers = static_cast<int32_t>(hp_ngl);
-        LLAMA_LOG_INFO("%s: single GPU device, no split optimization needed\n", __func__);
+        fprintf(stderr, "[KV-FIT-DBG] ==> conclusion: single GPU, no split needed\n");
         return true;
     }
 
@@ -652,7 +672,7 @@ LLAMA_API bool llama_kv_fit_auto_split(
         // Set the split for this probe
         mparams->tensor_split = split;
 
-        LLAMA_LOG_INFO("%s: %s - probing tensor_split [", __func__, phase);
+        fprintf(stderr, "[KV-FIT-DBG] %s - probing tensor_split [", phase);
         for (size_t i = 0; i < nd; i++) {
             fprintf(stderr, "%s", i > 0 ? ", " : "");
             fprintf(stderr, "%.4f", split[i]);
@@ -689,13 +709,25 @@ LLAMA_API bool llama_kv_fit_auto_split(
         for (size_t i = 0; i < nd && i + 1 < dmds_lo.size(); i++) {
             const auto & lo = dmds_lo[i].mb;
             const auto & hi = dmds_hi[i].mb;
-            double rate = ((double)hi.context - (double)lo.context) / 256.0;
-            double fixed = (double)lo.context - rate * 256.0;
-            LLAMA_LOG_INFO("%s: %s -   dev %zu: model=%.3f GiB compute+fixed=%.3f GiB rate=%.1f B/cell\n",
-                    __func__, phase, i,
-                    lo.model / 1073741824.0,
-                    ((double)lo.compute + fixed) / 1073741824.0,
-                    rate);
+            // measured (raw) parameters
+            const long long model   = (long long)lo.model;
+            const long long compute = (long long)lo.compute;
+            const long long ctx256  = (long long)lo.context;
+            const long long ctx512  = (long long)hi.context;
+            // derived parameters
+            const double rate  = (ctx512 - ctx256) / 256.0;                 // B per KV cell
+            const double fixed = ctx256 - rate * 256.0;                      // context bytes independent of pool size
+
+            fprintf(stderr, "[KV-FIT-DBG] %s dev%zu -- measured:\n", phase, i);
+            fprintf(stderr, "[KV-FIT-DBG]   model      = %lld B\n",  model);
+            fprintf(stderr, "[KV-FIT-DBG]   compute    = %lld B\n",  compute);
+            fprintf(stderr, "[KV-FIT-DBG]   ctx@256    = %lld B\n",  ctx256);
+            fprintf(stderr, "[KV-FIT-DBG]   ctx@512    = %lld B\n",  ctx512);
+            fprintf(stderr, "[KV-FIT-DBG] %s dev%zu -- derived:\n", phase, i);
+            fprintf(stderr, "[KV-FIT-DBG]   rate       = (ctx@512 - ctx@256) / (512-256) = (%lld-%lld)/256 = %.0f B/cell\n",
+                    ctx512, ctx256, rate);
+            fprintf(stderr, "[KV-FIT-DBG]   fixed      = ctx@256 - rate*256 = %lld - %.0f*256 = %.0f B\n",
+                    ctx256, rate, fixed);
         }
 
         return {std::move(dmds_lo), std::move(dmds_hi)};
@@ -706,23 +738,32 @@ LLAMA_API bool llama_kv_fit_auto_split(
     {
         double sum_free = 0.0;
         std::vector<double> free_nd(nd);
+        std::vector<double> total_nd(nd);
         for (size_t g = 0; g < nd; g++) {
             size_t free, total;
             ggml_backend_dev_memory(devs[g], &free, &total);
-            free_nd[g] = static_cast<double>(free);
-            sum_free += free_nd[g];
+            free_nd[g]  = static_cast<double>(free);
+            total_nd[g] = static_cast<double>(total);
+            sum_free   += free_nd[g];
         }
         if (sum_free <= 0.0) {
             LLAMA_LOG_WARN("%s: total free VRAM is zero; aborting auto split\n", __func__);
             return false;
         }
+
+        fprintf(stderr, "[KV-FIT-DBG] PhaseA -- measured (free/total per device):\n");
+        for (size_t g = 0; g < nd; g++) {
+            fprintf(stderr, "[KV-FIT-DBG]   dev%zu: free=%.0f B total=%.0f B\n",
+                    g, free_nd[g], total_nd[g]);
+        }
+
         for (size_t g = 0; g < nd; g++) {
             tensor_split[g] = static_cast<float>(free_nd[g] / sum_free);
         }
-        LLAMA_LOG_INFO("%s: free-VRAM-proportional tensor split:\n", __func__);
+        fprintf(stderr, "[KV-FIT-DBG] PhaseA -- derived: split[dev] = free[dev] / sum(free)\n");
         for (size_t g = 0; g < nd; g++) {
-            LLAMA_LOG_INFO("%s:   - device %zu: %.4f (%.1f%%)\n",
-                    __func__, g, tensor_split[g], 100.0 * tensor_split[g]);
+            fprintf(stderr, "[KV-FIT-DBG]   dev%zu: %.0f / %.0f = %.4f (%.1f%%)\n",
+                    g, free_nd[g], sum_free, tensor_split[g], 100.0 * tensor_split[g]);
         }
     }
 
@@ -731,9 +772,7 @@ LLAMA_API bool llama_kv_fit_auto_split(
     if (nd > 1) {
         mparams->tensor_split = tensor_split;
     }
-
-    LLAMA_LOG_INFO("%s: optimized n_gpu_layers=%u with tensor_split for %zu devices\n",
-            __func__, hp_ngl, nd);
+    fprintf(stderr, "[KV-FIT-DBG] set n_gpu_layers=%u tensor_split for %zu devices\n", hp_ngl, nd);
 
     // Phase B: measure the pool this split actually yields. Uses the same 256/512
     // probe + affine solve as llama_kv_fit_max_pool() so what is logged is what
@@ -750,8 +789,7 @@ LLAMA_API bool llama_kv_fit_auto_split(
             // final budget.
             const uint32_t n_ver = llama_kv_fit_max_pool_solve(
                     lo_ver, hi_ver, 256, 512, nullptr, nullptr, 0, vram_fraction);
-            LLAMA_LOG_INFO("%s: Phase B verification - free-VRAM split gives measured pool %u cells\n",
-                    __func__, n_ver);
+            fprintf(stderr, "[KV-FIT-DBG] ==> conclusion: free-VRAM split gives measured pool %u cells\n", n_ver);
         } else {
             LLAMA_LOG_WARN("%s: Phase B verification probes failed\n", __func__);
         }
