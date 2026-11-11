@@ -2,6 +2,8 @@
 
 #include "llama-impl.h"
 #include "llama-version.h"
+// [FORK] fork build identifier, shared with tools/server (see fork-version.h)
+#include "../tools/server/fork-version.h"
 
 #include "llama-chat.h"
 #include "llama-context.h"
@@ -119,7 +121,16 @@ const char * llama_version(void) {
     return LLAMA_VERSION;
 }
 
+// [FORK]
+const char * llama_fork_version(void) {
+    return FORK_VERSION;
+}
+
 void llama_backend_init(void) {
+    // [FORK] Identify the running libllama build in every consumer's log: the text
+    // changes with each fork commit, so a stale/old library is instantly visible.
+    fprintf(stderr, "[FORK-VER] libllama %s\n", FORK_VERSION);
+
     ggml_time_init();
 
     // needed to initialize f16 tables

@@ -482,6 +482,11 @@ extern "C" {
 
     LLAMA_API const char * llama_version(void);
 
+    // [FORK] Version of this fork's library build (see tools/server/fork-version.h).
+    // Printed automatically by llama_backend_init() so the running libllama is
+    // identifiable in any consumer's log.
+    LLAMA_API const char * llama_fork_version(void);
+
     // Helpers for getting default parameters
     // TODO: update API to start accepting pointers to params structs (https://github.com/ggml-org/llama.cpp/discussions/9172)
     LLAMA_API struct llama_model_params          llama_model_default_params(void);
