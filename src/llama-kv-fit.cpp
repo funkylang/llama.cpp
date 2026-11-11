@@ -182,26 +182,56 @@ static std::vector<llama_device_memory_data> llama_kv_fit_probe(
     return ret;
 }
 
-// Measure per-device VRAM consumed by lazy first-use allocations that no_alloc probing
-// cannot see: kernel code objects, cuBLAS/HIPBLAS workspaces, and other runtime buffers
-// are allocated only when a graph is actually executed. Running one real (tiny) decode
-// forces every such allocation; the per-device free-memory delta around it is the cost.
-// The pool stays tiny (256 cells) so this cannot exhaust VRAM regardless of what the
-// fit later decides. Result: bytes per device, host entry included (always 0).
-static std::vector<uint64_t> llama_kv_fit_runtime_overhead(
+// Measure per-device VRAM consumed by everything a real context needs BEYOND what
+// the no_alloc probes already account for (weights via `model`, KV rows + recurrent
+// state via `rate`/`fixed`, sched graph buffers via `compute`). Evidence (rocky2
+// 2026-11-11, u256 OOM run): the output/sampling buffers and the scheduler compute
+// buffers are allocated DURING llama_init_from_model - after a ctx-init-anchored
+// baseline they are invisible, which left ~0.9 GiB uncounted on dev1 while the pool
+// was sized to the cap and OOMed at the first decode.
+//
+// Design: free-memory snapshot right after the real model load (F0) - this is the
+// exact landscape a real run will face, probe residuals included. Then init both
+// contexts (tiny pools) and decode each once; F_last is the post-everything state.
+// Returns:
+//   overhead[g] = F0[g] - F_last[g]           (raw bytes of ctx init + decodes)
+//   baseline[g] = F0[g]                       (caller logs it; pool_room math still
+//                                              uses the no_alloc probe's free values)
+// The solver subtracts the measured contexts' own KV rows (fixed + rate*n_probe_tok)
+// from overhead before using it, so nothing is counted twice.
+struct llama_kv_fit_runtime_result {
+    bool               ok = false;       // probe actually ran (model + ctxs + decodes)
+    uint32_t           probe_cells = 0;  // pool size used by the measurement contexts
+    std::vector<uint64_t> overhead; // per-device, host entry 0
+    std::vector<size_t>   baseline_free; // per-device free at model-load point, host 0
+};
+
+static llama_kv_fit_runtime_result llama_kv_fit_runtime_overhead(
         const char * path_model,
         llama_model_params * mparams,
         llama_context_params * cparams,
         const llama_kv_fit_extra * extra,
         std::vector<ggml_backend_dev_t> & devs) {
     const size_t nd = devs.size(); // includes the host entry
+    llama_kv_fit_runtime_result ret;
     std::vector<uint64_t> overhead(nd, 0);
+    std::vector<size_t> baseline_free(nd, 0);
 
     const llama_model_params mp_real = *mparams; // real weights: no no_alloc override
     llama_model * model = llama_model_load_from_file(path_model, mp_real);
     if (model == nullptr) {
         LLAMA_LOG_WARN("%s: runtime overhead probe failed to load model\n", __func__);
-        return overhead;
+        ret.overhead      = std::move(overhead);
+        ret.baseline_free = std::move(baseline_free);
+        return ret; // ok = false
+    }
+
+    // Baseline: everything already resident here (probe leftovers via the caching
+    // allocator included) is what a real run must live with.
+    for (size_t g = 0; g < devs.size() - 1; g++) {
+        size_t f, t;
+        ggml_backend_dev_memory(devs[g], &f, &t);
+        baseline_free[g] = f;
     }
 
     // Effective worst-case ubatch: what the scheduler reserves/launches at runtime is
@@ -228,15 +258,11 @@ static std::vector<uint64_t> llama_kv_fit_runtime_overhead(
     if (ctx == nullptr) {
         LLAMA_LOG_WARN("%s: runtime overhead probe failed to init context\n", __func__);
         llama_model_free(model);
-        return overhead;
+        ret.overhead      = std::move(overhead);
+        ret.baseline_free = std::move(baseline_free);
+        return ret; // ok = false
     }
-
-    std::vector<size_t> free_before(devs.size(), 0), free_after(devs.size(), 0);
-    for (size_t g = 0; g < devs.size() - 1; g++) {
-        size_t f, t;
-        ggml_backend_dev_memory(devs[g], &f, &t);
-        free_before[g] = f;
-    }
+    ret.probe_cells = cp.n_kv_cache;
 
     // One worst-case decode: content is irrelevant; the point is to make every kernel
     // type run at full ubatch size so all lazy buffers are allocated before the deltas.
@@ -295,26 +321,34 @@ static std::vector<uint64_t> llama_kv_fit_runtime_overhead(
     for (size_t g = 0; g < devs.size() - 1; g++) {
         size_t f, t;
         ggml_backend_dev_memory(devs[g], &f, &t);
-        free_after[g] = f;
-        if (free_before[g] > free_after[g]) {
-            overhead[g] = free_before[g] - free_after[g];
+        if (baseline_free[g] > f) {
+            overhead[g] = baseline_free[g] - f;
         }
     }
 
     llama_free(ctx);
     llama_model_free(model);
-    return overhead;
+    ret.ok          = true; // main ctx measured; the production config that matters is covered
+    ret.overhead    = std::move(overhead);
+    ret.baseline_free = std::move(baseline_free);
+    return ret;
 }
 
 // Pure computation: solve the maximum unified KV pool size from two no_alloc
 // probes taken at N0 and N1 cells. Has no device/model dependencies of its own;
 // everything is measured into the dmds vectors by the caller.
+// runtime_overhead[id] is the RAW measured bytes (ctx init + decodes, see
+// llama_kv_fit_runtime_overhead): it already contains the sched compute buffers and
+// the measurement contexts' own KV rows, so the solver adds only model + the residual
+// (raw - fixed - rate*n_probe_cells). n_probe_cells = pool size of the measurement
+// contexts (0 when no overhead data is available).
 static uint32_t llama_kv_fit_max_pool_solve(
         const std::vector<llama_device_memory_data> & dmds_low,
         const std::vector<llama_device_memory_data> & dmds_high,
                                 uint32_t N0, uint32_t N1,
                                 const size_t * margins,      // per-device margin to keep free (bytes)
-                                const uint64_t * runtime_overhead, // lazy first-use allocations per device (bytes)
+                                const uint64_t * runtime_overhead, // raw measured ctx-init+decode bytes per device
+                                uint32_t n_probe_cells,        // pool size of the measurement contexts
                                 double vram_fraction) {      // hard cap: max usage of each device's total memory
     fprintf(stderr, "[KV-FIT-DBG] solve: %zu device entries (last = host)\n", dmds_low.size());
     for (size_t id = 0; id < dmds_low.size(); id++) {
@@ -345,10 +379,7 @@ static uint32_t llama_kv_fit_max_pool_solve(
             return 0;
         }
 
-        // compute (the scheduler's graph-workspace estimate) may legitimately grow with the
-        // pool size: attention workspaces follow KV tensor length. It is a deterministic
-        // function of the graph, never an external-allocation drift, so take the max instead
-        // of demanding equality. Model bytes are a real allocation measurement and MUST match.
+        // Model bytes are a real allocation measurement and MUST match.
         const uint64_t compute = std::max(lo.compute, hi.compute);
 
         const int64_t delta_ctx = (int64_t) hi.context - (int64_t) lo.context;
@@ -382,10 +413,26 @@ static uint32_t llama_kv_fit_max_pool_solve(
         const int64_t cap_free   = (int64_t) dmd.free - margin_i;
         const int64_t pool_room  = std::min(cap_driver, cap_free);
 
-        // model weights + compute buffers + lazy runtime allocations + cell-independent
-        // state are consumed before the pool can claim any device memory
-        const int64_t rt_oh  = runtime_overhead != nullptr ? (int64_t) runtime_overhead[id] : 0;
-        const int64_t non_pool   = (int64_t) lo.model + (int64_t) compute + fixed + rt_oh;
+        // non-pool bytes. Two accounting modes:
+        // (a) measured window available (llama_kv_fit_max_pool): model + (raw - rate*n_pc).
+        //     The window carries everything a real run pays before the pool grows -
+        //     output/sampling buffers, recurrent state, sched compute buffers, kernels -
+        //     so no separate fixed/compute terms (they would double-count).
+        // (b) no measurement (Phase D split-consistency check): model + compute + fixed from
+        //     the no_alloc breakdowns, same basis Phase C fits against.
+        int64_t rt_oh_used = 0;
+        int64_t non_pool;
+        if (runtime_overhead != nullptr) {
+            if (runtime_overhead[id] > 0) {
+                rt_oh_used = (int64_t) runtime_overhead[id] - rate * (int64_t) n_probe_cells;
+                if (rt_oh_used < 0) {
+                    rt_oh_used = 0; // allocator recycling edge: keep raw measurement, never negative
+                }
+            }
+            non_pool = (int64_t) lo.model + rt_oh_used;
+        } else {
+            non_pool = (int64_t) lo.model + (int64_t) compute + fixed;
+        }
 
         uint32_t n_dev = 0;
         if (non_pool < pool_room) {
@@ -393,11 +440,13 @@ static uint32_t llama_kv_fit_max_pool_solve(
             n_dev = (uint32_t) (cells / 256u * 256u);
         }
 
-        fprintf(stderr, "[KV-FIT-DBG] solve: device %zu: total=%lld free=%lld used=%lld | cap_driver=%lld cap_free=%lld pool_room=%lld non_pool=%lld fixed=%lld rt_overhead=%lld rate=%lld B/cell -> max %9u cells\n",
+        fprintf(stderr, "[KV-FIT-DBG] solve: device %zu: total=%lld free=%lld used=%lld | cap_driver=%lld cap_free=%lld pool_room=%lld non_pool=%lld fixed=%lld rt_raw=%lld rt_used=%lld rate=%lld B/cell -> max %9u cells\n",
                 id,
                 (long long)dmd.total,  (long long)dmd.free, (long long)used,
                 (long long)cap_driver, (long long)cap_free, (long long)pool_room,
-                (long long)non_pool,   (long long)fixed, (long long)rt_oh, (long long)rate, n_dev);
+                (long long)non_pool,   (long long)fixed,
+                (long long)(runtime_overhead != nullptr ? runtime_overhead[id] : 0),
+                (long long)rt_oh_used, (long long)rate, n_dev);
 
         have_constraint = true;
         n_max = std::min(n_max, n_dev);
@@ -521,20 +570,27 @@ LLAMA_API int32_t llama_kv_fit_max_pool(
         return 0;
     }
 
-    // The no_alloc probes above cannot see lazy first-use allocations (kernel code objects,
-    // cuBLAS/HIPBLAS workspaces); measure them with one real tiny decode at the solved
-    // placement. Overhead is placement-dependent only through which devices run kernels,
-    // so measuring once at the final split is sufficient for the pool budget.
-    std::vector<uint64_t> rt_overhead =
+    // The no_alloc probes cannot see what a real context allocates beyond weight bytes:
+    // output/sampling buffers, recurrent state, scheduler compute buffers and decode-time
+    // kernels all land in VRAM during llama_init_from_model() / llama_decode(). Measure
+    // them with one real load + tiny-pool ctxs + worst-case ubatch decodes at the solved
+    // placement (F0 baseline right after model load). If the measurement itself fails we
+    // must NOT size optimistically on incomplete data - return 0 and let the caller fall
+    // back to an explicit --kv-cache-size or the conservative default.
+    const llama_kv_fit_runtime_result rt =
             llama_kv_fit_runtime_overhead(path_model, mparams, cparams, extra, devs_main);
-    LLAMA_LOG_INFO("%s: runtime overhead per device:", __func__);
-    for (size_t g = 0; g + 1 < rt_overhead.size(); g++) {
-        LLAMA_LOG_INFO("%s:   - device %zu: %.2f MiB\n", __func__, g,
-                rt_overhead[g] / 1048576.0);
+    fprintf(stderr, "[KV-FIT-DBG] runtime overhead probe: ok=%d probe_cells=%u\n", (int)rt.ok, rt.probe_cells);
+    for (size_t g = 0; g + 1 < rt.overhead.size(); g++) {
+        fprintf(stderr, "[KV-FIT-DBG]   - device %zu: raw=%8.2f MiB (baseline free %8.2f MiB)\n",
+                g, rt.overhead[g] / 1048576.0, rt.baseline_free[g] / 1048576.0);
+    }
+    if (!rt.ok) {
+        fprintf(stderr, "[KV-FIT-DBG] solve: giving up - runtime overhead probe failed (no unsafe sizing)\n");
+        return 0;
     }
 
     const uint32_t n_max = llama_kv_fit_max_pool_solve(
-            dmds_low, dmds_high, N0, N1, margins, rt_overhead.data(), vram_fraction);
+            dmds_low, dmds_high, N0, N1, margins, rt.overhead.data(), rt.probe_cells, vram_fraction);
     if (n_max > 0) {
         LLAMA_LOG_INFO("%s: maximum unified KV pool size is %u cells\n", __func__, n_max);
     }
@@ -1063,7 +1119,7 @@ LLAMA_API bool llama_kv_fit_auto_split(
             // stays slightly optimistic on purpose - it checks split consistency, not the
             // final budget.
             const uint32_t n_ver = llama_kv_fit_max_pool_solve(
-                    lo_ver, hi_ver, 256, 512, nullptr, nullptr, vram_fraction);
+                    lo_ver, hi_ver, 256, 512, nullptr, nullptr, 0, vram_fraction);
             LLAMA_LOG_INFO("%s: Phase D verification - solved split gives measured pool %u cells (predicted %.1f)\n",
                     __func__, n_ver, predicted_pool);
         } else {
