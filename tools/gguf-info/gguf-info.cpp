@@ -18,6 +18,7 @@
 #include <cstring>
 #include <string>
 #include <map>
+#include <vector>
 
 static const char * type_name(int t) {
     switch (t) {
@@ -81,16 +82,23 @@ int main(int argc, char ** argv) {
 
     int64_t n_tensors = gguf_get_n_tensors(ctx);
     std::map<int, int64_t> layer_weights;
+    int64_t embed_bytes = 0, norm_bytes = 0;
+    std::vector<std::pair<std::string, int64_t>> other_tensors;
     for (int64_t tid = 0; tid < n_tensors; tid++) {
 	const char * tname = gguf_get_tensor_name(ctx, tid);
 	size_t tsize = gguf_get_tensor_size(ctx, tid);
+
+	if (!strcmp(tname, "token_embd.weight")) { embed_bytes += tsize; continue; }
+	if (!strcmp(tname, "output_norm.weight")) { norm_bytes += tsize; continue; }
 
 	int il = -1;
 	if (strstr(tname, "blk.")) {
 	    const char * p = strstr(tname, "blk.");
 	    sscanf(p + 4, "%d", &il);
 	}
-	if (il >= 0) layer_weights[il] += tsize;
+	if (il >= 0) { layer_weights[il] += tsize; continue; }
+
+	other_tensors.emplace_back(tname, (int64_t)tsize);
     }
 
     // ---- load model via llama API for hparams (no weights) -----------------
@@ -122,6 +130,13 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "  kv_type_v:  %s\n", type_name(type_v));
 
     // ---- per-layer table with block characters ------------------------------
+    if (!other_tensors.empty()) {
+	fprintf(stderr, "\n");
+	for (const auto & [tname, tsize] : other_tensors) {
+	    fprintf(stderr, "  %-45s %12lld\n", tname.c_str(), (long long)tsize);
+	}
+    }
+
     fprintf(stderr, "\n");
     fprintf(stderr, "┌───────┬─────────────┬───────────┐\n");
     fprintf(stderr, "│ layer │ tensor size │ cell size │\n");
@@ -130,12 +145,19 @@ int main(int argc, char ** argv) {
     int64_t total_weights = 0;
     int64_t total_rate = 0;
 
+    if (embed_bytes > 0) {
+	fprintf(stderr, "│ embed │ %11lld │         0 │\n", (long long)embed_bytes);
+	total_weights += embed_bytes;
+    }
+
     for (uint32_t il = 0; il < n_layer_all; il++) {
 	int64_t weights = layer_weights[il];
 	total_weights += weights;
 
-	if (!hp.has_kv(il)) {
-	    fprintf(stderr, "│ %5u  │ %11lld │     -     │\n",
+	// Skip layers without KV cache OR recurrent layers (hybrid models) —
+	// they don't allocate unified pool KV cells
+	if (!hp.has_kv(il) || hp.is_recr(il)) {
+	    fprintf(stderr, "│ %5u │ %11lld │         0 │\n",
 		    (unsigned)il, (long long)weights);
 	    continue;
 	}
@@ -152,11 +174,20 @@ int main(int argc, char ** argv) {
 		(unsigned)il, (long long)weights, (long long)cell_bytes);
     }
 
+    for (const auto & [tname, tsize] : other_tensors) {
+	total_weights += tsize;
+    }
+
+    if (norm_bytes > 0) {
+	fprintf(stderr, "│  norm │ %11lld │         0 │\n", (long long)norm_bytes);
+	total_weights += norm_bytes;
+    }
+
     // ---- totals -------------------------------------------------------------
     fprintf(stderr, "├───────┼─────────────┼───────────┤\n");
     fprintf(stderr, "│ TOTAL │ %11lld │ %9lld │\n",
 	    (long long)total_weights, (long long)total_rate);
-    fprintf(stderr, "└────────┴────────────┴───────────┘\n");
+    fprintf(stderr, "└───────┴─────────────┴───────────┘\n");
 
     llama_model_free(model);
     gguf_free(ctx);
