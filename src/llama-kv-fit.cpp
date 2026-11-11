@@ -202,8 +202,8 @@ static std::vector<llama_device_memory_data> llama_kv_fit_probe(
 struct llama_kv_fit_runtime_result {
     bool               ok = false;       // probe actually ran (model + ctxs + decodes)
     uint32_t           probe_cells = 0;  // pool size used by the measurement contexts
-    std::vector<uint64_t> overhead; // per-device, host entry 0
-    std::vector<size_t>   baseline_free; // per-device free at model-load point, host 0
+    std::vector<uint64_t> overhead; // per-GPU-device raw bytes (no host entry)
+    std::vector<size_t>   baseline_free; // per-GPU-device free at model-load point (no host)
 };
 
 static llama_kv_fit_runtime_result llama_kv_fit_runtime_overhead(
@@ -212,7 +212,7 @@ static llama_kv_fit_runtime_result llama_kv_fit_runtime_overhead(
         llama_context_params * cparams,
         const llama_kv_fit_extra * extra,
         std::vector<ggml_backend_dev_t> & devs) {
-    const size_t nd = devs.size(); // includes the host entry
+    const size_t nd = devs.size(); // GPU devices only; NO host entry (see llama_kv_fit_probe)
     llama_kv_fit_runtime_result ret;
     std::vector<uint64_t> overhead(nd, 0);
     std::vector<size_t> baseline_free(nd, 0);
@@ -227,8 +227,9 @@ static llama_kv_fit_runtime_result llama_kv_fit_runtime_overhead(
     }
 
     // Baseline: everything already resident here (probe leftovers via the caching
-    // allocator included) is what a real run must live with.
-    for (size_t g = 0; g < devs.size() - 1; g++) {
+    // allocator included) is what a real run must live with. devs holds GPU devices
+    // only (no trailing host), so every entry must be read.
+    for (size_t g = 0; g < devs.size(); g++) {
         size_t f, t;
         ggml_backend_dev_memory(devs[g], &f, &t);
         baseline_free[g] = f;
@@ -318,7 +319,7 @@ static llama_kv_fit_runtime_result llama_kv_fit_runtime_overhead(
         }
     }
 
-    for (size_t g = 0; g < devs.size() - 1; g++) {
+    for (size_t g = 0; g < devs.size(); g++) {
         size_t f, t;
         ggml_backend_dev_memory(devs[g], &f, &t);
         if (baseline_free[g] > f) {
@@ -580,7 +581,7 @@ LLAMA_API int32_t llama_kv_fit_max_pool(
     const llama_kv_fit_runtime_result rt =
             llama_kv_fit_runtime_overhead(path_model, mparams, cparams, extra, devs_main);
     fprintf(stderr, "[KV-FIT-DBG] runtime overhead probe: ok=%d probe_cells=%u\n", (int)rt.ok, rt.probe_cells);
-    for (size_t g = 0; g + 1 < rt.overhead.size(); g++) {
+    for (size_t g = 0; g < rt.overhead.size(); g++) {
         fprintf(stderr, "[KV-FIT-DBG]   - device %zu: raw=%8.2f MiB (baseline free %8.2f MiB)\n",
                 g, rt.overhead[g] / 1048576.0, rt.baseline_free[g] / 1048576.0);
     }

@@ -4,4 +4,4 @@
 // updated on every fork commit with the ACTUAL current time at update (strict ordering);
 // printed as the first startup message of llama-server so the running build can be identified
 
-static const char * FORK_VERSION = "2026-11-11 14:40:12 KV-fit overhead probe v2: baseline at post-model-load (fixes OOM)";
+static const char * FORK_VERSION = "2026-11-11 16:20:54 KV-fit overhead probe: measure every GPU device (off-by-one left last dev at 0)";
