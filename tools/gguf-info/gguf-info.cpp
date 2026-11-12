@@ -14,7 +14,9 @@
 //      by the loader unless load_mtp, and their KV pool is a separate context;
 //      base deployment cost (non-mtp) and the ADDITIONAL mtp cost are both
 //      visible at a glance
-//   6. totals — tensor TOTAL equals the exact sum of all GGUF tensors
+//   6. totals — TOTAL equals the exact sum of all GGUF tensors in the file;
+//      it is built from a code accumulator over the printed rows, so it always
+//      matches the sum of the visible rows (no hidden tensors)
 //
 // Table columns (fixed order, optional ones conditional on model capability):
 //   layer | tensor size | [mtp tensor] | cell size | [mtp cell] | [swa/ssm]
@@ -150,10 +152,14 @@ int main(int argc, char ** argv) {
 
     int64_t n_tensors = gguf_get_n_tensors(ctx);
     std::map<int, int64_t> layer_weights;
-    // global tensors: token_embd.weight ("embed", before layer 0),
-    // output_norm.weight ("norm", after the last layer); every other
-    // non-blk tensor is listed above the table but still counted in TOTAL.
-    int64_t embed_bytes = 0, norm_bytes = 0;
+    // global tensors (outside blk.*), each one a visible table row:
+    //   token_embd.weight  -> "embed"  row (before layer 0)
+    //   output_norm.weight -> "norm"   row (after the last layer)
+    //   output.weight      -> "output" row (after norm — lm_head, data flow
+    //                          order: embed -> layers -> norm -> output)
+    // everything else non-blk gets its own named row as well — TOTAL must
+    // equal the sum of the visible rows, never include hidden tensors.
+    int64_t embed_bytes = 0, norm_bytes = 0, output_bytes = 0;
     std::vector<std::pair<std::string, int64_t>> other_tensors;
     for (int64_t tid = 0; tid < n_tensors; tid++) {
 	const char * tname = gguf_get_tensor_name(ctx, tid);
@@ -161,6 +167,7 @@ int main(int argc, char ** argv) {
 
 	if (!strcmp(tname, "token_embd.weight")) { embed_bytes += tsize; continue; }
 	if (!strcmp(tname, "output_norm.weight")) { norm_bytes += tsize; continue; }
+	if (!strcmp(tname, "output.weight"))      { output_bytes += tsize; continue; }
 
 	int il = -1;
 	if (strstr(tname, "blk.")) {
@@ -214,23 +221,29 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "  kv_type_k:  %s\n", type_name(type_k));
     fprintf(stderr, "  kv_type_v:  %s\n", type_name(type_v));
 
-    if (!other_tensors.empty()) {
-	fprintf(stderr, "\n");
-	for (const auto & [tname, tsize] : other_tensors) {
-	    fprintf(stderr, "  %-45s %12lld\n", tname.c_str(), (long long)tsize);
-	}
-    }
+    // ---- table layout: mtp + swa/ssm columns are capability-driven ----------
+    // col 0 is sized to fit every label that will be printed (layer numbers,
+    // embed/norm/output/TOTAL, and any exotic global tensor names)
 
-    // ---- table layout: mtp + swa columns are capability-driven --------------
+    int col0_w = 7; // at least "layer"
+    for (const auto & [tname, tsize] : other_tensors) {
+        const int l = (int)tname.size() + 2;
+        if (l > col0_w) col0_w = l;
+    }
 
     std::vector<const char *> hdr;
     std::vector<int> widths;
-    hdr.push_back("layer");       widths.push_back(7);   // label/layer column
+    hdr.push_back("layer");       widths.push_back(col0_w); // label/layer column
     hdr.push_back("tensor size"); widths.push_back(NUM_COL_W);
     if (has_mtp) { hdr.push_back("mtp tensor"); widths.push_back(NUM_COL_W); }
     hdr.push_back("cell size");   widths.push_back(NUM_COL_W);
     if (has_mtp) { hdr.push_back("mtp cell");   widths.push_back(NUM_COL_W); }
     if (has_swa || has_ssm) { hdr.push_back("swa/ssm"); widths.push_back(NUM_COL_W); }
+
+    // accounting invariant (code-enforced): emit_row accumulates every weight
+    // byte it prints; the TOTAL row is built from exactly these accumulators,
+    // so TOTAL always equals the sum of the visible rows — no hidden tensors.
+    int64_t printed_base = 0, printed_mtp = 0;
 
     auto emit_row = [&](const char * label, int64_t tsize, int64_t mtens,
                         int64_t csize, int64_t mcell, int64_t state) {
@@ -242,10 +255,10 @@ int main(int argc, char ** argv) {
         if (has_mtp) vals.push_back(mcell);    // mtp cell           (optional)
         if (has_swa || has_ssm) vals.push_back(state); // swa/ssm     (optional, last)
         fprintf(stderr, "%s\n", data_row(label, vals, widths).c_str());
+        printed_base += tsize;                 // accumulate what was printed
+        printed_mtp  += mtens;
     };
 
-    int64_t total_weights = 0;
-    int64_t mtp_weights = 0;
     int64_t total_rate = 0, mtp_rate = 0;
     int64_t total_state = 0, mtp_state = 0;
 
@@ -256,7 +269,6 @@ int main(int argc, char ** argv) {
 
     if (embed_bytes > 0) {
         emit_row("embed", embed_bytes, 0, 0, 0, 0);
-        total_weights += embed_bytes;
     }
 
     for (uint32_t il = 0; il < n_layer_all; il++) {
@@ -266,8 +278,6 @@ int main(int argc, char ** argv) {
 	// base deployment cost: without MTP, nextn layers are neither loaded
 	// (load_mtp=false -> TENSOR_SKIP) nor executed — their weights and KV
 	// appear in the mtp columns as the ADDITIONAL cost when MTP is enabled.
-	total_weights += weights;
-	if (is_mtp_layer) { mtp_weights += weights; }
 
 	int64_t tsize = 0, mtens = 0, csize = 0, mcell = 0, state = 0;
 
@@ -319,21 +329,30 @@ int main(int argc, char ** argv) {
 	emit_row(label, tsize, mtens, csize, mcell, state);
     }
 
-    for (const auto & [tname, tsize] : other_tensors) {
-        total_weights += tsize;
-    }
-
+    // globals after the last layer, in data flow order:
+    // norm -> output (lm_head); any remaining non-blk tensors each get a row
     if (norm_bytes > 0) {
         emit_row("norm", norm_bytes, 0, 0, 0, 0);
-        total_weights += norm_bytes;
+    }
+    if (output_bytes > 0) {
+        emit_row("output", output_bytes, 0, 0, 0, 0);
+    }
+    for (const auto & [tname, tsize] : other_tensors) {
+        emit_row(tname.c_str(), tsize, 0, 0, 0, 0);
     }
 
-    // ---- totals -------------------------------------------------------------
-    int64_t base_weights = total_weights - mtp_weights;
+    // ---- totals: exactly the sum of the rows printed above ------------------
     fprintf(stderr, "%s\n", box("├", "┼", "┤", widths).c_str());
-    emit_row("TOTAL", base_weights, has_mtp ? mtp_weights : 0,
-             total_rate, has_mtp ? mtp_rate : 0,
-             (has_swa || has_ssm) ? (total_state + mtp_state) : 0);
+    {
+        std::vector<int64_t> vals;
+        vals.push_back(0);                          // label slot (unused)
+        vals.push_back(printed_base);               // sum of visible rows
+        if (has_mtp) vals.push_back(printed_mtp);
+        vals.push_back(total_rate);
+        if (has_mtp) vals.push_back(mtp_rate);
+        if (has_swa || has_ssm) vals.push_back(total_state + mtp_state);
+        fprintf(stderr, "%s\n", data_row("TOTAL", vals, widths).c_str());
+    }
     fprintf(stderr, "%s\n", box("└", "┴", "┘", widths).c_str());
 
     llama_model_free(model);
