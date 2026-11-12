@@ -228,9 +228,18 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
-// [KV-FIT-DBG] TEMPORARY instrumentation (probe-VRAM hunt): raw per-device
-// total/free at each ctx-init substep. REMOVE when resolved.
+// [KV-FIT-DBG] Raw per-device total/free at each ctx-init substep (probe-VRAM
+// hunt). Silent by default; enable with LLAMA_KV_FIT_DBG=1.
+static bool llama_ctx_dbg_enabled() {
+    static const bool en = [](){
+        const char * e = getenv("LLAMA_KV_FIT_DBG");
+        return e != nullptr && e[0] != '0' && e[0] != '\0';
+    }();
+    return en;
+}
+
 static void llama_ctx_dbg_vram(const char * tag) {
+    if (!llama_ctx_dbg_enabled()) return;
     fprintf(stderr, "[KV-FIT-DBG] ctx-init@%s:\n", tag);
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);

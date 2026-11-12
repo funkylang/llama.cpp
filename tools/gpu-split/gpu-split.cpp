@@ -2,9 +2,11 @@
 //
 // Current stage: DEVICE SCAN (STEP 0 of concept-gpu-split-tool.md)
 //   Enumerates every device the ggml backend registry sees and prints its
-//   VRAM in two phases: free (raw, nothing loaded) and after-init (after each
-//   GPU/IGPU backend uploaded its shaders/fixed driver parts) — the figure to
-//   plan from. CPU has no shaders: both phases measure the same thing.
+//   VRAM in two phases: free (raw, nothing loaded) and after-init (after model +
+//   context initialization — kernels/shaders upload, compute buffers allocate;
+//   the fixed overhead of any deployment). Tensors are NOT loaded and no
+//   deployment-sized KV cache is allocated. CPU has no such phase: both columns
+//   measure the same thing.
 //   The split solver (phases 2-5 of the concept doc) builds on this; the
 //   GGUF/hparams table code below is carried over from llama-gguf-info so
 //   both tools share the same accounting logic.
@@ -73,9 +75,11 @@ static void log_callback_quiet(enum ggml_log_level, const char *, void *) {}
 // STEP 0 (concept-gpu-split-tool.md §15.4/§15.6): two-phase measurement of
 // every device the backend registry sees:
 //   free       — raw, right after llama_backend_init(), nothing loaded yet
-//   after-init — after each GPU/IGPU backend is initialized, i.e. shaders and
-//                other fixed driver parts are uploaded; this is the real
-//                "available before deployment" figure (Michael's "loaded" col)
+//   after-init — after the no_alloc model + a real context are initialized.
+//                This is the step a live deployment takes BEFORE loading tensors
+//                and allocating the KV cache: backends come up on the target
+//                devices (kernels/shaders), compute buffers are allocated. The
+//                delta free - after-init = the FIXED overhead of any run.
 // No filtering yet: the output shows exactly what the driver advertises on
 // the rig. The GPU/IGPU filter for the split solver comes with phases 2+.
 
@@ -197,30 +201,7 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
     }
 
     fprintf(stderr, "\n");
-    fprintf(stderr, "    (after-init = free after backend/shader upload)\n");
-}
-
-// Initialize each GPU/IGPU backend so shaders/fixed driver parts load; the
-// initialized backends are returned for later cleanup (we free them once the
-// scan is done — they are not needed for the metadata-only model load).
-static void init_gpu_backends(std::vector<ggml_backend_t> & backends) {
-    const size_t ndevs = ggml_backend_dev_count();
-    for (size_t i = 0; i < ndevs; ++i) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (!dev) {
-            continue;
-        }
-        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
-        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
-            continue;
-        }
-        ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
-        if (!be) {
-            fprintf(stderr, "  device %zu (%s): backend init failed — after-init not measured\n",
-                    i, ggml_backend_dev_name(dev));
-        }
-        backends.push_back(be);
-    }
+    fprintf(stderr, "    (after-init = free after model + context init: kernels, compute buffers)\n");
 }
 
 // ---- table printing -----------------------------------------------------------
@@ -359,20 +340,11 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
 
-    // STEP 0: two-phase device scan — raw VRAM, then after GPU backend init
-    // (shaders/fixed driver parts). The initialized backends are freed right
-    // after the scan: not needed for the metadata-only model load.
+    // STEP 0: two-phase device scan — raw VRAM (nothing loaded yet), then after
+    // model/context init, which loads the fixed driver parts (see below).
     std::vector<dev_snapshot> scan_raw, scan_init;
     read_all_devices(scan_raw);
     fix_cpu_free(scan_raw);
-    std::vector<ggml_backend_t> scan_backends;
-    init_gpu_backends(scan_backends);
-    read_all_devices(scan_init);
-    fix_cpu_free(scan_init);
-    print_device_scan(scan_raw, scan_init);
-    for (auto * be : scan_backends) {
-        if (be) ggml_backend_free(be);
-    }
 
     llama_model_params mp; memset(&mp, 0, sizeof(mp));
     mp.no_alloc = true;
@@ -384,6 +356,28 @@ int main(int argc, char ** argv) {
         gguf_free(ctx);
         return 1;
     }
+
+    // after-init scan: create a real context from the no_alloc model. This is
+    // what a live deployment does BEFORE loading tensors and allocating the KV
+    // cache: backends initialize on the target devices (kernels/shaders upload)
+    // and compute buffers are allocated — the FIXED overhead of any run. The
+    // probe pool stays tiny so no deployment-sized cache is touched.
+    {
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx      = 1024;   // small working context: enough to init, nothing more
+        cp.n_kv_cache = 256;    // minimal probe pool (fork field) — fixed-cost measurement only
+
+        llama_context * ctx0 = llama_init_from_model(model, cp);
+        if (ctx0) {
+            read_all_devices(scan_init);
+            fix_cpu_free(scan_init);
+            llama_free(ctx0);
+        } else {
+            fprintf(stderr, "  device scan: context init failed — after-init not measured\n");
+        }
+    }
+
+    print_device_scan(scan_raw, scan_init);
 
     const auto & hp = model->hparams;
     const uint32_t n_layer_all   = hp.n_layer_all;
