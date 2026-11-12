@@ -233,6 +233,20 @@ llama_kv_cache::llama_kv_cache(
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
+        // [MEM-SIZE] debug: per-layer KV cell size formula with every variable
+        {
+            const uint64_t k_bytes = has_k ? ggml_row_size(type_k, n_embd_k_gqa) : 0;
+            const uint64_t v_bytes = has_v ? ggml_row_size(type_v, n_embd_v_gqa) : 0;
+            fprintf(stderr, "[MEM-SIZE] kv layer %2d @%s: cell = row_k(%llu)[%s,n_embd_k=%u] + row_v(%llu)[%s,n_embd_v=%u] = %llu; "
+                    "tensor bytes = cell * kv_size(%u) * n_stream(%u) = %llu\n",
+                    il, dev_name,
+                    (unsigned long long) k_bytes, ggml_type_name(type_k), n_embd_k_gqa,
+                    (unsigned long long) v_bytes, ggml_type_name(type_v), has_v ? n_embd_v_gqa : 0,
+                    (unsigned long long) (k_bytes + v_bytes),
+                    kv_size, n_stream,
+                    (unsigned long long) ((k_bytes + v_bytes) * (uint64_t)kv_size * (uint64_t)n_stream));
+        }
+
         has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
         has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
 

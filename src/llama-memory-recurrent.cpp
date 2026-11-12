@@ -99,6 +99,20 @@ llama_memory_recurrent::llama_memory_recurrent(
         }
 
         const uint32_t n_rows = mem_size * (1 + n_rs_seq);
+        // [MEM-SIZE] debug: SSM state size formula with every variable
+        {
+            const uint64_t row_r = ggml_row_size(type_r, hparams.n_embd_r());
+            const uint64_t row_s = ggml_row_size(type_s, hparams.n_embd_s());
+            const uint64_t row_p = (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) ?
+                    ggml_row_size(type_r, hparams.ple_conv_state()) : 0;
+            fprintf(stderr, "[MEM-SIZE] ssm layer %2d: n_rows = mem_size(%u) * (1 + n_rs_seq(%u)) = %u; "
+                    "bytes = n_rows * (row_r(%llu)[%s] + row_s(%llu)[%s]%s) = %llu\n",
+                    i, mem_size, n_rs_seq, n_rows,
+                    (unsigned long long) row_r, ggml_type_name(type_r),
+                    (unsigned long long) row_s, ggml_type_name(type_s),
+                    row_p > 0 ? " + row_p(...)" : "",
+                    (unsigned long long) ((uint64_t)n_rows * (row_r + row_s + row_p)));
+        }
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
         ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
         ggml_format_name(r, "cache_r_l%d", i);
