@@ -7,7 +7,9 @@
 //   3. KV cell bytes per layer from architecture metadata
 //      - hybrid models: only non-recurrent layers allocate unified pool KV
 //      - quantized KV types: block-rounded via ggml_row_size (allocator-identical)
-//   4. SWA window size per layer: one sliding window = n_swa x cell_bytes
+//   4. fixed per-layer state in the swa/ssm column:
+//      - SWA attention layers: one sliding window = n_swa x cell_bytes
+//      - recurrent (SSM) layers: one snapshot row-set of R/S tensors
 //   5. MTP/nextn usage in dedicated mtp columns — their weights are skipped
 //      by the loader unless load_mtp, and their KV pool is a separate context;
 //      base deployment cost (non-mtp) and the ADDITIONAL mtp cost are both
@@ -15,11 +17,16 @@
 //   6. totals — tensor TOTAL equals the exact sum of all GGUF tensors
 //
 // Table columns (fixed order, optional ones conditional on model capability):
-//   layer | tensor size | [mtp tensor] | cell size | [mtp cell] | [swa]
+//   layer | tensor size | [mtp tensor] | cell size | [mtp cell] | [swa/ssm]
 //   - mtp columns only if the model has nextn/MTP layers (n_layer_nextn > 0)
-//   - swa column (always last) only if the model has SWA layers:
-//     one sliding-window checkpoint per (SWA) layer = n_swa x cell_bytes —
-//     "we will always need one to hold the current state"
+//   - swa/ssm column (always last) only if the model has SWA or recurrent
+//     layers: per-layer fixed state cost — "we will always need one to hold
+//     the current state":
+//       SWA attention layer: one sliding window = n_swa x cell_bytes
+//       recurrent (SSM) layer: one snapshot row-set of its R/S tensors
+//         (llama-memory-recurrent.cpp: r/s allocated F32 per create_memory,
+//          one live row + n_rs_seq snapshot rows per sequence share the cost
+//          of a single row-set each); PLE layers add their conv-history row
 
 #include "ggml.h"
 #include "gguf.h"
@@ -188,9 +195,10 @@ int main(int argc, char ** argv) {
     // ---- capabilities -------------------------------------------------------
     const bool has_moe = hp.n_expert > 0;
     const bool has_mtp = n_layer_nextn > 0;
-    bool has_swa = false;
-    for (uint32_t il = 0; il < n_layer_all && !has_swa; ++il) {
-        has_swa = hp.is_swa(il);
+    bool has_swa = false, has_ssm = false;
+    for (uint32_t il = 0; il < n_layer_all; ++il) {
+        has_swa |= hp.is_swa(il);
+        has_ssm |= hp.is_recr(il);
     }
 
     // ---- parameters ---------------------------------------------------------
@@ -201,6 +209,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "  layers:     %u (all)\n", (unsigned)n_layer_all);
     fprintf(stderr, "  MoE:        %s\n", has_moe ? "yes" : "no");
     fprintf(stderr, "  SWA:        %s\n", has_swa ? "yes" : "no");
+    fprintf(stderr, "  SSM:        %s\n", has_ssm ? "yes" : "no");
     fprintf(stderr, "  MTP:        %s\n", has_mtp ? "yes" : "no");
     fprintf(stderr, "  kv_type_k:  %s\n", type_name(type_k));
     fprintf(stderr, "  kv_type_v:  %s\n", type_name(type_v));
@@ -221,24 +230,24 @@ int main(int argc, char ** argv) {
     if (has_mtp) { hdr.push_back("mtp tensor"); widths.push_back(NUM_COL_W); }
     hdr.push_back("cell size");   widths.push_back(NUM_COL_W);
     if (has_mtp) { hdr.push_back("mtp cell");   widths.push_back(NUM_COL_W); }
-    if (has_swa) { hdr.push_back("swa");            widths.push_back(NUM_COL_W); }
+    if (has_swa || has_ssm) { hdr.push_back("swa/ssm"); widths.push_back(NUM_COL_W); }
 
     auto emit_row = [&](const char * label, int64_t tsize, int64_t mtens,
-                        int64_t csize, int64_t mcell, int64_t swa) {
+                        int64_t csize, int64_t mcell, int64_t state) {
         std::vector<int64_t> vals;
         vals.push_back(0);                     // slot 0 is the label (unused)
         vals.push_back(tsize);                 // tensor size        (always)
         if (has_mtp) vals.push_back(mtens);    // mtp tensor         (optional)
         vals.push_back(csize);                 // cell size          (always)
         if (has_mtp) vals.push_back(mcell);    // mtp cell           (optional)
-        if (has_swa) vals.push_back(swa);      // swa size           (optional, last)
+        if (has_swa || has_ssm) vals.push_back(state); // swa/ssm     (optional, last)
         fprintf(stderr, "%s\n", data_row(label, vals, widths).c_str());
     };
 
     int64_t total_weights = 0;
     int64_t mtp_weights = 0;
     int64_t total_rate = 0, mtp_rate = 0;
-    int64_t total_swa = 0, mtp_swa = 0;
+    int64_t total_state = 0, mtp_state = 0;
 
     fprintf(stderr, "\n");
     fprintf(stderr, "%s\n", box("┌", "┬", "┐", widths).c_str());
@@ -260,40 +269,54 @@ int main(int argc, char ** argv) {
 	total_weights += weights;
 	if (is_mtp_layer) { mtp_weights += weights; }
 
-	int64_t tsize = 0, mtens = 0, csize = 0, mcell = 0, swa = 0;
+	int64_t tsize = 0, mtens = 0, csize = 0, mcell = 0, state = 0;
 
 	// Skip layers without KV cache OR recurrent layers (hybrid models) —
 	// they don't allocate unified pool KV cells
 	if (hp.has_kv(il) && !hp.is_recr(il)) {
-	    // block-rounded rows: identical to what the allocator computes,
-	    // correct for quantized KV types (q8_0 packs 32 elements + scale)
-	    const uint32_t n_embd_k = hp.n_embd_k_gqa(il);
-	    const uint32_t n_embd_v = v_trans ? hp.n_embd_v_gqa_max() : hp.n_embd_v_gqa(il);
+		// block-rounded rows: identical to what the allocator computes,
+		// correct for quantized KV types (q8_0 packs 32 elements + scale)
+		const uint32_t n_embd_k = hp.n_embd_k_gqa(il);
+		const uint32_t n_embd_v = v_trans ? hp.n_embd_v_gqa_max() : hp.n_embd_v_gqa(il);
 
-	    int64_t k_bytes = ggml_row_size(type_k, n_embd_k);
-	    int64_t v_bytes = hp.is_mla() ? 0 : (int64_t)ggml_row_size(type_v, n_embd_v);
-	    int64_t cell_bytes = k_bytes + v_bytes;
+		int64_t k_bytes = ggml_row_size(type_k, n_embd_k);
+		int64_t v_bytes = hp.is_mla() ? 0 : (int64_t)ggml_row_size(type_v, n_embd_v);
+		int64_t cell_bytes = k_bytes + v_bytes;
 
-	    // one sliding window per SWA layer: fixed cost that always exists
-	    // ("we will always need one to hold the current state")
-	    swa = hp.is_swa(il) ? (int64_t)hp.n_swa * cell_bytes : 0;
+		// one sliding window per SWA layer: fixed cost that always exists
+		// ("we will always need one to hold the current state")
+		state = hp.is_swa(il) ? (int64_t)hp.n_swa * cell_bytes : 0;
 
-	    if (is_mtp_layer) {
-		mtens = weights; mcell = cell_bytes;
-		mtp_rate += cell_bytes; mtp_swa += swa;
-	    } else {
-		tsize = weights; csize = cell_bytes;
-		total_rate += cell_bytes; total_swa += swa;
-	    }
+		if (is_mtp_layer) {
+			mtens = weights; mcell = cell_bytes;
+			mtp_rate += cell_bytes; mtp_state += state;
+		} else {
+			tsize = weights; csize = cell_bytes;
+			total_rate += cell_bytes; total_state += state;
+		}
 	} else {
-	    // recurrent / no-KV layer: its weights deploy with the base model
-	    tsize = is_mtp_layer ? 0 : weights;
-	    mtens = is_mtp_layer ? weights : 0;
+		// recurrent / no-KV layer: its weights deploy with the base model
+		tsize = is_mtp_layer ? 0 : weights;
+		mtens = is_mtp_layer ? weights : 0;
+
+		if (hp.is_recr(il)) {
+			// one snapshot row-set of this recurrent layer's R/S tensors:
+			// the live row and every rollback snapshot cost the same row-set
+			// each (llama-memory-recurrent.cpp allocates n_rows =
+			// mem_size * (1 + n_rs_seq)); r/s are F32 per create_memory,
+			// PLE layers add their conv-history row
+			state  = (int64_t)ggml_row_size(GGML_TYPE_F32, hp.n_embd_r());
+			state += (int64_t)ggml_row_size(GGML_TYPE_F32, hp.n_embd_s());
+			if (hp.ple_conv_state() > 0 && hp.is_ple(il)) {
+				state += (int64_t)ggml_row_size(GGML_TYPE_F32, hp.ple_conv_state());
+			}
+			if (is_mtp_layer) { mtp_state += state; } else { total_state += state; }
+		}
 	}
 
 	char label[16];
 	snprintf(label, sizeof(label), "%u", il);
-	emit_row(label, tsize, mtens, csize, mcell, swa);
+	emit_row(label, tsize, mtens, csize, mcell, state);
     }
 
     for (const auto & [tname, tsize] : other_tensors) {
@@ -310,7 +333,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "%s\n", box("├", "┼", "┤", widths).c_str());
     emit_row("TOTAL", base_weights, has_mtp ? mtp_weights : 0,
              total_rate, has_mtp ? mtp_rate : 0,
-             has_swa ? (total_swa + mtp_swa) : 0);
+             (has_swa || has_ssm) ? (total_state + mtp_state) : 0);
     fprintf(stderr, "%s\n", box("└", "┴", "┘", widths).c_str());
 
     llama_model_free(model);
