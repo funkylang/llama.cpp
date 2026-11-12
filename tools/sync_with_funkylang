@@ -1,0 +1,91 @@
+#!/bin/bash
+# sync_with_funkylang - safe funkylang sync via fast-forward only.
+#
+# No stashes (nothing to resurrect), no reset --hard, no clean -fd:
+# if incoming changes would touch your local work, the script stops and tells you why.
+#
+# Round-trip support: after re-committed patches arrive from rocky2, local and
+# remote have different hashes but identical content — detected via full content
+# comparison and resolved by quietly aligning to origin (nothing changes on disk).
+#
+# NOTE (llama.cpp): the funkylang remote's fetch URL is guarded (push-only via SSH),
+# so fetching goes through the public HTTPS URL and refreshes the tracking ref.
+
+set -u
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT" || exit 1
+
+REMOTE="funkylang"
+FETCH_URL="https://github.com/funkylang/llama.cpp.git"   # public read URL (SSH is push-only)
+
+echo "=== Sync with funkylang ==="
+echo "Repository: $REPO_ROOT"
+echo ""
+
+# --- Step 1: current branch + its upstream ---
+BRANCH=$(git branch --show-current)
+if [ -z "$BRANCH" ]; then
+    echo "Error: Not on a branch (detached HEAD)."
+    exit 1
+fi
+UPSTREAM="${REMOTE}/${BRANCH}"
+if ! git rev-parse --verify "${UPSTREAM}" >/dev/null 2>&1; then
+    UPSTREAM="${REMOTE}/main"
+fi
+echo "[1/4] Branch: $BRANCH  (upstream: $UPSTREAM)"
+
+# --- Step 2: fetch ---
+echo "[2/4] Fetching..."
+git fetch "$FETCH_URL" "main:refs/remotes/${REMOTE}/main" || { echo "Error: Fetch failed."; exit 1; }
+
+LOCAL_HEAD=$(git rev-parse HEAD)
+# Explicit full ref path: short names like "funkylang/main" can be ambiguous when
+# a local branch of the same shape exists (git then resolves to the wrong ref).
+REMOTE_HEAD=$(git rev-parse "refs/remotes/${REMOTE}/main")
+if [ "$LOCAL_HEAD" = "$REMOTE_HEAD" ]; then
+    echo "Already up to date."
+    exit 0
+fi
+
+# --- Step 3a: simple fast-forward (origin ahead, local has nothing unique) ---
+if git merge-base --is-ancestor "$LOCAL_HEAD" "$REMOTE_HEAD"; then
+    CHANGED_LOCAL=$(git status --porcelain | awk '{print $2}' | sort -u)
+    CHANGED_INCOMING=$(git diff --name-only "$LOCAL_HEAD" "$REMOTE_HEAD" | sort -u)
+    CONFLICTS=$(comm -12 <(echo "$CHANGED_LOCAL") <(echo "$CHANGED_INCOMING"))
+
+    if [ -n "$CONFLICTS" ]; then
+        echo "ABORT: Incoming changes touch files you have locally modified or untracked:"
+        echo "$CONFLICTS" | sed 's/^/  /'
+        echo ""
+        echo "Handle them manually (commit, save elsewhere, or discard your copy), then re-run."
+        exit 1
+    fi
+
+    echo "[3/4] Fast-forwarding..."
+    git merge --ff-only "refs/remotes/${REMOTE}/main" || { echo "Error: Fast-forward failed."; exit 1; }
+else
+    # --- Step 3b: round-trip duplicates (different hashes, identical content) ---
+    if git diff --quiet HEAD "$REMOTE_HEAD"; then
+        N=$(git rev-list "$REMOTE_HEAD..HEAD" | wc -l)
+        echo "[3/4] Round-trip detected: $N local commit(s) already on $UPSTREAM with identical content."
+        echo "      Aligning local ref to $UPSTREAM (nothing changes on disk)."
+        git reset --soft "$REMOTE_HEAD" || { echo "Error: Could not align to $UPSTREAM."; exit 1; }
+    else
+        # --- Step 3c: true divergence with different content ---
+        echo "ABORT: Branches have diverged with DIFFERENT content."
+        echo ""
+        echo "  Local-only commits:"
+        git log --oneline "$REMOTE_HEAD..HEAD" | sed 's/^/    /'
+        echo ""
+        echo "  Remote-only commits:"
+        git log --oneline "HEAD..$REMOTE_HEAD" | sed 's/^/    /'
+        echo ""
+        echo "Resolve manually (commit your work, or pull the remote line in), then re-run."
+        exit 1
+    fi
+fi
+
+echo ""
+echo "[4/4] Done. Latest commits:"
+git log --oneline -3
