@@ -11,6 +11,8 @@
 //   3. KV cell bytes per layer from architecture metadata
 //      - hybrid models: only non-recurrent layers allocate unified pool KV
 //      - quantized KV types: block-rounded via ggml_row_size (allocator-identical)
+//        cache type is selectable on the CLI like llama-server:
+//          -ctk/--cache-type-k, -ctv/--cache-type-v  (default f16 for both)
 //   4. fixed per-layer state in the swa/ssm column:
 //      - SWA attention layers: one sliding window = n_swa x cell_bytes
 //      - recurrent (SSM) layers: one snapshot row-set of R/S tensors
@@ -48,23 +50,36 @@
 
 static const int NUM_COL_W = 13; // numeric column cell width (incl. side padding)
 
-static const char * type_name(int t) {
-    switch (t) {
-	case GGML_TYPE_F16:  return "f16";
-	case GGML_TYPE_Q8_0: return "q8_0";
-	case GGML_TYPE_Q4_0: return "q4_0";
-	case GGML_TYPE_F32:  return "f32";
-	default:             return ggml_type_name((ggml_type)t);
+// same allowed KV cache types as llama-server (common/arg.cpp)
+static const std::vector<ggml_type> kv_cache_types = {
+    GGML_TYPE_F32,
+    GGML_TYPE_F16,
+    GGML_TYPE_BF16,
+    GGML_TYPE_Q8_0,
+    GGML_TYPE_Q4_0,
+    GGML_TYPE_Q4_1,
+    GGML_TYPE_IQ4_NL,
+    GGML_TYPE_Q5_0,
+    GGML_TYPE_Q5_1,
+};
+
+static ggml_type kv_cache_type_from_str(const char * s) {
+    for (const auto & type : kv_cache_types) {
+        if (!strcmp(ggml_type_name(type), s)) {
+            return type;
+        }
     }
+    fprintf(stderr, "Unsupported cache type: %s\n", s);
+    exit(1);
 }
 
-static bool set_kv_type(const char * s, ggml_type & out) {
-    if      (!strcmp(s, "f16"))   { out = GGML_TYPE_F16;  return true; }
-    else if (!strcmp(s, "q8_0"))  { out = GGML_TYPE_Q8_0; return true; }
-    else if (!strcmp(s, "q4_0"))  { out = GGML_TYPE_Q4_0; return true; }
-    else if (!strcmp(s, "f32"))   { out = GGML_TYPE_F32;  return true; }
-    fprintf(stderr, "unknown kv type '%s', keeping current\n", s);
-    return false;
+static std::string all_kv_cache_types() {
+    std::string msg;
+    for (const auto & type : kv_cache_types) {
+        if (!msg.empty()) msg += ", ";
+        msg += ggml_type_name(type);
+    }
+    return msg;
 }
 
 static void log_callback_quiet(enum ggml_log_level, const char *, void *) {}
@@ -116,9 +131,10 @@ static std::string header_row(const std::vector<const char *> & hdr,
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
-	fprintf(stderr, "usage: %s <model.gguf> [-type-k f16|q8_0] [-type-v f16|q8_0]\n"
-			"                       [-flash-attn|-no-flash-attn]\n", argv[0]);
-	return 1;
+        fprintf(stderr, "usage: %s <model.gguf> [-ctk|--cache-type-k TYPE] [-ctv|--cache-type-v TYPE]\n"
+                        "                       [-flash-attn|-no-flash-attn]\n"
+                        "  allowed cache types: %s\n", argv[0], all_kv_cache_types().c_str());
+        return 1;
     }
 
     const char * path = argv[1];
@@ -126,11 +142,11 @@ int main(int argc, char ** argv) {
     bool flash_attn = true;
 
     for (int a = 2; a < argc; a++) {
-	std::string arg = argv[a];
-	if      (arg == "-type-k")         set_kv_type(argv[++a], type_k);
-	else if (arg == "-type-v")         set_kv_type(argv[++a], type_v);
-	else if (arg == "-flash-attn")     flash_attn = true;
-	else if (arg == "-no-flash-attn")  flash_attn = false;
+        std::string arg = argv[a];
+        if      (arg == "-ctk" || arg == "--cache-type-k") type_k = kv_cache_type_from_str(argv[++a]);
+        else if (arg == "-ctv" || arg == "--cache-type-v") type_v = kv_cache_type_from_str(argv[++a]);
+        else if (arg == "-flash-attn")                     flash_attn = true;
+        else if (arg == "-no-flash-attn")                  flash_attn = false;
     }
 
     const bool v_trans = !flash_attn;
@@ -221,8 +237,8 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "  SWA:        %s\n", has_swa ? "yes" : "no");
     fprintf(stderr, "  SSM:        %s\n", has_ssm ? "yes" : "no");
     fprintf(stderr, "  MTP:        %s\n", has_mtp ? "yes" : "no");
-    fprintf(stderr, "  kv_type_k:  %s\n", type_name(type_k));
-    fprintf(stderr, "  kv_type_v:  %s\n", type_name(type_v));
+    fprintf(stderr, "  kv_type_k:  %s\n", ggml_type_name(type_k));
+    fprintf(stderr, "  kv_type_v:  %s\n", ggml_type_name(type_v));
 
     // the token embedding ALWAYS stays on the CPU (llama-model.cpp: "there is
     // very little benefit to offloading the input layer") — it is not part of
