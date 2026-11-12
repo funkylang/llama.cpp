@@ -105,6 +105,13 @@ static std::string gib_str(size_t bytes) {
     return buf;
 }
 
+// Exact byte count; plain format so values are copy-pasteable into spreadsheets as-is
+static std::string bytes_str(size_t bytes) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%zu", bytes);
+    return buf;
+}
+
 struct dev_snapshot { size_t free_bytes = 0, total_bytes = 0; bool ok = false; };
 
 static void read_all_devices(std::vector<dev_snapshot> & snaps) {
