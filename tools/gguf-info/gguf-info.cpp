@@ -3,7 +3,11 @@
 // Reads GGUF file directly for tensor sizes + loads model (no weights) for
 // architecture hparams to compute:
 //   1. model parameters (name, arch, KV types)
-//   2. tensor weight sizes per layer (+ embed/norm global tensors)
+//   2. what must be DISTRIBUTED TO THE GPUS — the table shows exactly those
+//      bytes: layers, norm/output globals, and any other deployed non-blk
+//      tensors; the input embedding always stays on CPU (shown separately as
+//      embed(CPU)) EXCEPT tied models, where its lm_head copy joins the table
+//      as the last row
 //   3. KV cell bytes per layer from architecture metadata
 //      - hybrid models: only non-recurrent layers allocate unified pool KV
 //      - quantized KV types: block-rounded via ggml_row_size (allocator-identical)
@@ -14,9 +18,8 @@
 //      by the loader unless load_mtp, and their KV pool is a separate context;
 //      base deployment cost (non-mtp) and the ADDITIONAL mtp cost are both
 //      visible at a glance
-//   6. totals — TOTAL equals the exact sum of all GGUF tensors in the file;
-//      it is built from a code accumulator over the printed rows, so it always
-//      matches the sum of the visible rows (no hidden tensors)
+//   6. totals — TOTAL is built from a code accumulator over the printed rows,
+//      so it always matches the sum of the visible rows (no hidden tensors)
 //
 // Table columns (fixed order, optional ones conditional on model capability):
 //   layer | tensor size | [mtp tensor] | cell size | [mtp cell] | [swa/ssm]
@@ -221,6 +224,16 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "  kv_type_k:  %s\n", type_name(type_k));
     fprintf(stderr, "  kv_type_v:  %s\n", type_name(type_v));
 
+    // the token embedding ALWAYS stays on the CPU (llama-model.cpp: "there is
+    // very little benefit to offloading the input layer") — it is not part of
+    // what gets distributed to GPUs, so it is shown here, outside the table.
+    // EXCEPTION: tied models (no separate output.weight) get a second copy as
+    // the lm_head on the output device — that copy appears as the LAST ROW of
+    // the table (the bytes to distribute).
+    if (embed_bytes > 0) {
+        fprintf(stderr, "  embed(CPU): %lld\n", (long long)embed_bytes);
+    }
+
     // ---- table layout: mtp + swa/ssm columns are capability-driven ----------
     // col 0 is sized to fit every label that will be printed (layer numbers,
     // embed/norm/output/TOTAL, and any exotic global tensor names)
@@ -266,10 +279,6 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "%s\n", box("┌", "┬", "┐", widths).c_str());
     fprintf(stderr, "%s\n", header_row(hdr, widths).c_str());
     fprintf(stderr, "%s\n", box("├", "┼", "┤", widths).c_str());
-
-    if (embed_bytes > 0) {
-        emit_row("embed", embed_bytes, 0, 0, 0, 0);
-    }
 
     for (uint32_t il = 0; il < n_layer_all; il++) {
 	int64_t weights = layer_weights[il];
@@ -339,6 +348,12 @@ int main(int argc, char ** argv) {
     }
     for (const auto & [tname, tsize] : other_tensors) {
         emit_row(tname.c_str(), tsize, 0, 0, 0, 0);
+    }
+    // tied lm_head: without a separate output tensor the loader duplicates the
+    // token embedding as an OUTPUT tensor (llama-model-loader.cpp:1174) — that
+    // GPU copy is part of what must be distributed, hence this last row.
+    if (output_bytes == 0 && embed_bytes > 0) {
+        emit_row("embed", embed_bytes, 0, 0, 0, 0);
     }
 
     // ---- totals: exactly the sum of the rows printed above ------------------
