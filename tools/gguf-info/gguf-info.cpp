@@ -24,7 +24,10 @@
 //      so it always matches the sum of the visible rows (no hidden tensors)
 //
 // Table columns (fixed order, optional ones conditional on model capability):
-//   layer | tensor size | [mtp tensor] | cell size | [mtp cell] | [swa/ssm]
+//   layer | tensor size | [moe] | [mtp tensor] | cell size | [mtp cell] | [swa/ssm]
+//   - moe column (1/0 per layer) only if the model has MoE; TOTAL row shows
+//     the count of base-model MoE layers. The header also prints a compact
+//     layer scheme of dense (d) and MoE runs plus expert count / top-k.
 //   - mtp columns only if the model has nextn/MTP layers (n_layer_nextn > 0)
 //   - swa/ssm column (always last) only if the model has SWA or recurrent
 //     layers: per-layer fixed state cost — "we will always need one to hold
@@ -171,6 +174,12 @@ int main(int argc, char ** argv) {
 
     int64_t n_tensors = gguf_get_n_tensors(ctx);
     std::map<int, int64_t> layer_weights;
+    // per-layer routed-expert flags derived from the GGUF tensor names —
+    // needed because some architectures (e.g. granite-hybrid) never fill
+    // n_ff_exp_arr and key their experts off a global n_expert only.
+    // Expert tensors: ffn_{gate,up,down}_exps (packed 3D) or the per-expert
+    // naming ffn_{gate,up,down}.<exp_id>
+    std::vector<bool> layer_has_exps;
     // global tensors (outside blk.*), each one a visible table row:
     //   token_embd.weight  -> "embed"  row (before layer 0)
     //   output_norm.weight -> "norm"   row (after the last layer)
@@ -193,7 +202,18 @@ int main(int argc, char ** argv) {
 	    const char * p = strstr(tname, "blk.");
 	    sscanf(p + 4, "%d", &il);
 	}
-	if (il >= 0) { layer_weights[il] += tsize; continue; }
+	if (il >= 0) {
+	    layer_weights[il] += tsize;
+	    // routed-expert tensors mark this layer as MoE (see note above)
+	    const bool exp_tensor = strstr(tname, "ffn_gate_exp") || strstr(tname, "ffn_up_exp") ||
+	                            strstr(tname, "ffn_down_exp") || strstr(tname, "ffn_gate.") ||
+	                            strstr(tname, "ffn_up.") || strstr(tname, "ffn_down.");
+	    if (exp_tensor) {
+	        if (il >= (int)layer_has_exps.size()) layer_has_exps.resize(il + 1, false);
+	        layer_has_exps[il] = true;
+	    }
+	    continue;
+	}
 
 	other_tensors.emplace_back(tname, (int64_t)tsize);
     }
@@ -218,6 +238,12 @@ int main(int argc, char ** argv) {
     const uint32_t n_layer_all   = hp.n_layer_all;
     const uint32_t n_layer_nextn = hp.n_layer_nextn;
 
+    // per-layer MoE predicate: hparams experts OR expert tensors in the file
+    const auto is_moe_layer = [&](uint32_t il) -> bool {
+        return hp.n_ff_exp(il) > 0 ||
+               (il < layer_has_exps.size() && layer_has_exps[il]);
+    };
+
     // ---- capabilities -------------------------------------------------------
     const bool has_moe = hp.n_expert > 0;
     const bool has_mtp = n_layer_nextn > 0;
@@ -233,7 +259,31 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "  name:       %s\n", name ? name : "(unknown)");
     fprintf(stderr, "  arch:       %s\n", arch ? arch : llm_arch_name(model->arch));
     fprintf(stderr, "  layers:     %u (all)\n", (unsigned)n_layer_all);
-    fprintf(stderr, "  MoE:        %s\n", has_moe ? "yes" : "no");
+
+    // ---- MoE scheme -----------------------------------------------------------
+    // per-layer MoE membership = has routed experts (n_ff_exp(il) > 0);
+    // dense runs and MoE runs are reported as compact layer ranges
+    {
+        bool any_dense = false;
+        std::string scheme;
+        for (uint32_t il = 0; il < n_layer_all; ) {
+            const bool moe_layer = is_moe_layer(il);
+            uint32_t j = il;
+            while (j < n_layer_all && is_moe_layer(j) == moe_layer) ++j;
+            char range[48];
+            snprintf(range, sizeof(range), "%s%u-%u", scheme.empty() ? "" : " ", il, j - 1);
+            scheme += moe_layer ? range : std::string("d") + range; // 'd' = dense run
+            if (!moe_layer) any_dense = true;
+            il = j;
+        }
+        if (has_moe) {
+            fprintf(stderr, "  MoE:        yes (%u experts, top-%u)%s\n",
+                    (unsigned)hp.n_expert, (unsigned)hp.n_expert_used_max(),
+                    any_dense ? (" scheme: " + scheme).c_str() : "");
+        } else {
+            fprintf(stderr, "  MoE:        no\n");
+        }
+    }
     fprintf(stderr, "  SWA:        %s\n", has_swa ? "yes" : "no");
     fprintf(stderr, "  SSM:        %s\n", has_ssm ? "yes" : "no");
     fprintf(stderr, "  MTP:        %s\n", has_mtp ? "yes" : "no");
@@ -264,6 +314,7 @@ int main(int argc, char ** argv) {
     std::vector<int> widths;
     hdr.push_back("layer");       widths.push_back(col0_w); // label/layer column
     hdr.push_back("tensor size"); widths.push_back(NUM_COL_W);
+    if (has_moe) { hdr.push_back("moe"); widths.push_back(5); }
     if (has_mtp) { hdr.push_back("mtp tensor"); widths.push_back(NUM_COL_W); }
     hdr.push_back("cell size");   widths.push_back(NUM_COL_W);
     if (has_mtp) { hdr.push_back("mtp cell");   widths.push_back(NUM_COL_W); }
@@ -274,17 +325,19 @@ int main(int argc, char ** argv) {
     // so TOTAL always equals the sum of the visible rows — no hidden tensors.
     int64_t printed_base = 0, printed_mtp = 0;
 
-    auto emit_row = [&](const char * label, int64_t tsize, int64_t mtens,
-                        int64_t csize, int64_t mcell, int64_t state) {
+    auto emit_row = [&](const char * label, int64_t tsize, int moe_flag,
+                        int64_t mtens, int64_t csize, int64_t mcell,
+                        int64_t state) {
         std::vector<int64_t> vals;
-        vals.push_back(0);                     // slot 0 is the label (unused)
-        vals.push_back(tsize);                 // tensor size        (always)
-        if (has_mtp) vals.push_back(mtens);    // mtp tensor         (optional)
-        vals.push_back(csize);                 // cell size          (always)
-        if (has_mtp) vals.push_back(mcell);    // mtp cell           (optional)
-        if (has_swa || has_ssm) vals.push_back(state); // swa/ssm     (optional, last)
+        vals.push_back(0);                              // slot 0 is the label (unused)
+        vals.push_back(tsize);                          // tensor size        (always)
+        if (has_moe) vals.push_back(moe_flag);          // moe flag           (optional)
+        if (has_mtp) vals.push_back(mtens);             // mtp tensor         (optional)
+        vals.push_back(csize);                          // cell size          (always)
+        if (has_mtp) vals.push_back(mcell);             // mtp cell           (optional)
+        if (has_swa || has_ssm) vals.push_back(state);  // swa/ssm            (optional, last)
         fprintf(stderr, "%s\n", data_row(label, vals, widths).c_str());
-        printed_base += tsize;                 // accumulate what was printed
+        printed_base += tsize;                          // accumulate what was printed
         printed_mtp  += mtens;
     };
 
@@ -351,33 +404,40 @@ int main(int argc, char ** argv) {
 
 	char label[16];
 	snprintf(label, sizeof(label), "%u", il);
-	emit_row(label, tsize, mtens, csize, mcell, state);
+	emit_row(label, tsize, is_moe_layer(il) ? 1 : 0, mtens, csize, mcell, state);
     }
 
     // globals after the last layer, in data flow order:
     // norm -> output (lm_head); any remaining non-blk tensors each get a row
     if (norm_bytes > 0) {
-        emit_row("norm", norm_bytes, 0, 0, 0, 0);
+        emit_row("norm", norm_bytes, 0, 0, 0, 0, 0);
     }
     if (output_bytes > 0) {
-        emit_row("output", output_bytes, 0, 0, 0, 0);
+        emit_row("output", output_bytes, 0, 0, 0, 0, 0);
     }
     for (const auto & [tname, tsize] : other_tensors) {
-        emit_row(tname.c_str(), tsize, 0, 0, 0, 0);
+        emit_row(tname.c_str(), tsize, 0, 0, 0, 0, 0);
     }
     // tied lm_head: without a separate output tensor the loader duplicates the
     // token embedding as an OUTPUT tensor (llama-model-loader.cpp:1174) — that
     // GPU copy is part of what must be distributed, hence this last row.
     if (output_bytes == 0 && embed_bytes > 0) {
-        emit_row("embed", embed_bytes, 0, 0, 0, 0);
+        emit_row("embed", embed_bytes, 0, 0, 0, 0, 0);
     }
 
     // ---- totals: exactly the sum of the rows printed above ------------------
+    // the moe column total = count of base-model MoE layers (mtp excluded,
+    // matching how the mtp columns are an ADDITIONAL cost)
+    int64_t total_moe = 0;
+    for (uint32_t il = 0; il < n_layer_all - n_layer_nextn; ++il) {
+        if (is_moe_layer(il)) ++total_moe;
+    }
     fprintf(stderr, "%s\n", box("├", "┼", "┤", widths).c_str());
     {
         std::vector<int64_t> vals;
         vals.push_back(0);                          // label slot (unused)
         vals.push_back(printed_base);               // sum of visible rows
+        if (has_moe) vals.push_back(total_moe);     // moe layer count
         if (has_mtp) vals.push_back(printed_mtp);
         vals.push_back(total_rate);
         if (has_mtp) vals.push_back(mtp_rate);
