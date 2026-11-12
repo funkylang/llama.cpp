@@ -8,9 +8,16 @@
 //      - hybrid models: only non-recurrent layers allocate unified pool KV
 //      - quantized KV types: block-rounded via ggml_row_size (allocator-identical)
 //   4. SWA window size per layer: one sliding window = n_swa x cell_bytes
-//   5. MTP/nextn layers reported separately (they belong to the MTP context,
-//      not the main unified pool)
+//   5. MTP/nextn usage in dedicated mtp columns — their weights are skipped
+//      by the loader unless load_mtp, and their KV pool is a separate context;
+//      base deployment cost (non-mtp) and the ADDITIONAL mtp cost are both
+//      visible at a glance
 //   6. totals — tensor TOTAL equals the exact sum of all GGUF tensors
+//
+// Table columns (fixed order, optional ones conditional on model capability):
+//   layer | tensor size | [mtp tensor] | cell size | [mtp cell] | [swa size]
+//   - mtp columns only if the model has nextn/MTP layers (n_layer_nextn > 0)
+//   - swa column (always last) only if the model has SWA layers
 
 #include "ggml.h"
 #include "gguf.h"
@@ -24,6 +31,8 @@
 #include <string>
 #include <map>
 #include <vector>
+
+static const int NUM_COL_W = 13; // numeric column cell width (incl. side padding)
 
 static const char * type_name(int t) {
     switch (t) {
@@ -45,6 +54,51 @@ static bool set_kv_type(const char * s, ggml_type & out) {
 }
 
 static void log_callback_quiet(enum ggml_log_level, const char *, void *) {}
+
+// ---- table printing -----------------------------------------------------------
+// widths[] holds per-column cell width INCLUDING the 1-space padding on each
+// side of the content. Column 0 is a left-aligned label; all others are
+// right-aligned numbers.
+
+static std::string box(const char * tl, const char * mid, const char * tr,
+                       const std::vector<int> & widths) {
+    std::string s(tl);
+    for (size_t i = 0; i < widths.size(); ++i) {
+        if (i > 0) s += mid;
+        for (int j = 0; j < widths[i]; ++j) s += "─";
+    }
+    return s + tr;
+}
+
+static std::string data_row(const char * label, const std::vector<int64_t> & vals,
+                            const std::vector<int> & widths) {
+    std::string s("│");
+    const int l = (int)strlen(label);
+    // col 0: right-aligned (layer numbers and labels share the column)
+    s += std::string(widths[0] - 1 - l, ' ') + label + " │";
+    for (size_t i = 1; i < vals.size(); ++i) {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%lld", (long long)vals[i]);
+        const int n = (int)strlen(buf);
+        s += std::string(widths[i] - n - 1, ' ') + buf + " │";
+    }
+    return s;
+}
+
+static std::string header_row(const std::vector<const char *> & hdr,
+                              const std::vector<int> & widths) {
+    std::string s("│");
+    for (size_t i = 0; i < hdr.size(); ++i) {
+        const int l = (int)strlen(hdr[i]);
+        // visually centered over the full width; " │" supplies one right
+        // padding space, so subtract it from pad_r. On uneven padding the
+        // text leans left:
+        const int pad_l = (widths[i] - l) / 2;
+        const int pad_r = widths[i] - l - pad_l - 1;
+        s += std::string(pad_l, ' ') + hdr[i] + std::string(pad_r, ' ') + " │";
+    }
+    return s;
+}
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
@@ -126,7 +180,7 @@ int main(int argc, char ** argv) {
     }
 
     const auto & hp = model->hparams;
-    const uint32_t n_layer_all = hp.n_layer_all;
+    const uint32_t n_layer_all   = hp.n_layer_all;
     const uint32_t n_layer_nextn = hp.n_layer_nextn;
 
     // ---- parameters ---------------------------------------------------------
@@ -138,7 +192,6 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "  kv_type_k:  %s\n", type_name(type_k));
     fprintf(stderr, "  kv_type_v:  %s\n", type_name(type_v));
 
-    // ---- per-layer table with block characters ------------------------------
     if (!other_tensors.empty()) {
 	fprintf(stderr, "\n");
 	for (const auto & [tname, tsize] : other_tensors) {
@@ -146,60 +199,93 @@ int main(int argc, char ** argv) {
 	}
     }
 
-    fprintf(stderr, "\n");
-    fprintf(stderr, "┌───────┬─────────────┬───────────┬───────────┐\n");
-    fprintf(stderr, "│ layer │ tensor size │ cell size │ swa size  │\n");
-    fprintf(stderr, "├───────┼─────────────┼───────────┼───────────┤\n");
+    // ---- table layout: mtp + swa columns are capability-driven --------------
+    const bool has_mtp = n_layer_nextn > 0;
+    bool has_swa = false;
+    for (uint32_t il = 0; il < n_layer_all && !has_swa; ++il) {
+        has_swa = hp.is_swa(il);
+    }
+
+    std::vector<const char *> hdr;
+    std::vector<int> widths;
+    hdr.push_back("layer");       widths.push_back(7);   // label/layer column
+    hdr.push_back("tensor size"); widths.push_back(NUM_COL_W);
+    if (has_mtp) { hdr.push_back("mtp tensor"); widths.push_back(NUM_COL_W); }
+    hdr.push_back("cell size");   widths.push_back(NUM_COL_W);
+    if (has_mtp) { hdr.push_back("mtp cell");   widths.push_back(NUM_COL_W); }
+    if (has_swa) { hdr.push_back("swa size");   widths.push_back(NUM_COL_W); }
+
+    auto emit_row = [&](const char * label, int64_t tsize, int64_t mtens,
+                        int64_t csize, int64_t mcell, int64_t swa) {
+        std::vector<int64_t> vals;
+        vals.push_back(0);                     // slot 0 is the label (unused)
+        vals.push_back(tsize);                 // tensor size        (always)
+        if (has_mtp) vals.push_back(mtens);    // mtp tensor         (optional)
+        vals.push_back(csize);                 // cell size          (always)
+        if (has_mtp) vals.push_back(mcell);    // mtp cell           (optional)
+        if (has_swa) vals.push_back(swa);      // swa size           (optional, last)
+        fprintf(stderr, "%s\n", data_row(label, vals, widths).c_str());
+    };
 
     int64_t total_weights = 0;
-    int64_t total_rate = 0, total_swa = 0;
-    int64_t mtp_weights = 0, mtp_rate = 0, mtp_swa = 0;
+    int64_t mtp_weights = 0;
+    int64_t total_rate = 0, mtp_rate = 0;
+    int64_t total_swa = 0, mtp_swa = 0;
+
+    fprintf(stderr, "\n");
+    fprintf(stderr, "%s\n", box("┌", "┬", "┐", widths).c_str());
+    fprintf(stderr, "%s\n", header_row(hdr, widths).c_str());
+    fprintf(stderr, "%s\n", box("├", "┼", "┤", widths).c_str());
 
     if (embed_bytes > 0) {
-        fprintf(stderr, "│ embed │ %11lld │         0 │         0 │\n", (long long)embed_bytes);
+        emit_row("embed", embed_bytes, 0, 0, 0, 0);
         total_weights += embed_bytes;
     }
 
     for (uint32_t il = 0; il < n_layer_all; il++) {
 	int64_t weights = layer_weights[il];
-	total_weights += weights;
-
 	const bool is_mtp_layer = il >= (n_layer_all - n_layer_nextn);
+
+	// base deployment cost: without MTP, nextn layers are neither loaded
+	// (load_mtp=false -> TENSOR_SKIP) nor executed — their weights and KV
+	// appear in the mtp columns as the ADDITIONAL cost when MTP is enabled.
+	total_weights += weights;
+	if (is_mtp_layer) { mtp_weights += weights; }
+
+	int64_t tsize = 0, mtens = 0, csize = 0, mcell = 0, swa = 0;
 
 	// Skip layers without KV cache OR recurrent layers (hybrid models) —
 	// they don't allocate unified pool KV cells
-	if (!hp.has_kv(il) || hp.is_recr(il)) {
-	    fprintf(stderr, "│ %5u │ %11lld │         0 │         0 │\n",
-		    (unsigned)il, (long long)weights);
-	    continue;
-	}
+	if (hp.has_kv(il) && !hp.is_recr(il)) {
+	    // block-rounded rows: identical to what the allocator computes,
+	    // correct for quantized KV types (q8_0 packs 32 elements + scale)
+	    const uint32_t n_embd_k = hp.n_embd_k_gqa(il);
+	    const uint32_t n_embd_v = v_trans ? hp.n_embd_v_gqa_max() : hp.n_embd_v_gqa(il);
 
-	// block-rounded rows: identical to what the allocator computes,
-	// correct for quantized KV types (q8_0 packs 32 elements + scale)
-	const uint32_t n_embd_k = hp.n_embd_k_gqa(il);
-	const uint32_t n_embd_v = v_trans ? hp.n_embd_v_gqa_max() : hp.n_embd_v_gqa(il);
+	    int64_t k_bytes = ggml_row_size(type_k, n_embd_k);
+	    int64_t v_bytes = hp.is_mla() ? 0 : (int64_t)ggml_row_size(type_v, n_embd_v);
+	    int64_t cell_bytes = k_bytes + v_bytes;
 
-	int64_t k_bytes = ggml_row_size(type_k, n_embd_k);
-	int64_t v_bytes = hp.is_mla() ? 0 : (int64_t)ggml_row_size(type_v, n_embd_v);
-	int64_t cell_bytes = k_bytes + v_bytes;
+	    // one sliding window per SWA layer: fixed cost that always exists
+	    // ("we will always need one to hold the current state")
+	    swa = hp.is_swa(il) ? (int64_t)hp.n_swa * cell_bytes : 0;
 
-	// one sliding window per SWA layer: fixed cost that always exists
-	// ("we will always need one to hold the current state")
-	int64_t swa_bytes = hp.is_swa(il) ? (int64_t)hp.n_swa * cell_bytes : 0;
-
-	if (is_mtp_layer) {
-	    // nextn/MTP layers belong to the MTP context, not the main pool
-	    mtp_weights += weights;
-	    mtp_rate    += cell_bytes;
-	    mtp_swa     += swa_bytes;
+	    if (is_mtp_layer) {
+		mtens = weights; mcell = cell_bytes;
+		mtp_rate += cell_bytes; mtp_swa += swa;
+	    } else {
+		tsize = weights; csize = cell_bytes;
+		total_rate += cell_bytes; total_swa += swa;
+	    }
 	} else {
-	    total_rate += cell_bytes;
-	    total_swa  += swa_bytes;
+	    // recurrent / no-KV layer: its weights deploy with the base model
+	    tsize = is_mtp_layer ? 0 : weights;
+	    mtens = is_mtp_layer ? weights : 0;
 	}
 
-	fprintf(stderr, "│ %5u │ %11lld │ %9lld │ %9lld │%s\n",
-		(unsigned)il, (long long)weights, (long long)cell_bytes,
-		(long long)swa_bytes, is_mtp_layer ? "  (mtp)" : "");
+	char label[16];
+	snprintf(label, sizeof(label), "%u", il);
+	emit_row(label, tsize, mtens, csize, mcell, swa);
     }
 
     for (const auto & [tname, tsize] : other_tensors) {
@@ -207,20 +293,17 @@ int main(int argc, char ** argv) {
     }
 
     if (norm_bytes > 0) {
-        fprintf(stderr, "│  norm │ %11lld │         0 │         0 │\n", (long long)norm_bytes);
+        emit_row("norm", norm_bytes, 0, 0, 0, 0);
         total_weights += norm_bytes;
     }
 
-    if (n_layer_nextn > 0) {
-	fprintf(stderr, "│  mtp  │ %11lld │ %9lld │ %9lld │\n",
-		(long long)mtp_weights, (long long)mtp_rate, (long long)mtp_swa);
-    }
-
     // ---- totals -------------------------------------------------------------
-    fprintf(stderr, "├───────┼─────────────┼───────────┼───────────┤\n");
-    fprintf(stderr, "│ TOTAL │ %11lld │ %9lld │ %9lld │\n",
-        (long long)total_weights, (long long)total_rate, (long long)total_swa);
-    fprintf(stderr, "└───────┴─────────────┴───────────┴───────────┘\n");
+    int64_t base_weights = total_weights - mtp_weights;
+    fprintf(stderr, "%s\n", box("├", "┼", "┤", widths).c_str());
+    emit_row("TOTAL", base_weights, has_mtp ? mtp_weights : 0,
+             total_rate, has_mtp ? mtp_rate : 0,
+             has_swa ? (total_swa + mtp_swa) : 0);
+    fprintf(stderr, "%s\n", box("└", "┴", "┘", widths).c_str());
 
     llama_model_free(model);
     gguf_free(ctx);
