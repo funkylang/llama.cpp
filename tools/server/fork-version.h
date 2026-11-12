@@ -4,4 +4,4 @@
 // updated on every fork commit with the ACTUAL current time at update (strict ordering);
 // printed as the first startup message of llama-server so the running build can be identified
 
-static const char * FORK_VERSION = "2026-11-12 12:23:27 gguf-info: mtp tensor/cell columns per model capability";
+static const char * FORK_VERSION = "2026-11-12 15:49:22 gguf-info: MoE/SWA/MTP capability block in header; rename swa column";

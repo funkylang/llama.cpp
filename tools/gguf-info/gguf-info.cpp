@@ -15,9 +15,11 @@
 //   6. totals — tensor TOTAL equals the exact sum of all GGUF tensors
 //
 // Table columns (fixed order, optional ones conditional on model capability):
-//   layer | tensor size | [mtp tensor] | cell size | [mtp cell] | [swa size]
+//   layer | tensor size | [mtp tensor] | cell size | [mtp cell] | [swa]
 //   - mtp columns only if the model has nextn/MTP layers (n_layer_nextn > 0)
-//   - swa column (always last) only if the model has SWA layers
+//   - swa column (always last) only if the model has SWA layers:
+//     one sliding-window checkpoint per (SWA) layer = n_swa x cell_bytes —
+//     "we will always need one to hold the current state"
 
 #include "ggml.h"
 #include "gguf.h"
@@ -183,12 +185,23 @@ int main(int argc, char ** argv) {
     const uint32_t n_layer_all   = hp.n_layer_all;
     const uint32_t n_layer_nextn = hp.n_layer_nextn;
 
+    // ---- capabilities -------------------------------------------------------
+    const bool has_moe = hp.n_expert > 0;
+    const bool has_mtp = n_layer_nextn > 0;
+    bool has_swa = false;
+    for (uint32_t il = 0; il < n_layer_all && !has_swa; ++il) {
+        has_swa = hp.is_swa(il);
+    }
+
     // ---- parameters ---------------------------------------------------------
     fprintf(stderr, "\n");
     fprintf(stderr, "  file:       %s\n", path);
     fprintf(stderr, "  name:       %s\n", name ? name : "(unknown)");
     fprintf(stderr, "  arch:       %s\n", arch ? arch : llm_arch_name(model->arch));
     fprintf(stderr, "  layers:     %u (all)\n", (unsigned)n_layer_all);
+    fprintf(stderr, "  MoE:        %s\n", has_moe ? "yes" : "no");
+    fprintf(stderr, "  SWA:        %s\n", has_swa ? "yes" : "no");
+    fprintf(stderr, "  MTP:        %s\n", has_mtp ? "yes" : "no");
     fprintf(stderr, "  kv_type_k:  %s\n", type_name(type_k));
     fprintf(stderr, "  kv_type_v:  %s\n", type_name(type_v));
 
@@ -200,11 +213,6 @@ int main(int argc, char ** argv) {
     }
 
     // ---- table layout: mtp + swa columns are capability-driven --------------
-    const bool has_mtp = n_layer_nextn > 0;
-    bool has_swa = false;
-    for (uint32_t il = 0; il < n_layer_all && !has_swa; ++il) {
-        has_swa = hp.is_swa(il);
-    }
 
     std::vector<const char *> hdr;
     std::vector<int> widths;
@@ -213,7 +221,7 @@ int main(int argc, char ** argv) {
     if (has_mtp) { hdr.push_back("mtp tensor"); widths.push_back(NUM_COL_W); }
     hdr.push_back("cell size");   widths.push_back(NUM_COL_W);
     if (has_mtp) { hdr.push_back("mtp cell");   widths.push_back(NUM_COL_W); }
-    if (has_swa) { hdr.push_back("swa size");   widths.push_back(NUM_COL_W); }
+    if (has_swa) { hdr.push_back("swa");            widths.push_back(NUM_COL_W); }
 
     auto emit_row = [&](const char * label, int64_t tsize, int64_t mtens,
                         int64_t csize, int64_t mcell, int64_t swa) {
