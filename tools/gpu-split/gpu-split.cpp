@@ -1,15 +1,19 @@
 // [FORK] gpu-split — GPU device scan + device placement & KV pool planner
 //
-// Current stage: DEVICE SCAN (STEP 0 of concept-gpu-split-tool.md)
-//   Enumerates every device the ggml backend registry sees and prints its
-//   VRAM in two phases: free (raw, nothing loaded) and after-init (after model +
-//   context initialization — kernels/shaders upload, compute buffers allocate;
-//   the fixed overhead of any deployment). Tensors are NOT loaded and no
-//   deployment-sized KV cache is allocated. CPU has no such phase: both columns
-//   measure the same thing.
-//   The split solver (phases 2-5 of the concept doc) builds on this; the
-//   GGUF/hparams table code below is carried over from llama-gguf-info so
-//   both tools share the same accounting logic.
+// The tool ALWAYS measures (Michael, 2026-11-13): it is an offline planning
+// tool run when deployment is being set up, so paying for a real model load is
+// correct. It never does a "fake" no_alloc probe load:
+//   1. scan devices → raw free VRAM (nothing loaded yet)
+//   2. REAL model load with the DEFAULT split — llama_model's native
+//      auto-split-by-free-VRAM places layers, exactly as production does
+//   3. small context + warmup decode over the real weights → every kernel the
+//      deployment will launch is uploaded (kernels only materialize on first
+//      execution — concept §17)
+//   4. scan devices again → per-GPU delta = the kernel/shader overhead of a
+//      live deployment
+// The GGUF/hparams table code below is carried over from llama-gguf-info so
+// both tools share the same accounting logic; the model loaded for measurement
+// supplies its hparams too (single load, no fake probe).
 //
 // The full model table (per-layer tensor sizes, KV cell bytes, mtp/swa/ssm
 // columns, TOTAL) is computed exactly as in llama-gguf-info:
@@ -32,6 +36,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <algorithm>
+#include <chrono>
 #include <map>
 #include <vector>
 
@@ -72,16 +78,15 @@ static std::string all_kv_cache_types() {
 static void log_callback_quiet(enum ggml_log_level, const char *, void *) {}
 
 // ---- device scan -----------------------------------------------------------
-// STEP 0 (concept-gpu-split-tool.md §15.4/§15.6): two-phase measurement of
-// every device the backend registry sees:
-//   free       — raw, right after llama_backend_init(), nothing loaded yet
-//   after-init — after the no_alloc model + a real context are initialized.
-//                This is the step a live deployment takes BEFORE loading tensors
-//                and allocating the KV cache: backends come up on the target
-//                devices (kernels/shaders), compute buffers are allocated. The
-//                delta free - after-init = the FIXED overhead of any run.
-// No filtering yet: the output shows exactly what the driver advertises on
-// the rig. The GPU/IGPU filter for the split solver comes with phases 2+.
+// Two-phase VRAM measurement of every device the backend registry sees:
+//   free          — raw, right after llama_backend_init(), nothing loaded yet
+//   after-measure — after the real model load + warmup decode (see main).
+//                   The delta = what a live deployment on these devices pays
+//                   (weights + KV pool + compute buffers + kernels/shaders);
+//                   the per-parameter decomposition (n_ctx, n_batch,
+//                   --ubatch-size, weights) is computed in the solver phase.
+// Row filtering: CPU rows are hidden while GPUs/IGPUs are present (noise for
+// planning); they reappear on GPU-less systems so the table stays non-empty.
 
 static const char * dev_type_str(enum ggml_backend_dev_type type) {
     switch (type) {
@@ -114,6 +119,81 @@ static void read_all_devices(std::vector<dev_snapshot> & snaps) {
         snaps[i].total_bytes = 0;
         ggml_backend_dev_memory(dev, &snaps[i].free_bytes, &snaps[i].total_bytes);
         snaps[i].ok = true;
+    }
+}
+
+// ---- provisional split -----------------------------------------------------
+// Read back where the measurement load ACTUALLY placed the weights: every
+// tensor of the loaded model carries its buffer, and each device's host
+// buffer type identifies its tensors — ground truth from the same code path
+// that did the splitting (llama_model auto-split by free VRAM), no re-derivation.
+
+static bool gpus_present() {
+    const size_t ndevs = ggml_backend_dev_count();
+    for (size_t i = 0; i < ndevs; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev) continue;
+        const enum ggml_backend_dev_type t = ggml_backend_dev_type(dev);
+        if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void print_provisional_split(const llama_model * model) {
+    const size_t ndevs = ggml_backend_dev_count();
+    if (ndevs == 0 || !gpus_present()) {
+        return;   // no GPUs: nothing to split
+    }
+
+    struct dev_usage { size_t bytes = 0; int first_layer = -1, last_layer = -1; };
+    std::vector<dev_usage> usage(ndevs);
+
+    for (const auto & [tname, tensor] : llama_internal_get_tensor_map(model)) {
+        if (!tensor || !tensor->buffer) {
+            continue;   // not loaded to a device buffer
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(tensor->buffer);
+        const size_t bytes = ggml_nbytes(tensor);
+
+        int il = -1;
+        if (!strncmp(tname.c_str(), "blk.", 4)) {
+            il = atoi(tname.c_str() + 4);
+        }
+
+        for (size_t i = 0; i < ndevs; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (!dev || ggml_backend_dev_host_buffer_type(dev) != buft) {
+                continue;
+            }
+            usage[i].bytes += bytes;
+            if (il >= 0) {
+                if (usage[i].first_layer < 0 || il < usage[i].first_layer) usage[i].first_layer = il;
+                if (il > usage[i].last_layer) usage[i].last_layer = il;
+            }
+            break;
+        }
+    }
+
+    fprintf(stderr, "\n");
+    fprintf(stderr, "  provisional split (as placed by the measurement load):\n\n");
+    fprintf(stderr, "    %-4s %-6s %-10s %-14s  %s\n", "idx", "type", "layers", "weights", "name");
+    for (size_t i = 0; i < ndevs; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev) continue;
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        if (type == GGML_BACKEND_DEVICE_TYPE_CPU && gpus_present()) {
+            continue;   // CPU rows hidden while GPUs are present
+        }
+
+        char range[24];
+        snprintf(range, sizeof(range),
+                 usage[i].first_layer >= 0 ? "%d-%d" : "-",
+                 usage[i].first_layer, usage[i].last_layer);
+        fprintf(stderr, "    %-4zu %-6s %-10s %-14s  %s\n",
+                i, dev_type_str(type), range, gib_str(usage[i].bytes).c_str(),
+                ggml_backend_dev_name(dev));
     }
 }
 
@@ -162,12 +242,110 @@ static void fix_cpu_free(std::vector<dev_snapshot> & snaps) {
     }
 }
 
+// ---- warmup decode ---------------------------------------------------------
+// Real-load measurement (Michael, 2026-11-13): the tool loads the model with
+// default params and decodes a real prompt once so every kernel the deployment
+// will launch is uploaded to the devices — kernels only materialize on their
+// first execution (verified across all backends, concept §17). The prompt is
+// ~20K chars of Hamlet (warmup-text.h): natural-language tokens with high
+// diversity, so a MoE router exercises many experts and their kernels load.
+// Returns the number of tokens decoded in prefill.
+
+#include "warmup-text.h"
+
+static int warmup_decode(llama_context * ctx, const std::vector<int32_t> & tokens) {
+    const int n_tok = (int)tokens.size();
+    if (n_tok <= 0) {
+        return 0;
+    }
+
+    // batch construction follows fllama.c exactly (and it does not crash):
+    // raw mallocs, a flat seq_id pointer array without per-token inner
+    // allocations, and manual frees. llama_batch_init/llama_batch_free use
+    // per-token inner allocations this deployment pattern never touches.
+    int seq_id = 0;   // non-const: batch.seq_id pointers must stay valid during llama_decode
+
+    auto build_batch = [&](std::vector<int32_t> * tok_vec, int32_t pos_start, bool logits_last_only) {
+        const size_t n = tok_vec->size();
+        llama_batch batch;
+        batch.n_tokens = (int32_t)n;
+        batch.token    = (llama_token *)  malloc(n * sizeof(llama_token));
+        batch.embd     = nullptr;
+        batch.pos      = (llama_pos *)     malloc(n * sizeof(llama_pos));
+        batch.n_seq_id = (int32_t *)       malloc(n * sizeof(int32_t));
+        batch.seq_id   = (llama_seq_id **) malloc(n * sizeof(llama_seq_id *));
+        batch.logits   = (int8_t *)        malloc(n);
+        for (size_t i = 0; i < n; ++i) {
+            batch.token[i]    = (*tok_vec)[i];
+            batch.pos[i]      = pos_start + (llama_pos)i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i]   = &seq_id;
+            // output only at the single marked position, else no outputs
+            batch.logits[i]   = logits_last_only && i == n - 1 ? 1 : 0;
+        }
+        return batch;
+    };
+
+    auto free_batch = [](llama_batch & batch) {
+        free(batch.token);
+        free(batch.pos);
+        free(batch.n_seq_id);
+        free(batch.seq_id);   // the pointer array only — seq_id[i] point into seq_id above
+        free(batch.logits);
+    };
+
+    // prefill: submit the prompt in n_batch-sized chunks (the backend
+    // subdivides each into ubatches internally — same graph sizes as
+    // production). Positions stay contiguous across chunks.
+    const int32_t n_batch = llama_n_batch(ctx);
+    for (int32_t start = 0; start < n_tok; start += n_batch) {
+        const int32_t end = std::min(n_tok, start + n_batch);
+        std::vector<int32_t> chunk(tokens.begin() + start, tokens.begin() + end);
+        // only the final chunk's last token produces logits
+        llama_batch batch = build_batch(&chunk, start, end == n_tok);
+        const int rc = llama_decode(ctx, batch);
+        free_batch(batch);
+        if (rc != 0) {
+            fprintf(stderr, "  warmup: prefill decode failed at token %d\n", start);
+            return 0;
+        }
+    }
+
+    // a few generate steps so the single-token decode path is exercised too
+    std::vector<int32_t> next(1);
+    for (int g = 0; g < 4; ++g) {
+        next[0] = tokens[n_tok - 1];
+        llama_batch gb = build_batch(&next, n_tok + g, true);
+        const int rc = llama_decode(ctx, gb);
+        free_batch(gb);
+        if (rc != 0) {
+            fprintf(stderr, "  warmup: generate decode %d failed\n", g);
+            break;
+        }
+    }
+
+    return n_tok;
+}
 static void print_device_scan(const std::vector<dev_snapshot> & raw,
-                              const std::vector<dev_snapshot> & init) {
+                              const std::vector<dev_snapshot> & measure) {
+    // decide row visibility first: when any GPU/IGPU is present, CPU rows are
+    // noise for planning and get hidden (Michael, 2026-11-12); without GPUs the
+    // CPU row is shown again so the scan never renders an empty table.
+    bool gpu_present = false;
+    const size_t ndevs = ggml_backend_dev_count();
+    for (size_t i = 0; i < ndevs; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev) continue;
+        const enum ggml_backend_dev_type t = ggml_backend_dev_type(dev);
+        if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            gpu_present = true;
+            break;
+        }
+    }
+
     fprintf(stderr, "\n");
     fprintf(stderr, "  device scan:\n\n");
 
-    const size_t ndevs = ggml_backend_dev_count();
     if (ndevs == 0) {
         fprintf(stderr, "    no devices registered\n");
         return;
@@ -175,7 +353,7 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
 
     char hdr[256];
     snprintf(hdr, sizeof(hdr), "    %-4s %-6s %-14s %-14s %-14s  %s",
-             "idx", "type", "total", "free", "after-init", "name");
+             "idx", "type", "total", "free", "after-measure", "name");
     fprintf(stderr, "%s\n", hdr);
 
     for (size_t i = 0; i < ndevs; ++i) {
@@ -186,7 +364,10 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
         }
 
         const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
-        const size_t free_init = (i < init.size() && init[i].ok) ? init[i].free_bytes : 0;
+        if (gpu_present && type == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;  // hidden while GPUs are present
+        }
+        const size_t free_measure = (i < measure.size() && measure[i].ok) ? measure[i].free_bytes : 0;
 
         char line[512];
         snprintf(line, sizeof(line),
@@ -195,13 +376,33 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
                  dev_type_str(type),
                  gib_str(raw[i].total_bytes).c_str(),
                  gib_str(raw[i].free_bytes).c_str(),
-                 gib_str(free_init).c_str(),
+                 gib_str(free_measure).c_str(),
                  ggml_backend_dev_name(dev));
         fprintf(stderr, "%s\n", line);
     }
 
+    // per-GPU kernel/shader overhead: the delta of free VRAM before and after
+    // the real load + warmup decode (weights + KV pool + compute buffers +
+    // kernels/shaders — the total a deployment on these devices will pay)
     fprintf(stderr, "\n");
-    fprintf(stderr, "    (after-init = free after model + context init: kernels, compute buffers)\n");
+    fprintf(stderr, "  measured overhead per device (free delta):\n\n");
+    fprintf(stderr, "    %-4s %-6s %-14s  %s\n", "idx", "type", "overhead", "name");
+    for (size_t i = 0; i < ndevs; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev) continue;
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        if (gpu_present && type == GGML_BACKEND_DEVICE_TYPE_CPU) continue;
+        if (!(i < measure.size() && measure[i].ok)) continue;
+        const size_t delta = (raw[i].free_bytes > measure[i].free_bytes)
+                             ? raw[i].free_bytes - measure[i].free_bytes : 0;
+
+        char line[512];
+        snprintf(line, sizeof(line), "    %-4zu %-6s %-14s  %s",
+                 i, dev_type_str(type), gib_str(delta).c_str(), ggml_backend_dev_name(dev));
+        fprintf(stderr, "%s\n", line);
+    }
+
+    fprintf(stderr, "\n");
 }
 
 // ---- table printing -----------------------------------------------------------
@@ -252,7 +453,7 @@ static std::string header_row(const std::vector<const char *> & hdr,
 int main(int argc, char ** argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s <model.gguf> [-ctk|--cache-type-k TYPE] [-ctv|--cache-type-v TYPE]\n"
-                        "                       [-flash-attn|-no-flash-attn]\n"
+                        "                       [-flash-attn|-no-flash-attn] [--ubatch-size N]\n"
                         "  allowed cache types: %s\n", argv[0], all_kv_cache_types().c_str());
         return 1;
     }
@@ -260,6 +461,7 @@ int main(int argc, char ** argv) {
     const char * path = argv[1];
     ggml_type type_k = GGML_TYPE_F16, type_v = GGML_TYPE_F16;
     bool flash_attn = true;
+    uint32_t ubatch_size = 512;   // default: matches llama.cpp's n_ubatch
 
     for (int a = 2; a < argc; a++) {
         std::string arg = argv[a];
@@ -267,6 +469,7 @@ int main(int argc, char ** argv) {
         else if (arg == "-ctv" || arg == "--cache-type-v") type_v = kv_cache_type_from_str(argv[++a]);
         else if (arg == "-flash-attn")                     flash_attn = true;
         else if (arg == "-no-flash-attn")                  flash_attn = false;
+        else if (arg == "--ubatch-size")                   ubatch_size = atoi(argv[++a]);
     }
 
     const bool v_trans = !flash_attn;
@@ -335,49 +538,70 @@ int main(int argc, char ** argv) {
         other_tensors.emplace_back(tname, (int64_t)tsize);
     }
 
-    // ---- load model via llama API for hparams (no weights) -----------------
+    // ---- load model via llama API (real weights) ---------------------------------
     llama_log_set(log_callback_quiet, nullptr);  // suppress verbose loading logs
 
     llama_backend_init();
 
-    // STEP 0: two-phase device scan — raw VRAM (nothing loaded yet), then after
-    // model/context init, which loads the fixed driver parts (see below).
-    std::vector<dev_snapshot> scan_raw, scan_init;
+    // two-phase device scan — raw VRAM (nothing loaded yet), then after the
+    // real model load + warmup decode (scan_measure below).
+    std::vector<dev_snapshot> scan_raw, scan_measure;
     read_all_devices(scan_raw);
     fix_cpu_free(scan_raw);
 
-    llama_model_params mp; memset(&mp, 0, sizeof(mp));
-    mp.no_alloc = true;
-    mp.load_mode = LLAMA_LOAD_MODE_NONE;
+    // REAL model load with the DEFAULT params: n_gpu_layers = -1 (all layers),
+    // tensor_split = nullptr → llama_model's native auto-split places the layers
+    // proportionally to each device's free VRAM — exactly as production does.
+    // This single load serves both the measurement and the hparams for the table
+    // below; no fake no_alloc probe is used.
+    const llama_model_params mp = llama_model_default_params();
 
+    fprintf(stderr, "  loading: %s (all layers GPU, auto-split by free VRAM)\n", path);
+    const auto t_load0 = std::chrono::steady_clock::now();
     llama_model * model = llama_model_load_from_file(path, mp);
     if (!model) {
-        fprintf(stderr, "failed to load model metadata\n");
+        fprintf(stderr, "failed to load model\n");
         gguf_free(ctx);
         return 1;
     }
+    const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load0).count();
 
-    // after-init scan: create a real context from the no_alloc model. This is
-    // what a live deployment does BEFORE loading tensors and allocating the KV
-    // cache: backends initialize on the target devices (kernels/shaders upload)
-    // and compute buffers are allocated — the FIXED overhead of any run. The
-    // probe pool stays tiny so no deployment-sized cache is touched.
+    // measurement: small context + warmup decode through the real weights.
+    // Every kernel the deployment will launch is uploaded during this run —
+    // kernels only materialize on their first execution (concept §17).
     {
         llama_context_params cp = llama_context_default_params();
-        cp.n_ctx      = 1024;   // small working context: enough to init, nothing more
-        cp.n_kv_cache = 256;    // minimal probe pool (fork field) — fixed-cost measurement only
+        cp.n_ctx    = 16384;  // reasonable working size (also allocates a 16K-cell KV pool)
+        cp.n_batch  = 2048;   // default; exercises the large-batch decode path
+        cp.n_ubatch = ubatch_size;
 
+        // tokenize the excerpt UP FRONT so the token count is visible while the
+        // (slow) warmup decode runs — the user sees what the system is processing
+        std::vector<int32_t> prompt_tokens(strlen(WARMUP_TEXT) + 8);
+        const int n_tok = llama_tokenize(
+            llama_model_get_vocab(model), WARMUP_TEXT, strlen(WARMUP_TEXT),
+            prompt_tokens.data(), (int)prompt_tokens.size(), true, false);
+        if (n_tok <= 0) {
+            fprintf(stderr, "  measurement: tokenization failed\n");
+            return 1;
+        }
+        prompt_tokens.resize(n_tok);
+        fprintf(stderr, "  measuring: n_ctx=%u n_batch=%u n_ubatch=%u (warmup: Hamlet excerpt, %d tokens)\n",
+                (unsigned)cp.n_ctx, (unsigned)cp.n_batch, (unsigned)cp.n_ubatch, n_tok);
+        const auto t_warmup0 = std::chrono::steady_clock::now();
         llama_context * ctx0 = llama_init_from_model(model, cp);
-        if (ctx0) {
-            read_all_devices(scan_init);
-            fix_cpu_free(scan_init);
-            llama_free(ctx0);
+        if (!ctx0) {
+            fprintf(stderr, "  measurement: context init failed\n");
         } else {
-            fprintf(stderr, "  device scan: context init failed — after-init not measured\n");
+            warmup_decode(ctx0, prompt_tokens);
+            const double warmup_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warmup0).count();
+            fprintf(stderr, "  measurement: done; load %.1f s + warmup %.1f s (%.0f tok/s)\n",
+                    load_s, warmup_s, warmup_s > 0 ? (double)n_tok / warmup_s : 0.0);
+            read_all_devices(scan_measure);
+            fix_cpu_free(scan_measure);
+            llama_free(ctx0);
         }
     }
-
-    print_device_scan(scan_raw, scan_init);
 
     const auto & hp = model->hparams;
     const uint32_t n_layer_all   = hp.n_layer_all;
@@ -444,6 +668,13 @@ int main(int argc, char ** argv) {
     if (embed_bytes > 0) {
         fprintf(stderr, "  embed(CPU): %lld\n", (long long)embed_bytes);
     }
+
+    // device scan prints AFTER the model header block (Michael, 2026-11-12);
+    // the measurements themselves were taken above, before any output.
+    print_device_scan(scan_raw, scan_measure);
+
+    // where the weights actually landed (GPU machines only)
+    print_provisional_split(model);
 
     // ---- table layout: mtp + swa/ssm columns are capability-driven ----------
     // col 0 is sized to fit every label that will be printed (layer numbers,
