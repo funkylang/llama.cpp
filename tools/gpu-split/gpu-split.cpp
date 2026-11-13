@@ -708,12 +708,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help") {
-        print_usage(argv[0]);
-        return 0;
-    }
-
-    const char * path = argv[1];
+    const char * path = nullptr;   // first non-option argument, wherever it appears
     ggml_type type_k = GGML_TYPE_F16, type_v = GGML_TYPE_F16;
     bool flash_attn = true;
     uint32_t ubatch_size = 512;   // default: matches llama.cpp's n_ubatch
@@ -722,17 +717,39 @@ int main(int argc, char ** argv) {
     double keep_free = 0.03;      // design default: reserve 3% of each GPU's VRAM
     bool use_mtp = true;          // auto: MTP draft context is measured when the model has a nextn block
 
-    for (int a = 2; a < argc; a++) {
+    for (int a = 1; a < argc; a++) {
         std::string arg = argv[a];
-        if      (arg == "--cache-type-k")  type_k = kv_cache_type_from_str(argv[++a]);
-        else if (arg == "--cache-type-v")  type_v = kv_cache_type_from_str(argv[++a]);
+        if (arg == "-h" || arg == "--help") {
+            print_usage(argv[0]);
+            return 0;
+        }
+        if (arg == "--cache-type-k" || arg == "--cache-type-v" || arg == "--ubatch-size" ||
+            arg == "--checkpoints" || arg == "--parallel" || arg == "--keep-free") {
+            if (++a >= argc) {
+                fprintf(stderr, "error: option '%s' requires a value\n", argv[a - 1]);
+                return 1;
+            }
+        }
+        if      (arg == "--cache-type-k")  type_k = kv_cache_type_from_str(argv[a]);
+        else if (arg == "--cache-type-v")  type_v = kv_cache_type_from_str(argv[a]);
         else if (arg == "--flash-attn")    flash_attn = true;
         else if (arg == "--no-flash-attn") flash_attn = false;
-        else if (arg == "--ubatch-size")   ubatch_size = atoi(argv[++a]);
-        else if (arg == "--checkpoints")   checkpoints_arg = atoi(argv[++a]);
-        else if (arg == "--parallel")      parallel_arg = atoi(argv[++a]);
-        else if (arg == "--keep-free")     keep_free = atof(argv[++a]);
+        else if (arg == "--ubatch-size")   ubatch_size = atoi(argv[a]);
+        else if (arg == "--checkpoints")   checkpoints_arg = atoi(argv[a]);
+        else if (arg == "--parallel")      parallel_arg = atoi(argv[a]);
+        else if (arg == "--keep-free")     keep_free = atof(argv[a]);
         else if (arg == "--no-mtp")        use_mtp = false;
+        else if (!path)                    path = argv[a];
+        else {
+            fprintf(stderr, "error: unexpected argument '%s' (model file already given as '%s')\n",
+                    arg.c_str(), path);
+            return 1;
+        }
+    }
+
+    if (!path) {
+        print_usage(argv[0]);
+        return 1;
     }
 
     if (checkpoints_arg >= 0 && checkpoints_arg < 1) {
