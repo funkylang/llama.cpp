@@ -285,6 +285,132 @@ static std::vector<kv_rate_info> compute_kv_rates(const llama_model * model,
     return kv_rate;
 }
 
+// ---- KV pool solver ---------------------------------------------------------
+// Largest KV pool size (in 256-cell blocks) that a greedy layer placement
+// affords on every GPU's available budget, found by bisecting (log2 steps).
+// Integer arithmetic throughout; verbose trace of every step so the search
+// and each decision can be verified (removed once proven correct).
+
+struct layer_cost {
+    uint64_t weights = 0;     // tensor bytes for this layer (GGUF metadata)
+    uint64_t kv_bpc  = 0;     // KV-cache bytes per cell, this layer's attention
+    uint64_t ssm_state = 0;   // recurrent checkpoint state (rows x row-set), else 0
+};
+
+static std::vector<layer_cost> compute_layer_costs(const llama_model * model,
+                                                   const std::map<int, int64_t> & layer_weights,
+                                                   ggml_type type_k, ggml_type type_v,
+                                                   bool flash_attn, uint32_t state_rows) {
+    const auto & hp = model->hparams;
+    const bool v_t = !flash_attn;
+    std::vector<layer_cost> out(hp.n_layer_all);   // trunk layers (excludes nextn)
+    for (uint32_t il = 0; il < hp.n_layer_all; ++il) {
+        auto it = layer_weights.find((int)il);
+        if (it != layer_weights.end()) {
+            out[il].weights = (uint64_t)it->second;
+        }
+        if (hp.is_recr(il)) {
+            // recurrent state rows are always F32 (create_memory hardcodes them)
+            uint64_t cb = (uint64_t)ggml_row_size(GGML_TYPE_F32, hp.n_embd_r());
+            cb += (uint64_t)ggml_row_size(GGML_TYPE_F32, hp.n_embd_s());
+            if (hp.ple_conv_state() > 0 && hp.is_ple(il)) {
+                cb += (uint64_t)ggml_row_size(GGML_TYPE_F32, hp.ple_conv_state());
+            }
+            out[il].ssm_state = cb * state_rows;
+        } else if (hp.has_kv(il)) {
+            const uint32_t ek = hp.n_embd_k_gqa(il);
+            const uint32_t ev = v_t ? hp.n_embd_v_gqa_max() : hp.n_embd_v_gqa(il);
+            uint64_t cb = (uint64_t)ggml_row_size(type_k, ek);
+            if (!hp.is_mla()) {
+                cb += (uint64_t)ggml_row_size(type_v, ev);
+            }
+            out[il].kv_bpc = cb;
+        }
+    }
+    return out;
+}
+
+// Try placing n 256-cell blocks: walk layers in order, each GPU takes layers
+// greedily until the next one would exceed its available budget. The failing
+// layer starts on the NEXT GPU; only an overflow on the LAST GPU fails the
+// candidate. Every decision is traced via fprintf (verification aid).
+static bool try_place_kv_pool(uint32_t n_blocks,
+                              const std::vector<layer_cost> & layers,
+                              const std::vector<uint64_t> & budgets) {
+    const uint64_t cells = (uint64_t)n_blocks * 256;
+
+    size_t il = 0;
+    for (size_t g = 0; g < budgets.size(); ++g) {
+        uint64_t used = 0;
+        const size_t first_layer = il;
+        while (il < layers.size()) {
+            const uint64_t cost = layers[il].weights + cells * layers[il].kv_bpc
+                                + layers[il].ssm_state;
+            if (used + cost > budgets[g]) {
+                break;   // this layer exceeds the budget — previous is last for this GPU
+            }
+            used += cost;
+            ++il;
+        }
+        const bool placed_any = (il > first_layer);
+        if (il < layers.size()) {
+            // intermediate GPU: expected hand-over, next GPU continues with il
+            fprintf(stderr, "    n=%-7u blocks (%-12llu cells)  gpu%zu: layers %s  "
+                            "used %15llu / %15llu  -> next layer %zu goes to gpu%zu\n",
+                    n_blocks, (unsigned long long)cells, g,
+                    placed_any ? "" : "(none)",
+                    (unsigned long long)used, (unsigned long long)budgets[g],
+                    il, g + 1);
+            if (g + 1 >= budgets.size()) {
+                fprintf(stderr, "    -> FAIL: last GPU cannot fit layer %zu and up\n", il);
+                return false;
+            }
+            continue;   // next GPU takes over at layer il
+        }
+        fprintf(stderr, "    n=%-7u blocks (%-12llu cells)  gpu%zu: layers %s  "
+                        "used %15llu / %15llu  -> all layers placed\n",
+                n_blocks, (unsigned long long)cells, g,
+                placed_any ? "" : "(none)",
+                (unsigned long long)used, (unsigned long long)budgets[g]);
+        return true;
+    }
+    return false;
+}
+
+// Bisect for the largest fitting n of 256-cell blocks: at most log2(n_max)
+// steps. Returns the winning block count (0 = nothing fits).
+static uint32_t solve_kv_pool(uint32_t n_max,
+                              const std::vector<layer_cost> & layers,
+                              const std::vector<uint64_t> & budgets) {
+    fprintf(stderr, "\n  kv pool solver: bisect n of 256-cell blocks (integer arithmetic)\n");
+    if (n_max == 0 || layers.empty() || budgets.empty()) {
+        fprintf(stderr, "    n_max = 0 — nothing to solve\n");
+        return 0;
+    }
+    // guard: even with an empty pool every layer must fit somewhere
+    if (!try_place_kv_pool(0, layers, budgets)) {
+        fprintf(stderr, "    ERROR: layers do not fit on the GPUs at n=0 blocks\n");
+        return 0;
+    }
+    uint32_t low = 0, high = n_max;   // low always fits (n=0 verified above)
+    while (low < high) {
+        const uint32_t mid = low + (high - low + 1) / 2;   // rounds UP -> monotonic progress
+        const bool ok = try_place_kv_pool(mid, layers, budgets);
+        fprintf(stderr, "    n=%-7u blocks: %s   [%lu .. %lu]\n",
+                mid, ok ? "fits  (low=mid)" : "no fit (high=mid-1)",
+                ok ? (unsigned long)mid : (unsigned long)low,
+                ok ? (unsigned long)high : (unsigned long)(mid - 1));
+        if (ok) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    fprintf(stderr, "    OPTIMAL: n=%-7u blocks = %llu kv cells\n",
+            low, (unsigned long long)low * 256ULL);
+    return low;
+}
+
 // On Linux the ggml CPU backend reports free == total unconditionally
 // (ggml-cpu.cpp:377) — a deliberate assumption, not a measurement. Read the
 // real figure from /proc/meminfo so the table is truthful there; leave the
@@ -419,7 +545,8 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
                               const llama_model * model, uint32_t n_ctx_measure,
                               ggml_type type_k, ggml_type type_v, bool flash_attn,
                               uint32_t streams, uint32_t state_rows, bool mtp_measured,
-                              double keep_free) {
+                              double keep_free,
+                              const std::map<int, int64_t> & layer_weights) {
     // decide row visibility first: when any GPU/IGPU is present, CPU rows are
     // noise for planning and get hidden (Michael, 2026-11-12); without GPUs the
     // CPU row is shown again so the scan never renders an empty table.
@@ -619,6 +746,7 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
         fprintf(stderr, "    %-4s %-6s %15s %15s %15s %15s %15s  %s\n",
                 "idx", "type", "total", "reserve", "budget", "loaded", "available", "name");
         int64_t accumulated_available = 0;
+        std::vector<uint64_t> gpu_budgets;   // solver input: per-GPU available, in row order
         for (const auto & r : rows) {
             if (!raw[r.idx].ok || raw[r.idx].total_bytes == 0) continue;
             const int64_t total   = (int64_t)raw[r.idx].total_bytes;
@@ -627,6 +755,8 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
             const int64_t loaded  = (int64_t)r.weights + (int64_t)r.probe_kv;
             const int64_t available = budget - loaded;
             accumulated_available += available;
+            // negative available = overcommitted GPU: it cannot hold anything
+            gpu_budgets.push_back(available > 0 ? (uint64_t)available : 0);
             fprintf(stderr, "    %-4zu %-6s %15lld %15lld %15lld %15lld %15lld  %s\n",
                     r.idx, r.type_str,
                     (long long)total, (long long)reserve, (long long)budget,
@@ -635,22 +765,34 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
         fprintf(stderr, "    %-76s%15lld\n",
                 "total available:", (long long)accumulated_available);
 
-        // theoretical kv-cache ceiling: how many tokens fit into the accumulated
-        // available budget at full per-token cost.
-        //   total cell size = sum over GPUs of (attention bytes-per-cell × streams)
+        // theoretical kv-cache ceiling: how many cells fit into the accumulated
+        // available budget at full per-cell cost. The pool capacity is a
+        // property of the pool itself — parallel sequences share it, they do
+        // not multiply its size, so streams plays no role here.
+        //   total cell size = sum over GPUs of attention bytes-per-cell
         //   upper limit     = total available ÷ total cell size    (integer division)
         uint64_t cell_size_per_token = 0;
         for (const auto & r : rows) {
             if (!raw[r.idx].ok || raw[r.idx].total_bytes == 0) continue;
-            cell_size_per_token += r.kv_bpc * (uint64_t)streams;
+            cell_size_per_token += r.kv_bpc;
         }
-        fprintf(stderr, "    %-76s%15llu   (%u streams)\n",
-                "total cell size:", (unsigned long long)cell_size_per_token, streams);
+        fprintf(stderr, "    %-76s%15llu\n",
+                "total cell size:", (unsigned long long)cell_size_per_token);
         if (cell_size_per_token > 0 && accumulated_available > 0) {
             const uint64_t kv_upper =
                 (uint64_t)accumulated_available / cell_size_per_token;
             fprintf(stderr, "    %-76s%15llu   tokens\n",
                     "kv cache upper limit:", (unsigned long long)kv_upper);
+
+            // ---- kv pool solver ----------------------------------------------
+            // step 3: the pool size must be a multiple of 256 cells (GGML_PAD),
+            // so bisect the count of 256-cell blocks up to that ceiling.
+            const uint32_t n_max = (uint32_t)(kv_upper / 256);
+            fprintf(stderr, "\n    n_max = kv upper limit / 256 = %llu\n",
+                    (unsigned long long)n_max);
+            auto layer_costs = compute_layer_costs(model, layer_weights,
+                                                   type_k, type_v, flash_attn, state_rows);
+            solve_kv_pool(n_max, layer_costs, gpu_budgets);
         } else {
             fprintf(stderr, "    %-76s%s\n", "kv cache upper limit:", "n/a");
         }
@@ -1159,7 +1301,7 @@ int main(int argc, char ** argv) {
     // device scan prints AFTER the model header block (Michael, 2026-11-12);
     // the measurements themselves were taken above, before any output.
     print_device_scan(scan_raw, scan_measure, model, n_ctx_measure, type_k, type_v, flash_attn,
-                      probe_parallel, state_rows, mtp_measured, keep_free);
+                      probe_parallel, state_rows, mtp_measured, keep_free, layer_weights);
 
     // where the weights actually landed (GPU machines only)
     print_provisional_split(model);
