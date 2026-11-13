@@ -788,14 +788,40 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // MTP capability, decided BEFORE the real load via a metadata-only peek
+    // (no_alloc pattern from gguf-info): a nextn block that is not repurposed
+    // as a router layer. On router models the trunk attends to those layers on
+    // EVERY pass, so no separate draft context exists there — and
+    // llama_init_from_model rejects LLAMA_CONTEXT_TYPE_MTP for them
+    // (llama-context.cpp:4388).
+    bool has_nextn = false;
+    {
+        llama_model_params mp_peek = llama_model_default_params();
+        mp_peek.no_alloc  = true;
+        mp_peek.load_mode = LLAMA_LOAD_MODE_NONE;
+        llama_model * model_peek = llama_model_load_from_file(path, mp_peek);
+        if (model_peek) {
+            has_nextn = model_peek->hparams.n_layer_nextn > 0 && model_peek->hparams.router_layer < 0;
+            llama_model_free(model_peek);
+        } else {
+            fprintf(stderr, "  pre-look: metadata load failed — assuming no MTP block\n");
+        }
+    }
+    const bool measure_mtp = use_mtp && has_nextn;
+
     // REAL model load with the DEFAULT params: n_gpu_layers = -1 (all layers),
     // tensor_split = nullptr → llama_model's native auto-split places the layers
     // proportionally to each device's free VRAM — exactly as production does.
     // This single load serves both the measurement and the hparams for the table
     // below; no fake no_alloc probe is used.
-    const llama_model_params mp = llama_model_default_params();
+    // load_mtp follows the MTP plan: without it the loader skips the nextn
+    // tensors (llama-model.cpp:3928) and an MTP context would crash building
+    // its graph on the missing eh_proj (qwen35.cpp:508).
+    llama_model_params mp = llama_model_default_params();
+    mp.load_mtp = measure_mtp;
 
-    fprintf(stderr, "  loading: %s (all layers GPU, auto-split by free VRAM)\n", path);
+    fprintf(stderr, "  loading: %s (all layers GPU, auto-split by free VRAM, load_mtp=%d)\n",
+            path, (int)mp.load_mtp);
     const auto t_load0 = std::chrono::steady_clock::now();
     llama_model * model = llama_model_load_from_file(path, mp);
     if (!model) {
@@ -804,12 +830,6 @@ int main(int argc, char ** argv) {
         return 1;
     }
     const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load0).count();
-
-    // MTP capability: a nextn block that is not repurposed as a router layer.
-    // On router models the trunk attends to those layers on EVERY pass, so no
-    // separate draft context exists there — and llama_init_from_model rejects
-    // LLAMA_CONTEXT_TYPE_MTP for them (llama-context.cpp:4388).
-    const bool measure_mtp = use_mtp && model->hparams.n_layer_nextn > 0 && model->hparams.router_layer < 0;
 
     // measurement: context at the common 16384-cell deployment size + decode
     // through the real weights. Every kernel the deployment will launch is
