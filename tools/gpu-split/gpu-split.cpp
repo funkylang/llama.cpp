@@ -496,8 +496,7 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
     }
 
     // per-device decomposition values: computed once, rendered in GiB and bytes.
-    // The byte view also shows the arithmetic behind probe-KV so it can be
-    // cross-checked against the [MEM-SIZE] formula lines of the same run.
+    // The byte view also shows the arithmetic behind probe-KV for inspection.
     struct dev_row {
         size_t idx; const char * type_str; const char * name;
         uint64_t delta, weights, probe_kv, kernels;
@@ -577,25 +576,26 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
             fprintf(stderr, "    %s (%d attention / %d SSM layers, %s K / %s V):\n",
                     r.name, r.attn_layers, r.ssm_layers,
                     ggml_type_name(type_k), ggml_type_name(type_v));
-            // factors print plain; only the term values are fixed-width,
-            // since those are what add up to probe-KV below
+            // Factors print right-aligned in fixed-width fields so the 'x' and
+            // '=' characters stack vertically across rows (term values are the
+            // aligned summands that make up probe-KV below).
             if (r.kv_bpc > 0) {
-                fprintf(stderr, "      %-12s %lu x %lu = %14lu\n",
+                fprintf(stderr, "      %-12s %9lu x %9lu = %14lu\n",
                         "context:", r.kv_cells, r.kv_bpc * r.streams,
                         r.kv_cells * r.kv_bpc * r.streams);
             }
             if (r.mtp_bpc > 0) {
-                fprintf(stderr, "      %-12s %lu x %lu = %14lu   (%d nextn layers)\n",
+                fprintf(stderr, "      %-12s %9lu x %9lu = %14lu   (%d nextn layers)\n",
                         "mtp draft:", r.kv_cells, r.mtp_bpc * r.streams,
                         r.kv_cells * r.mtp_bpc * r.streams, r.mtp_layers);
             }
             if (r.ssm_bpr > 0) {
-                fprintf(stderr, "      %-12s %lu x %lu = %14lu   (%d SSM layers)\n",
+                fprintf(stderr, "      %-12s %9lu x %9lu = %14lu   (%d SSM layers)\n",
                         "checkpoints:", r.state_rows, r.ssm_bpr,
                         r.state_rows * r.ssm_bpr, r.ssm_layers);
             }
-            fprintf(stderr, "      ────────────────────────────────────────────\n");
-            fprintf(stderr, "      %-12s       = %14lu\n",
+            fprintf(stderr, "      %s\n", "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500");
+            fprintf(stderr, "      %-12s                       = %14lu\n",
                     "probe-KV:", r.probe_kv);
         }
     }
