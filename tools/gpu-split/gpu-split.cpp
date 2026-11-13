@@ -634,6 +634,26 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
         }
         fprintf(stderr, "    %-76s%15lld\n",
                 "total available:", (long long)accumulated_available);
+
+        // theoretical kv-cache ceiling: how many tokens fit into the accumulated
+        // available budget at full per-token cost.
+        //   total cell size = sum over GPUs of (attention bytes-per-cell × streams)
+        //   upper limit     = total available ÷ total cell size    (integer division)
+        uint64_t cell_size_per_token = 0;
+        for (const auto & r : rows) {
+            if (!raw[r.idx].ok || raw[r.idx].total_bytes == 0) continue;
+            cell_size_per_token += r.kv_bpc * (uint64_t)streams;
+        }
+        fprintf(stderr, "    %-76s%15llu   (%u streams)\n",
+                "total cell size:", (unsigned long long)cell_size_per_token, streams);
+        if (cell_size_per_token > 0 && accumulated_available > 0) {
+            const uint64_t kv_upper =
+                (uint64_t)accumulated_available / cell_size_per_token;
+            fprintf(stderr, "    %-76s%15llu   tokens\n",
+                    "kv cache upper limit:", (unsigned long long)kv_upper);
+        } else {
+            fprintf(stderr, "    %-76s%s\n", "kv cache upper limit:", "n/a");
+        }
     }
 
     fprintf(stderr, "\n");
