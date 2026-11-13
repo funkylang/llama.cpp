@@ -690,9 +690,12 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
                 mtp_bpc    = kv_rate[i].mtp_kv_bytes_per_cell;
                 mtp_layers = kv_rate[i].n_mtp_layers;
             }
-            // probe memory = attention KV pool x streams + MTP draft pool x streams (if measured)
+            // probe memory = attention KV pool + MTP draft pool (if measured)
             //               + recurrent SSM state rows (= n_seq_max x (1 + n_rs_seq) per layer)
-            probe_kv_i  = kv_cells * (kv_bpc + mtp_bpc) * (uint64_t)streams
+            // The KV pools are shared: one pool of n_ctx cells serves all parallel
+            // streams (unified), so streams must NOT multiply its size — only the
+            // per-sequence SSM state rows do.
+            probe_kv_i  = kv_cells * (kv_bpc + mtp_bpc)
                         + (uint64_t)state_rows * ssm_bpr;
         }
         // kernels = residual after removing the two accounted-for terms
@@ -734,8 +737,9 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
     }
 
     if (have_decomp) {
-        fprintf(stderr, "\n  probe-KV derivation (bytes): (context x cell + mtp draft x cell)"
-                        " x streams + state rows x ssm_state:\n");
+        fprintf(stderr, "\n  probe-KV derivation (bytes): context x cell + mtp draft x cell"
+                        " + state rows x ssm_state:"
+                        " (unified pools: streams do not multiply the KV size)\n");
         for (const auto & r : rows) {
             fprintf(stderr, "    %s (%d attention / %d SSM layers, %s K / %s V):\n",
                     r.name, r.attn_layers, r.ssm_layers,
@@ -745,13 +749,13 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
             // aligned summands that make up probe-KV below).
             if (r.kv_bpc > 0) {
                 fprintf(stderr, "      %-12s %9lu × %9lu = %14lu\n",
-                        "context:", r.kv_cells, r.kv_bpc * r.streams,
-                        r.kv_cells * r.kv_bpc * r.streams);
+                        "context:", r.kv_cells, r.kv_bpc,
+                        r.kv_cells * r.kv_bpc);
             }
             if (r.mtp_bpc > 0) {
                 fprintf(stderr, "      %-12s %9lu × %9lu = %14lu   (%d nextn layers)\n",
-                        "mtp draft:", r.kv_cells, r.mtp_bpc * r.streams,
-                        r.kv_cells * r.mtp_bpc * r.streams, r.mtp_layers);
+                        "mtp draft:", r.kv_cells, r.mtp_bpc,
+                        r.kv_cells * r.mtp_bpc, r.mtp_layers);
             }
             if (r.ssm_bpr > 0) {
                 fprintf(stderr, "      %-12s %9lu × %9lu = %14lu   (%d SSM layers)\n",
@@ -768,11 +772,8 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
     // How much VRAM each GPU leaves for planning:
     //   reserve   = total × keep_free
     //   budget    = total - reserve              (= total × (1 - keep_free))
-    //   kernels   = driver/backend overhead on the device
-    //   loaded    = weights + probe-KV  (model footprint, informational)
-    //   available = budget - kernels   (planning headroom — the pool solver
-    //                re-charges tensors/checkpoints/cells per layer itself;
-    //                subtracting them here would count them twice)
+    //   loaded    = weights + probe-KV  (tensors + cache/checkpoint state)
+    //   available = budget - loaded
     // Integer arithmetic throughout, so every printed value chains from the
     // previous one. The accumulated available across all GPUs is the budget
     // the proportional split will distribute.
@@ -780,8 +781,8 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
         fprintf(stderr, "\n");
         fprintf(stderr, "  split budget (bytes): reserve = total × keep_free(%.2f); "
                         "budget = total - reserve;\n", keep_free);
-        fprintf(stderr, "                         kernels = device overhead; "
-                        "available = budget - kernels\n\n");
+        fprintf(stderr, "                         loaded = weights + probe-KV; "
+                        "available = budget - loaded\n\n");
         fprintf(stderr, "    %-4s %-6s %15s %15s %15s %15s %15s  %s\n",
                 "idx", "type", "total", "reserve", "budget", "loaded", "available", "name");
         int64_t accumulated_available = 0;
@@ -792,9 +793,8 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
             const int64_t total   = (int64_t)raw[r.idx].total_bytes;
             const int64_t reserve = (int64_t)((double)total * keep_free);
             const int64_t budget  = total - reserve;
-            const int64_t kernels = (int64_t)r.kernels;
             const int64_t loaded  = (int64_t)r.weights + (int64_t)r.probe_kv;
-            const int64_t available = budget - kernels;
+            const int64_t available = budget - loaded;
             accumulated_available += available;
             // negative available = overcommitted GPU: it cannot hold anything
             gpu_budgets.push_back(available > 0 ? (uint64_t)available : 0);
@@ -810,14 +810,13 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
         // theoretical kv-cache ceiling: how many cells fit into the accumulated
         // available budget at full per-cell cost. The pool capacity is a
         // property of the pool itself — parallel sequences share it, they do
-        // not multiply its size, so streams plays no role here. Per cell the
-        // model pays for BOTH pools: main KV cells + MTP draft cells.
-        //   total cell size = sum over GPUs of (kv_bpc + mtp_bpc)
+        // not multiply its size, so streams plays no role here.
+        //   total cell size = sum over GPUs of attention bytes-per-cell
         //   upper limit     = total available ÷ total cell size    (integer division)
         uint64_t cell_size_per_token = 0;
         for (const auto & r : rows) {
             if (!raw[r.idx].ok || raw[r.idx].total_bytes == 0) continue;
-            cell_size_per_token += r.kv_bpc + r.mtp_bpc;
+            cell_size_per_token += r.kv_bpc;
         }
         fprintf(stderr, "    %-76s%15llu\n",
                 "total cell size:", (unsigned long long)cell_size_per_token);
@@ -1175,8 +1174,9 @@ int main(int argc, char ** argv) {
         cp.n_ubatch = ubatch_size;
         cp.type_k = type_k;   // measure what the deployment uses — not the f16 default
         cp.type_v = type_v;
-        cp.n_seq_max = probe_parallel;  // parallel streams: KV pool x streams (non-unified cache)
+        cp.n_seq_max = probe_parallel;  // parallel streams: scales the SSM state rows, not the KV pool
         cp.n_rs_seq  = probe_rs_seq;    // SSM rows per stream-rollback set = state_rows / n_seq_max
+        cp.kv_unified = true;           // unified cache (the deployment model): one shared pool
 
         // tokenize the excerpt UP FRONT so the token count is visible while the
         // (slow) warmup decode runs — the user sees what the system is processing
@@ -1212,11 +1212,11 @@ int main(int argc, char ** argv) {
                 const auto t = ggml_backend_dev_type(dev);
                 if (!(t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU)) continue;
                 const uint64_t mtp_bpc = measure_mtp ? kv_rate[i].mtp_kv_bytes_per_cell : 0;   // MTP draft pool, same n_ctx
-                const uint64_t need_i = (uint64_t)cp.n_ctx * probe_parallel * (kv_rate[i].kv_bytes_per_cell + mtp_bpc);
+                const uint64_t need_i = (uint64_t)cp.n_ctx * (kv_rate[i].kv_bytes_per_cell + mtp_bpc);   // unified: one shared pool
                 const uint64_t have_i = scan_now[i].free_bytes;
                 if (need_i > have_i) {
-                    fprintf(stderr, "error: warmup KV pool too large — GPU %zu needs %s for %u cells x %u streams but only %s free\n",
-                            i, gib_str(need_i).c_str(), cp.n_ctx, probe_parallel, gib_str(have_i).c_str());
+                    fprintf(stderr, "error: warmup KV pool too large — GPU %zu needs %s for %u unified cells but only %s free\n",
+                            i, gib_str(need_i).c_str(), cp.n_ctx, gib_str(have_i).c_str());
                     fits = false;
                 }
             }
