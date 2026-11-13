@@ -577,27 +577,26 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
             fprintf(stderr, "    %s (%d attention / %d SSM layers, %s K / %s V):\n",
                     r.name, r.attn_layers, r.ssm_layers,
                     ggml_type_name(type_k), ggml_type_name(type_v));
+            // factors print plain; only the term values are fixed-width,
+            // since those are what add up to probe-KV below
             if (r.kv_bpc > 0) {
-                fprintf(stderr, "      context    : %s x %s%s = %s\n",
-                        bytes_str(r.kv_cells).c_str(), bytes_str(r.kv_bpc).c_str(),
-                        r.streams > 1 ? (std::string(" x ") + std::to_string(r.streams)).c_str() : "",
-                        bytes_str(r.kv_cells * r.kv_bpc * r.streams).c_str());
+                fprintf(stderr, "      %-12s %lu x %lu = %14lu\n",
+                        "context:", r.kv_cells, r.kv_bpc * r.streams,
+                        r.kv_cells * r.kv_bpc * r.streams);
             }
             if (r.mtp_bpc > 0) {
-                fprintf(stderr, "      mtp draft  : %s x %s%s = %s   (%d nextn layers)\n",
-                        bytes_str(r.kv_cells).c_str(), bytes_str(r.mtp_bpc).c_str(),
-                        r.streams > 1 ? (std::string(" x ") + std::to_string(r.streams)).c_str() : "",
-                        bytes_str(r.kv_cells * r.mtp_bpc * r.streams).c_str(), r.mtp_layers);
+                fprintf(stderr, "      %-12s %lu x %lu = %14lu   (%d nextn layers)\n",
+                        "mtp draft:", r.kv_cells, r.mtp_bpc * r.streams,
+                        r.kv_cells * r.mtp_bpc * r.streams, r.mtp_layers);
             }
             if (r.ssm_bpr > 0) {
-                fprintf(stderr, "      checkpoints: %s x %s = %s   (%d SSM layers%s)\n",
-                        bytes_str(r.state_rows).c_str(), bytes_str(r.ssm_bpr).c_str(),
-                        bytes_str(r.state_rows * r.ssm_bpr).c_str(), r.ssm_layers,
-                        r.streams > 1
-                            ? (std::string(", ") + std::to_string(r.streams) + " streams x 9 rows").c_str()
-                            : "");
+                fprintf(stderr, "      %-12s %lu x %lu = %14lu   (%d SSM layers)\n",
+                        "checkpoints:", r.state_rows, r.ssm_bpr,
+                        r.state_rows * r.ssm_bpr, r.ssm_layers);
             }
-            fprintf(stderr, "      probe-KV   : %s\n", bytes_str(r.probe_kv).c_str());
+            fprintf(stderr, "      ────────────────────────────────────────────\n");
+            fprintf(stderr, "      %-12s       = %14lu\n",
+                    "probe-KV:", r.probe_kv);
         }
     }
 
