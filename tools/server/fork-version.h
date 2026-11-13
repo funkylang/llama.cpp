@@ -4,4 +4,4 @@
 // updated on every fork commit with the ACTUAL current time at update (strict ordering);
 // printed as the first startup message of llama-server so the running build can be identified
 
-static const char * FORK_VERSION = "2026-11-13 12:33:57 gpu-split: probe-KV fix, 16384 probe ctx, bytes view with derivation";
+static const char * FORK_VERSION = "2026-11-13 13:52:42 gpu-split: MTP draft pool + SSM checkpoint rows in probe-KV";

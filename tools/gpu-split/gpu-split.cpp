@@ -233,9 +233,13 @@ static void print_provisional_split(const llama_model * model) {
     }
 }
 
-// Per-device attention KV cell rate (base model only — MTP off during the
-// measurement load, nextn layers TENSOR_SKIP). Indexed by backend device order.
-struct kv_rate_info { uint64_t bytes_per_cell = 0; int n_layers = 0; };
+// Per-device probe-memory rates (nextn layers counted separately — they serve
+// the MTP draft context, not the main one). Indexed by backend device order.
+struct kv_rate_info {
+    uint64_t kv_bytes_per_cell = 0; int n_attn_layers = 0; // attention KV pool
+    uint64_t ssm_bytes_per_row = 0; int n_ssm_layers = 0;  // recurrent state, per checkpoint row
+    uint64_t mtp_kv_bytes_per_cell = 0; int n_mtp_layers = 0; // nextn KV pool (MTP draft)
+};
 
 static std::vector<kv_rate_info> compute_kv_rates(const llama_model * model,
                                                   const std::vector<dev_usage> & usage,
@@ -247,20 +251,36 @@ static std::vector<kv_rate_info> compute_kv_rates(const llama_model * model,
     const bool v_t = !flash_attn;
     std::vector<kv_rate_info> kv_rate(usage.size());
     for (size_t i = 0; i < usage.size(); ++i) {
-        uint64_t rate = 0;
-        int n_layers = 0;
         for (int il : usage[i].layers) {
-            if (il >= (int)n_layer_all || il >= (int)(n_layer_all - n_layer_nextn)) continue; // nextn skipped
-            if (!hp.has_kv(il) || hp.is_recr(il)) continue;
-            const uint32_t ek = hp.n_embd_k_gqa(il);
-            const uint32_t ev = v_t ? hp.n_embd_v_gqa_max() : hp.n_embd_v_gqa(il);
-            uint64_t cb = (uint64_t)ggml_row_size(type_k, ek);
-            if (!hp.is_mla()) cb += (uint64_t)ggml_row_size(type_v, ev);
-            rate += cb;
-            ++n_layers;
+            if (il >= (int)n_layer_all) continue;
+            // nextn layers: their KV pool lives in the MTP draft context
+            if (il >= (int)(n_layer_all - n_layer_nextn)) {
+                const uint32_t ek = hp.n_embd_k_gqa(il);
+                const uint32_t ev = v_t ? hp.n_embd_v_gqa_max() : hp.n_embd_v_gqa(il);
+                uint64_t cb = (uint64_t)ggml_row_size(type_k, ek);
+                if (!hp.is_mla()) cb += (uint64_t)ggml_row_size(type_v, ev);
+                kv_rate[i].mtp_kv_bytes_per_cell += cb;
+                ++kv_rate[i].n_mtp_layers;
+                continue;
+            }
+            if (hp.is_recr(il)) {
+                // recurrent state rows are always F32 (create_memory hardcodes them)
+                uint64_t cb = (uint64_t)ggml_row_size(GGML_TYPE_F32, hp.n_embd_r());
+                cb += (uint64_t)ggml_row_size(GGML_TYPE_F32, hp.n_embd_s());
+                if (hp.ple_conv_state() > 0 && hp.is_ple(il)) {
+                    cb += (uint64_t)ggml_row_size(GGML_TYPE_F32, hp.ple_conv_state());
+                }
+                kv_rate[i].ssm_bytes_per_row += cb;
+                ++kv_rate[i].n_ssm_layers;
+            } else if (hp.has_kv(il)) {
+                const uint32_t ek = hp.n_embd_k_gqa(il);
+                const uint32_t ev = v_t ? hp.n_embd_v_gqa_max() : hp.n_embd_v_gqa(il);
+                uint64_t cb = (uint64_t)ggml_row_size(type_k, ek);
+                if (!hp.is_mla()) cb += (uint64_t)ggml_row_size(type_v, ev);
+                kv_rate[i].kv_bytes_per_cell += cb;
+                ++kv_rate[i].n_attn_layers;
+            }
         }
-        kv_rate[i].bytes_per_cell = rate;
-        kv_rate[i].n_layers = n_layers;
     }
     return kv_rate;
 }
@@ -397,7 +417,8 @@ static int warmup_decode(llama_context * ctx, const std::vector<int32_t> & token
 static void print_device_scan(const std::vector<dev_snapshot> & raw,
                               const std::vector<dev_snapshot> & measure,
                               const llama_model * model, uint32_t n_ctx_measure,
-                              ggml_type type_k, ggml_type type_v, bool flash_attn) {
+                              ggml_type type_k, ggml_type type_v, bool flash_attn,
+                              uint32_t n_checkpoints, bool mtp_measured) {
     // decide row visibility first: when any GPU/IGPU is present, CPU rows are
     // noise for planning and get hidden (Michael, 2026-11-12); without GPUs the
     // CPU row is shown again so the scan never renders an empty table.
@@ -454,8 +475,9 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
     // per-GPU decomposition of the free-VRAM delta: what the live deployment
     // load consumed, split into its three components —
     //   weights : tensor bytes placed on this device (read back from the model)
-    //   probe-KV: the measurement context's KV pool (n_ctx cells at this device's
-    //             attention rate) — negligible by construction but accounted for
+    //   probe-KV: the measurement context's probe memory = attention KV pool
+    //             (n_ctx cells at this device's rate) + recurrent SSM state
+    //             (--checkpoints rows per layer at this device's state rate)
     //   kernels : shaders + compute buffers + alignment slack = delta − weights
     //             − probe-KV. This residual is the fixed per-GPU overhead a
     //             deployment always pays (the number we actually budget for).
@@ -478,7 +500,8 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
     struct dev_row {
         size_t idx; const char * type_str; const char * name;
         uint64_t delta, weights, probe_kv, kernels;
-        uint64_t kv_bpc; int kv_layers;   // kv_rate inputs behind probe-KV
+        uint64_t kv_cells, kv_bpc, n_ckpt, ssm_bpr, mtp_bpc;  // probe-KV formula inputs
+        int attn_layers, ssm_layers, mtp_layers;
     };
     std::vector<dev_row> rows;
     for (size_t i = 0; i < ndevs; ++i) {
@@ -490,19 +513,31 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
         const uint64_t delta = (raw[i].free_bytes > measure[i].free_bytes)
                              ? raw[i].free_bytes - measure[i].free_bytes : 0;
 
-        uint64_t weights_i = 0, probe_kv_i = 0, kv_bpc = 0;
-        int kv_layers = 0;
+        uint64_t weights_i = 0, probe_kv_i = 0, kv_cells = 0, kv_bpc = 0, ssm_bpr = 0, mtp_bpc = 0;
+        int attn_layers = 0, ssm_layers = 0, mtp_layers = 0;
         if (have_decomp && i < usage.size() && i < kv_rate.size()) {
-            weights_i  = usage[i].bytes;
-            kv_bpc     = kv_rate[i].bytes_per_cell;
-            kv_layers  = kv_rate[i].n_layers;
-            probe_kv_i = (uint64_t)n_ctx_measure * kv_bpc;
+            weights_i   = usage[i].bytes;
+            kv_cells    = ((uint64_t)n_ctx_measure + 255) / 256 * 256; // GGML_PAD, as the cache does
+            kv_bpc      = kv_rate[i].kv_bytes_per_cell;
+            ssm_bpr     = kv_rate[i].ssm_bytes_per_row;
+            attn_layers = kv_rate[i].n_attn_layers;
+            ssm_layers  = kv_rate[i].n_ssm_layers;
+            if (mtp_measured) {
+                mtp_bpc    = kv_rate[i].mtp_kv_bytes_per_cell;
+                mtp_layers = kv_rate[i].n_mtp_layers;
+            }
+            // probe memory = attention KV pool + MTP draft pool (if measured)
+            //               + recurrent SSM state rows
+            probe_kv_i  = kv_cells * (kv_bpc + mtp_bpc)
+                        + (uint64_t)n_checkpoints * ssm_bpr;
         }
         // kernels = residual after removing the two accounted-for terms
         uint64_t kernels_i = (delta > weights_i + probe_kv_i) ? delta - weights_i - probe_kv_i : 0;
 
         rows.push_back({i, dev_type_str(type), ggml_backend_dev_name(dev),
-                        delta, weights_i, probe_kv_i, kernels_i, kv_bpc, kv_layers});
+                        delta, weights_i, probe_kv_i, kernels_i,
+                        kv_cells, kv_bpc, n_checkpoints, ssm_bpr, mtp_bpc,
+                        attn_layers, ssm_layers, mtp_layers});
     }
 
     for (const auto & r : rows) {
@@ -535,14 +570,28 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
     }
 
     if (have_decomp) {
-        fprintf(stderr, "\n  probe-KV derivation (probe pool: %u cells x kv_rate of this device):\n",
-                n_ctx_measure);
+        fprintf(stderr, "\n  probe-KV derivation (bytes): context cells x cell"
+                        " + mtp draft x cell + checkpoints x ssm_state:\n");
         for (const auto & r : rows) {
-            if (r.probe_kv == 0) continue;
-            fprintf(stderr, "    %s: %u x %s = %s   (%d attention layers, %s K / %s V)\n",
-                    r.name, n_ctx_measure, bytes_str(r.kv_bpc).c_str(),
-                    bytes_str(r.probe_kv).c_str(), r.kv_layers,
+            fprintf(stderr, "    %s (%d attention / %d SSM layers, %s K / %s V):\n",
+                    r.name, r.attn_layers, r.ssm_layers,
                     ggml_type_name(type_k), ggml_type_name(type_v));
+            if (r.kv_bpc > 0) {
+                fprintf(stderr, "      context    : %s x %s = %s\n",
+                        bytes_str(r.kv_cells).c_str(), bytes_str(r.kv_bpc).c_str(),
+                        bytes_str(r.kv_cells * r.kv_bpc).c_str());
+            }
+            if (r.mtp_bpc > 0) {
+                fprintf(stderr, "      mtp draft  : %s x %s = %s   (%d nextn layers)\n",
+                        bytes_str(r.kv_cells).c_str(), bytes_str(r.mtp_bpc).c_str(),
+                        bytes_str(r.kv_cells * r.mtp_bpc).c_str(), r.mtp_layers);
+            }
+            if (r.ssm_bpr > 0) {
+                fprintf(stderr, "      checkpoints: %s x %s = %s   (%d SSM layers)\n",
+                        bytes_str(r.n_ckpt).c_str(), bytes_str(r.ssm_bpr).c_str(),
+                        bytes_str(r.n_ckpt * r.ssm_bpr).c_str(), r.ssm_layers);
+            }
+            fprintf(stderr, "      probe-KV   : %s\n", bytes_str(r.probe_kv).c_str());
         }
     }
 
@@ -598,6 +647,7 @@ int main(int argc, char ** argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s <model.gguf> [-ctk|--cache-type-k TYPE] [-ctv|--cache-type-v TYPE]\n"
                         "                       [-flash-attn|-no-flash-attn] [--ubatch-size N]\n"
+                        "                       [--checkpoints N] [--no-mtp]\n"
                         "  allowed cache types: %s\n", argv[0], all_kv_cache_types().c_str());
         return 1;
     }
@@ -606,6 +656,8 @@ int main(int argc, char ** argv) {
     ggml_type type_k = GGML_TYPE_F16, type_v = GGML_TYPE_F16;
     bool flash_attn = true;
     uint32_t ubatch_size = 512;   // default: matches llama.cpp's n_ubatch
+    uint32_t n_checkpoints = 1;   // SSM state rows per layer for the probe run
+    bool use_mtp = true;          // auto: MTP draft context is measured when the model has a nextn block
 
     for (int a = 2; a < argc; a++) {
         std::string arg = argv[a];
@@ -614,6 +666,13 @@ int main(int argc, char ** argv) {
         else if (arg == "-flash-attn")                     flash_attn = true;
         else if (arg == "-no-flash-attn")                  flash_attn = false;
         else if (arg == "--ubatch-size")                   ubatch_size = atoi(argv[++a]);
+        else if (arg == "--checkpoints")                   n_checkpoints = (uint32_t)atoi(argv[++a]);
+        else if (arg == "--no-mtp")                        use_mtp = false;
+    }
+
+    if (n_checkpoints < 1) {
+        fprintf(stderr, "error: --checkpoints must be >= 1 (the live state row always exists)\n");
+        return 1;
     }
 
     const bool v_trans = !flash_attn;
@@ -746,18 +805,26 @@ int main(int argc, char ** argv) {
     }
     const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load0).count();
 
+    // MTP capability: a nextn block that is not repurposed as a router layer.
+    // On router models the trunk attends to those layers on EVERY pass, so no
+    // separate draft context exists there — and llama_init_from_model rejects
+    // LLAMA_CONTEXT_TYPE_MTP for them (llama-context.cpp:4388).
+    const bool measure_mtp = use_mtp && model->hparams.n_layer_nextn > 0 && model->hparams.router_layer < 0;
+
     // measurement: context at the common 16384-cell deployment size + decode
     // through the real weights. Every kernel the deployment will launch is
     // uploaded during this run — kernels only materialize on their first execution
     // (concept §17). The probe KV pool is accounted for in the overhead
     // decomposition below, so its size no longer skews the shader overhead.
     uint32_t n_ctx_measure = 0;
+    bool mtp_measured = false;   // true when the nextn KV pool is in the measured delta
     {
         llama_context_params cp = llama_context_default_params();
         cp.n_batch  = 2048;   // default; exercises the large-batch decode path
         cp.n_ubatch = ubatch_size;
         cp.type_k = type_k;   // measure what the deployment uses — not the f16 default
         cp.type_v = type_v;
+        cp.n_rs_seq = n_checkpoints - 1;   // state rows per layer = 1 + n_rs_seq = --checkpoints
 
         // tokenize the excerpt UP FRONT so the token count is visible while the
         // (slow) warmup decode runs — the user sees what the system is processing
@@ -792,7 +859,8 @@ int main(int argc, char ** argv) {
                 if (!dev) continue;
                 const auto t = ggml_backend_dev_type(dev);
                 if (!(t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU)) continue;
-                const uint64_t need_i = (uint64_t)cp.n_ctx * kv_rate[i].bytes_per_cell; // 1 stream during measurement
+                const uint64_t mtp_bpc = measure_mtp ? kv_rate[i].mtp_kv_bytes_per_cell : 0;   // MTP draft pool, same n_ctx
+                const uint64_t need_i = (uint64_t)cp.n_ctx * (kv_rate[i].kv_bytes_per_cell + mtp_bpc);
                 const uint64_t have_i = scan_now[i].free_bytes;
                 if (need_i > have_i) {
                     fprintf(stderr, "error: warmup KV pool too large — GPU %zu needs %s for %u cells but only %s free\n",
@@ -808,19 +876,66 @@ int main(int argc, char ** argv) {
             }
         }
 
-        fprintf(stderr, "  measuring: n_ctx=%u n_batch=%u n_ubatch=%u (warmup: Hamlet excerpt, %d tokens)\n",
-                (unsigned)cp.n_ctx, (unsigned)cp.n_batch, (unsigned)cp.n_ubatch, n_tok);
+        fprintf(stderr, "  measuring: n_ctx=%u n_batch=%u n_ubatch=%u checkpoints=%u mtp=%s (warmup: Hamlet excerpt, %d tokens)\n",
+                (unsigned)cp.n_ctx, (unsigned)cp.n_batch, (unsigned)cp.n_ubatch,
+                (unsigned)n_checkpoints, measure_mtp ? "yes" : "no", n_tok);
         const auto t_warmup0 = std::chrono::steady_clock::now();
         llama_context * ctx0 = llama_init_from_model(model, cp);
         if (!ctx0) {
             fprintf(stderr, "  measurement: context init failed\n");
         } else {
             warmup_decode(ctx0, prompt_tokens);
+
+            // MTP draft context — auto-enabled when the model has a nextn block,
+            // --no-mtp to skip (speculative.cpp pattern): same n_ctx as the target,
+            // no recurrent state of its own, reads h_nextn from the main context.
+            // It must still exist when scan_measure runs below, so its nextn KV
+            // pool is part of the measured delta — freed only afterwards.
+            llama_context * ctx_mtp = nullptr;
+            if (measure_mtp) {
+                llama_context_params cp_mtp = cp;
+                cp_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                cp_mtp.n_rs_seq = 0;
+                cp_mtp.ctx_other = ctx0;
+                ctx_mtp = llama_init_from_model(model, cp_mtp);
+                if (ctx_mtp) {
+                    mtp_measured = true;   // the nextn KV pool now exists in the measured delta
+                    // one single-token MTP graph run at the first position after
+                    // the prompt (the main context decoded it during warmup):
+                    // uploads every kernel an MTP deployment will launch
+                    int seq_id = 0;   // non-const: batch.seq_id must point to a stable llama_seq_id
+                    llama_batch mb;
+                    mb.n_tokens = 1;
+                    mb.token    = (llama_token *)  malloc(sizeof(llama_token));
+                    mb.pos      = (llama_pos *)     malloc(sizeof(llama_pos));
+                    mb.n_seq_id = (int32_t *)       malloc(sizeof(int32_t));
+                    mb.seq_id   = (llama_seq_id **) malloc(sizeof(llama_seq_id *));
+                    mb.logits   = (int8_t *)        malloc(1);
+                    mb.token[0]    = prompt_tokens.back();
+                    mb.pos[0]      = (llama_pos)prompt_tokens.size();
+                    mb.n_seq_id[0] = 1;
+                    mb.seq_id[0]   = &seq_id;
+                    mb.logits[0]   = 1;
+                    const int rc = llama_decode(ctx_mtp, mb);
+                    free(mb.token); free(mb.pos); free(mb.n_seq_id); free(mb.seq_id); free(mb.logits);
+                    if (rc != 0) {
+                        fprintf(stderr, "  mtp draft: decode failed (%d)\n", rc);
+                    } else {
+                        fprintf(stderr, "  mtp draft: context ready — nextn KV pool in the measured delta\n");
+                    }
+                } else {
+                    fprintf(stderr, "  mtp draft: context init failed — nextn KV pool NOT in the measured delta\n");
+                }
+            }
+
             const double warmup_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warmup0).count();
             fprintf(stderr, "  measurement: done; load %.1f s + warmup %.1f s (%.0f tok/s)\n",
                     load_s, warmup_s, warmup_s > 0 ? (double)n_tok / warmup_s : 0.0);
             read_all_devices(scan_measure);
             fix_cpu_free(scan_measure);
+            if (ctx_mtp) {
+                llama_free(ctx_mtp);
+            }
             llama_free(ctx0);
         }
     }
@@ -893,7 +1008,8 @@ int main(int argc, char ** argv) {
 
     // device scan prints AFTER the model header block (Michael, 2026-11-12);
     // the measurements themselves were taken above, before any output.
-    print_device_scan(scan_raw, scan_measure, model, n_ctx_measure, type_k, type_v, flash_attn);
+    print_device_scan(scan_raw, scan_measure, model, n_ctx_measure, type_k, type_v, flash_attn,
+                      n_checkpoints, mtp_measured);
 
     // where the weights actually landed (GPU machines only)
     print_provisional_split(model);
