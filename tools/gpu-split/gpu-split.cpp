@@ -176,8 +176,12 @@ static std::vector<dev_usage> compute_dev_usage(const llama_model * model) {
         const size_t bytes = ggml_nbytes(tensor);
 
         int il = -1;
-        if (!strncmp(tname.c_str(), "blk.", 4)) {
-            il = atoi(tname.c_str() + 4);
+        const char * t = tname.c_str();
+        if (!strncmp(t, "blk.nextn.", 10)) {
+            // nextn block <i> sits at hp index n_layer + i (trunk is [0, n_layer))
+            il = (int)model->hparams.n_layer() + atoi(t + 10);
+        } else if (!strncmp(t, "blk.", 4)) {
+            il = atoi(t + 4);
         }
 
         for (size_t i = 0; i < ndevs; ++i) {
@@ -292,9 +296,10 @@ static std::vector<kv_rate_info> compute_kv_rates(const llama_model * model,
 // and each decision can be verified (removed once proven correct).
 
 struct layer_cost {
-    uint64_t weights = 0;     // tensor bytes for this layer (GGUF metadata)
-    uint64_t kv_bpc  = 0;     // KV-cache bytes per cell, this layer's attention
-    uint64_t ssm_state = 0;   // recurrent checkpoint state (rows x row-set), else 0
+    uint64_t weights = 0;       // tensor bytes for this layer (GGUF metadata)
+    uint64_t kv_bpc  = 0;       // KV-cache bytes per cell, main pool (attention layers)
+    uint64_t mtp_kv_bpc = 0;    // KV-cache bytes per cell, MTP draft pool (nextn layers)
+    uint64_t ssm_state = 0;     // recurrent checkpoint state (rows x row-set), else 0
 };
 
 static std::vector<layer_cost> compute_layer_costs(const llama_model * model,
@@ -303,7 +308,8 @@ static std::vector<layer_cost> compute_layer_costs(const llama_model * model,
                                                    bool flash_attn, uint32_t state_rows) {
     const auto & hp = model->hparams;
     const bool v_t = !flash_attn;
-    std::vector<layer_cost> out(hp.n_layer_all);   // trunk layers (excludes nextn)
+    const uint32_t n_nextn_first = hp.n_layer_all - hp.n_layer_nextn;   // first nextn index
+    std::vector<layer_cost> out(hp.n_layer_all);
     for (uint32_t il = 0; il < hp.n_layer_all; ++il) {
         auto it = layer_weights.find((int)il);
         if (it != layer_weights.end()) {
@@ -324,7 +330,12 @@ static std::vector<layer_cost> compute_layer_costs(const llama_model * model,
             if (!hp.is_mla()) {
                 cb += (uint64_t)ggml_row_size(type_v, ev);
             }
-            out[il].kv_bpc = cb;
+            // nextn layers back the MTP draft context, not the main pool
+            if (il >= n_nextn_first) {
+                out[il].mtp_kv_bpc = cb;
+            } else {
+                out[il].kv_bpc = cb;
+            }
         }
     }
     return out;
@@ -343,12 +354,14 @@ static bool try_place_kv_pool(uint32_t n_blocks,
     fprintf(stderr, "\n    testing with n = %-5u blocks (%llu cells)\n",
             n_blocks, (unsigned long long)cells);
 
-    // prefix sums over layers: O(1) range queries for cost and kv bytes-per-cell
+    // prefix sums over layers: O(1) range queries for cost and kv bytes-per-cell.
+    // The per-cell charge covers BOTH pools a layer's cells live in: the main
+    // KV pool (attention layers) and the MTP draft pool (nextn layers).
     const size_t nl = layers.size();
     std::vector<uint64_t> p_wss(nl + 1, 0), p_bpc(nl + 1, 0);
     for (size_t i = 0; i < nl; ++i) {
         p_wss[i + 1] = p_wss[i] + layers[i].weights + layers[i].ssm_state;
-        p_bpc[i + 1] = p_bpc[i] + layers[i].kv_bpc;
+        p_bpc[i + 1] = p_bpc[i] + layers[i].kv_bpc + layers[i].mtp_kv_bpc;
     }
 
     size_t il = 0;
@@ -360,7 +373,8 @@ static bool try_place_kv_pool(uint32_t n_blocks,
         if (!is_last) {
             // intermediate GPU: take layers while they fit, hand over the rest
             while (il < nl) {
-                const uint64_t cost = layers[il].weights + cells * layers[il].kv_bpc
+                const uint64_t cost = layers[il].weights + cells * (layers[il].kv_bpc
+                                                                   + layers[il].mtp_kv_bpc)
                                     + layers[il].ssm_state;
                 if (used + cost > budgets[g]) break;   // next GPU continues at il
                 used += cost;
@@ -412,12 +426,14 @@ static uint32_t solve_kv_pool(uint32_t n_max,
         fprintf(stderr, "    n_max = 0 — nothing to solve\n");
         return 0;
     }
-    // guard: even with an empty pool every layer must fit somewhere
-    if (!try_place_kv_pool(0, layers, budgets, names)) {
-        fprintf(stderr, "    ERROR: layers do not fit on the GPUs at n=0 blocks\n");
-        return 0;
+    // the budgets each candidate is checked against
+    fprintf(stderr, "    budgets:");
+    for (size_t g = 0; g < budgets.size(); ++g) {
+        fprintf(stderr, " %s = %llu", names[g].c_str(),
+                (unsigned long long)budgets[g]);
     }
-    uint32_t low = 0, high = n_max;   // low always fits (n=0 verified above)
+    fprintf(stderr, "\n");
+    uint32_t low = 0, high = n_max;   // bisection over the whole range
     while (low < high) {
         const uint32_t mid = low + (high - low + 1) / 2;   // rounds UP -> monotonic progress
         if (try_place_kv_pool(mid, layers, budgets, names)) {
@@ -752,8 +768,11 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
     // How much VRAM each GPU leaves for planning:
     //   reserve   = total × keep_free
     //   budget    = total - reserve              (= total × (1 - keep_free))
-    //   loaded    = weights + probe-KV  (tensors + cache/checkpoint state)
-    //   available = budget - loaded
+    //   kernels   = driver/backend overhead on the device
+    //   loaded    = weights + probe-KV  (model footprint, informational)
+    //   available = budget - kernels   (planning headroom — the pool solver
+    //                re-charges tensors/checkpoints/cells per layer itself;
+    //                subtracting them here would count them twice)
     // Integer arithmetic throughout, so every printed value chains from the
     // previous one. The accumulated available across all GPUs is the budget
     // the proportional split will distribute.
@@ -761,8 +780,8 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
         fprintf(stderr, "\n");
         fprintf(stderr, "  split budget (bytes): reserve = total × keep_free(%.2f); "
                         "budget = total - reserve;\n", keep_free);
-        fprintf(stderr, "                         loaded = weights + probe-KV; "
-                        "available = budget - loaded\n\n");
+        fprintf(stderr, "                         kernels = device overhead; "
+                        "available = budget - kernels\n\n");
         fprintf(stderr, "    %-4s %-6s %15s %15s %15s %15s %15s  %s\n",
                 "idx", "type", "total", "reserve", "budget", "loaded", "available", "name");
         int64_t accumulated_available = 0;
@@ -773,8 +792,9 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
             const int64_t total   = (int64_t)raw[r.idx].total_bytes;
             const int64_t reserve = (int64_t)((double)total * keep_free);
             const int64_t budget  = total - reserve;
+            const int64_t kernels = (int64_t)r.kernels;
             const int64_t loaded  = (int64_t)r.weights + (int64_t)r.probe_kv;
-            const int64_t available = budget - loaded;
+            const int64_t available = budget - kernels;
             accumulated_available += available;
             // negative available = overcommitted GPU: it cannot hold anything
             gpu_budgets.push_back(available > 0 ? (uint64_t)available : 0);
@@ -790,13 +810,14 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
         // theoretical kv-cache ceiling: how many cells fit into the accumulated
         // available budget at full per-cell cost. The pool capacity is a
         // property of the pool itself — parallel sequences share it, they do
-        // not multiply its size, so streams plays no role here.
-        //   total cell size = sum over GPUs of attention bytes-per-cell
+        // not multiply its size, so streams plays no role here. Per cell the
+        // model pays for BOTH pools: main KV cells + MTP draft cells.
+        //   total cell size = sum over GPUs of (kv_bpc + mtp_bpc)
         //   upper limit     = total available ÷ total cell size    (integer division)
         uint64_t cell_size_per_token = 0;
         for (const auto & r : rows) {
             if (!raw[r.idx].ok || raw[r.idx].total_bytes == 0) continue;
-            cell_size_per_token += r.kv_bpc;
+            cell_size_per_token += r.kv_bpc + r.mtp_bpc;
         }
         fprintf(stderr, "    %-76s%15llu\n",
                 "total cell size:", (unsigned long long)cell_size_per_token);
@@ -989,6 +1010,17 @@ int main(int argc, char ** argv) {
 
     int64_t n_tensors = gguf_get_n_tensors(ctx);
     std::map<int, int64_t> layer_weights;
+    // nextn block indices (runtime layout): blk.nextn.<i> maps to hp layer
+    // n_layer + i — the trunk occupies [0, n_layer), nextn sits right after.
+    // Read from GGUF metadata: this no_alloc parse predates the model load.
+    int64_t n_layer_meta = 0;
+    if (arch) {
+        const std::string nk = std::string(arch) + ".n_layer";
+        int64_t id_nlayer = gguf_find_key(ctx, nk.c_str());
+        if (id_nlayer >= 0) {
+            n_layer_meta = (int64_t)gguf_get_val_u32(ctx, id_nlayer);
+        }
+    }
     // per-layer routed-expert flags derived from the GGUF tensor names —
     // needed because some architectures (e.g. granite-hybrid) never fill
     // n_ff_exp_arr and key their experts off a global n_expert only.
@@ -1013,7 +1045,14 @@ int main(int argc, char ** argv) {
         if (!strcmp(tname, "output.weight"))      { output_bytes += tsize; continue; }
 
         int il = -1;
-        if (strstr(tname, "blk.")) {
+        const char * p_nextn = strstr(tname, "blk.nextn.");
+        if (p_nextn) {
+            // nextn tensor: blk.nextn.<i>.<rest> -> hp layer n_layer + i
+            int nin = 0;
+            if (n_layer_meta > 0 && sscanf(p_nextn + strlen("blk.nextn."), "%d", &nin) == 1) {
+                il = (int)n_layer_meta + nin;
+            }
+        } else if (strstr(tname, "blk.")) {
             const char * p = strstr(tname, "blk.");
             sscanf(p + 4, "%d", &il);
         }
