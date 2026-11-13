@@ -330,77 +330,97 @@ static std::vector<layer_cost> compute_layer_costs(const llama_model * model,
     return out;
 }
 
-// Try placing n 256-cell blocks: walk layers in order, each GPU takes layers
-// greedily until the next one would exceed its available budget. The failing
-// layer starts on the NEXT GPU; only an overflow on the LAST GPU fails the
-// candidate. Every decision is traced via fprintf (verification aid).
+// Try placing n 256-cell blocks: walk layers in order — each intermediate GPU
+// takes layers greedily until the next one would exceed its budget; the LAST
+// GPU has no choice, it must take all remaining layers, so it only fits if
+// their total cost stays inside its budget (otherwise "over limit" is shown).
+// Every decision is traced via fprintf (verification aid).
 static bool try_place_kv_pool(uint32_t n_blocks,
                               const std::vector<layer_cost> & layers,
-                              const std::vector<uint64_t> & budgets) {
+                              const std::vector<uint64_t> & budgets,
+                              const std::vector<std::string> & names) {
     const uint64_t cells = (uint64_t)n_blocks * 256;
+    fprintf(stderr, "\n    testing with n = %-5u blocks (%llu cells)\n",
+            n_blocks, (unsigned long long)cells);
+
+    // prefix sums over layers: O(1) range queries for cost and kv bytes-per-cell
+    const size_t nl = layers.size();
+    std::vector<uint64_t> p_wss(nl + 1, 0), p_bpc(nl + 1, 0);
+    for (size_t i = 0; i < nl; ++i) {
+        p_wss[i + 1] = p_wss[i] + layers[i].weights + layers[i].ssm_state;
+        p_bpc[i + 1] = p_bpc[i] + layers[i].kv_bpc;
+    }
 
     size_t il = 0;
-    for (size_t g = 0; g < budgets.size(); ++g) {
-        uint64_t used = 0;
+    for (size_t g = 0; g < budgets.size() && il < nl; ++g) {
+        const bool is_last = (g + 1 == budgets.size());
         const size_t first_layer = il;
-        while (il < layers.size()) {
-            const uint64_t cost = layers[il].weights + cells * layers[il].kv_bpc
-                                + layers[il].ssm_state;
-            if (used + cost > budgets[g]) {
-                break;   // this layer exceeds the budget — previous is last for this GPU
+        uint64_t used = 0;
+
+        if (!is_last) {
+            // intermediate GPU: take layers while they fit, hand over the rest
+            while (il < nl) {
+                const uint64_t cost = layers[il].weights + cells * layers[il].kv_bpc
+                                    + layers[il].ssm_state;
+                if (used + cost > budgets[g]) break;   // next GPU continues at il
+                used += cost;
+                ++il;
             }
-            used += cost;
-            ++il;
+        } else {
+            // last GPU: no choice — all remaining layers are its, so the range
+            // total against its budget decides the candidate outright
+            used = (p_wss[nl] - p_wss[first_layer])
+                 + cells * (p_bpc[nl] - p_bpc[first_layer]);
         }
-        const bool placed_any = (il > first_layer);
-        if (il < layers.size()) {
-            // intermediate GPU: expected hand-over, next GPU continues with il
-            fprintf(stderr, "    n=%-7u blocks (%-12llu cells)  gpu%zu: layers %s  "
-                            "used %15llu / %15llu  -> next layer %zu goes to gpu%zu\n",
-                    n_blocks, (unsigned long long)cells, g,
-                    placed_any ? "" : "(none)",
-                    (unsigned long long)used, (unsigned long long)budgets[g],
-                    il, g + 1);
-            if (g + 1 >= budgets.size()) {
-                fprintf(stderr, "    -> FAIL: last GPU cannot fit layer %zu and up\n", il);
-                return false;
-            }
-            continue;   // next GPU takes over at layer il
+
+        const bool has_layers = is_last || (il > first_layer);   // last GPU always "owns" the rest
+        const size_t shown_last = has_layers ? (is_last ? nl - 1 : il - 1) : 0;
+        char range[64];
+        snprintf(range, sizeof range, "%s", has_layers ? "" : "(none)");
+        if (has_layers) {
+            snprintf(range, sizeof range, "%zu..%zu", first_layer, shown_last);
         }
-        fprintf(stderr, "    n=%-7u blocks (%-12llu cells)  gpu%zu: layers %s  "
-                        "used %15llu / %15llu  -> all layers placed\n",
-                n_blocks, (unsigned long long)cells, g,
-                placed_any ? "" : "(none)",
-                (unsigned long long)used, (unsigned long long)budgets[g]);
-        return true;
+
+        const uint64_t bpc = has_layers ? (p_bpc[shown_last + 1] - p_bpc[first_layer]) : 0;
+        const bool fits = (used <= budgets[g]);   // always true for intermediate GPUs (greedy)
+
+        fprintf(stderr, "      %s: layers = %s, cache size = %llu × %llu = %llu",
+                names[g].c_str(), range,
+                (unsigned long long)cells, (unsigned long long)bpc,
+                (unsigned long long)cells * bpc);
+        if (!is_last || fits) {
+            fprintf(stderr, ", not used = %llu\n",
+                    (unsigned long long)(budgets[g] - used));
+        } else {
+            fprintf(stderr, ", over limit = %llu\n",
+                    (unsigned long long)(used - budgets[g]));
+        }
+
+        if (is_last) return fits;
     }
-    return false;
+    return true;   // all layers placed — candidate fits
 }
 
 // Bisect for the largest fitting n of 256-cell blocks: at most log2(n_max)
 // steps. Returns the winning block count (0 = nothing fits).
 static uint32_t solve_kv_pool(uint32_t n_max,
                               const std::vector<layer_cost> & layers,
-                              const std::vector<uint64_t> & budgets) {
+                              const std::vector<uint64_t> & budgets,
+                              const std::vector<std::string> & names) {
     fprintf(stderr, "\n  kv pool solver: bisect n of 256-cell blocks (integer arithmetic)\n");
     if (n_max == 0 || layers.empty() || budgets.empty()) {
         fprintf(stderr, "    n_max = 0 — nothing to solve\n");
         return 0;
     }
     // guard: even with an empty pool every layer must fit somewhere
-    if (!try_place_kv_pool(0, layers, budgets)) {
+    if (!try_place_kv_pool(0, layers, budgets, names)) {
         fprintf(stderr, "    ERROR: layers do not fit on the GPUs at n=0 blocks\n");
         return 0;
     }
     uint32_t low = 0, high = n_max;   // low always fits (n=0 verified above)
     while (low < high) {
         const uint32_t mid = low + (high - low + 1) / 2;   // rounds UP -> monotonic progress
-        const bool ok = try_place_kv_pool(mid, layers, budgets);
-        fprintf(stderr, "    n=%-7u blocks: %s   [%lu .. %lu]\n",
-                mid, ok ? "fits  (low=mid)" : "no fit (high=mid-1)",
-                ok ? (unsigned long)mid : (unsigned long)low,
-                ok ? (unsigned long)high : (unsigned long)(mid - 1));
-        if (ok) {
+        if (try_place_kv_pool(mid, layers, budgets, names)) {
             low = mid;
         } else {
             high = mid - 1;
@@ -747,6 +767,7 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
                 "idx", "type", "total", "reserve", "budget", "loaded", "available", "name");
         int64_t accumulated_available = 0;
         std::vector<uint64_t> gpu_budgets;   // solver input: per-GPU available, in row order
+        std::vector<std::string> gpu_names;  // solver input: matching device names
         for (const auto & r : rows) {
             if (!raw[r.idx].ok || raw[r.idx].total_bytes == 0) continue;
             const int64_t total   = (int64_t)raw[r.idx].total_bytes;
@@ -757,6 +778,7 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
             accumulated_available += available;
             // negative available = overcommitted GPU: it cannot hold anything
             gpu_budgets.push_back(available > 0 ? (uint64_t)available : 0);
+            gpu_names.push_back(r.name);
             fprintf(stderr, "    %-4zu %-6s %15lld %15lld %15lld %15lld %15lld  %s\n",
                     r.idx, r.type_str,
                     (long long)total, (long long)reserve, (long long)budget,
@@ -792,7 +814,7 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
                     (unsigned long long)n_max);
             auto layer_costs = compute_layer_costs(model, layer_weights,
                                                    type_k, type_v, flash_attn, state_rows);
-            solve_kv_pool(n_max, layer_costs, gpu_budgets);
+            solve_kv_pool(n_max, layer_costs, gpu_budgets, gpu_names);
         } else {
             fprintf(stderr, "    %-76s%s\n", "kv cache upper limit:", "n/a");
         }

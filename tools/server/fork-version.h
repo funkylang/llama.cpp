@@ -4,4 +4,4 @@
 // updated on every fork commit with the ACTUAL current time at update (strict ordering);
 // printed as the first startup message of llama-server so the running build can be identified
 
-static const char * FORK_VERSION = "2026-11-13 17:48:38 gpu-split: kv pool solver — bisect greedy layer placement over 256-cell blocks";
+static const char * FORK_VERSION = "2026-11-13 18:43:29 gpu-split: per-device pool solver trace with mandatory last-GPU placement";
