@@ -418,7 +418,8 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
                               const std::vector<dev_snapshot> & measure,
                               const llama_model * model, uint32_t n_ctx_measure,
                               ggml_type type_k, ggml_type type_v, bool flash_attn,
-                              uint32_t streams, uint32_t state_rows, bool mtp_measured) {
+                              uint32_t streams, uint32_t state_rows, bool mtp_measured,
+                              double keep_free) {
     // decide row visibility first: when any GPU/IGPU is present, CPU rows are
     // noise for planning and get hidden (Michael, 2026-11-12); without GPUs the
     // CPU row is shown again so the scan never renders an empty table.
@@ -580,24 +581,59 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
             // '=' characters stack vertically across rows (term values are the
             // aligned summands that make up probe-KV below).
             if (r.kv_bpc > 0) {
-                fprintf(stderr, "      %-12s %9lu x %9lu = %14lu\n",
+                fprintf(stderr, "      %-12s %9lu × %9lu = %14lu\n",
                         "context:", r.kv_cells, r.kv_bpc * r.streams,
                         r.kv_cells * r.kv_bpc * r.streams);
             }
             if (r.mtp_bpc > 0) {
-                fprintf(stderr, "      %-12s %9lu x %9lu = %14lu   (%d nextn layers)\n",
+                fprintf(stderr, "      %-12s %9lu × %9lu = %14lu   (%d nextn layers)\n",
                         "mtp draft:", r.kv_cells, r.mtp_bpc * r.streams,
                         r.kv_cells * r.mtp_bpc * r.streams, r.mtp_layers);
             }
             if (r.ssm_bpr > 0) {
-                fprintf(stderr, "      %-12s %9lu x %9lu = %14lu   (%d SSM layers)\n",
+                fprintf(stderr, "      %-12s %9lu × %9lu = %14lu   (%d SSM layers)\n",
                         "checkpoints:", r.state_rows, r.ssm_bpr,
                         r.state_rows * r.ssm_bpr, r.ssm_layers);
             }
-            fprintf(stderr, "      %s\n", "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500");
+            fprintf(stderr, "      %s\n", "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500");
             fprintf(stderr, "      %-12s                       = %14lu\n",
                     "probe-KV:", r.probe_kv);
         }
+    }
+
+    // ---- split budget --------------------------------------------------------
+    // How much VRAM each GPU leaves for planning:
+    //   reserve   = total × keep_free
+    //   budget    = total - reserve              (= total × (1 - keep_free))
+    //   loaded    = weights + probe-KV  (tensors + cache/checkpoint state)
+    //   available = budget - loaded
+    // Integer arithmetic throughout, so every printed value chains from the
+    // previous one. The accumulated available across all GPUs is the budget
+    // the proportional split will distribute.
+    if (have_decomp && gpu_present) {
+        fprintf(stderr, "\n");
+        fprintf(stderr, "  split budget (bytes): reserve = total × keep_free(%.2f); "
+                        "budget = total - reserve;\n", keep_free);
+        fprintf(stderr, "                         loaded = weights + probe-KV; "
+                        "available = budget - loaded\n\n");
+        fprintf(stderr, "    %-4s %-6s %15s %15s %15s %15s %15s  %s\n",
+                "idx", "type", "total", "reserve", "budget", "loaded", "available", "name");
+        int64_t accumulated_available = 0;
+        for (const auto & r : rows) {
+            if (!raw[r.idx].ok || raw[r.idx].total_bytes == 0) continue;
+            const int64_t total   = (int64_t)raw[r.idx].total_bytes;
+            const int64_t reserve = (int64_t)((double)total * keep_free);
+            const int64_t budget  = total - reserve;
+            const int64_t loaded  = (int64_t)r.weights + (int64_t)r.probe_kv;
+            const int64_t available = budget - loaded;
+            accumulated_available += available;
+            fprintf(stderr, "    %-4zu %-6s %15lld %15lld %15lld %15lld %15lld  %s\n",
+                    r.idx, r.type_str,
+                    (long long)total, (long long)reserve, (long long)budget,
+                    (long long)loaded, (long long)available, r.name);
+        }
+        fprintf(stderr, "    %-76s%15lld\n",
+                "total available:", (long long)accumulated_available);
     }
 
     fprintf(stderr, "\n");
@@ -1086,7 +1122,7 @@ int main(int argc, char ** argv) {
     // device scan prints AFTER the model header block (Michael, 2026-11-12);
     // the measurements themselves were taken above, before any output.
     print_device_scan(scan_raw, scan_measure, model, n_ctx_measure, type_k, type_v, flash_attn,
-                      probe_parallel, state_rows, mtp_measured);
+                      probe_parallel, state_rows, mtp_measured, keep_free);
 
     // where the weights actually landed (GPU machines only)
     print_provisional_split(model);
