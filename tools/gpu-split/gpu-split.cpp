@@ -354,14 +354,16 @@ static bool try_place_kv_pool(uint32_t n_blocks,
     fprintf(stderr, "\n    testing with n = %-5u blocks (%llu cells)\n",
             n_blocks, (unsigned long long)cells);
 
-    // prefix sums over layers: O(1) range queries for cost and kv bytes-per-cell.
+    // prefix sums over layers: O(1) range queries for each cost component.
     // The per-cell charge covers BOTH pools a layer's cells live in: the main
     // KV pool (attention layers) and the MTP draft pool (nextn layers).
     const size_t nl = layers.size();
-    std::vector<uint64_t> p_wss(nl + 1, 0), p_bpc(nl + 1, 0);
+    std::vector<uint64_t> p_wss(nl + 1, 0), p_bpc(nl + 1, 0), p_wts(nl + 1, 0), p_ssm(nl + 1, 0);
     for (size_t i = 0; i < nl; ++i) {
         p_wss[i + 1] = p_wss[i] + layers[i].weights + layers[i].ssm_state;
         p_bpc[i + 1] = p_bpc[i] + layers[i].kv_bpc + layers[i].mtp_kv_bpc;
+        p_wts[i + 1] = p_wts[i] + layers[i].weights;
+        p_ssm[i + 1] = p_ssm[i] + layers[i].ssm_state;
     }
 
     size_t il = 0;
@@ -395,18 +397,33 @@ static bool try_place_kv_pool(uint32_t n_blocks,
             snprintf(range, sizeof range, "%zu..%zu", first_layer, shown_last);
         }
 
+        // full chained arithmetic for this GPU: every value derivable from the
+        // lines above it (tensors + swa/ssm + cache = used; budget - used = not used)
+        const uint64_t wts = has_layers ? (p_wts[shown_last + 1] - p_wts[first_layer]) : 0;
+        const uint64_t ssm = has_layers ? (p_ssm[shown_last + 1] - p_ssm[first_layer]) : 0;
         const uint64_t bpc = has_layers ? (p_bpc[shown_last + 1] - p_bpc[first_layer]) : 0;
+        const uint64_t cache = cells * bpc;
         const bool fits = (used <= budgets[g]);   // always true for intermediate GPUs (greedy)
 
-        fprintf(stderr, "      %s: layers = %s, cache size = %llu × %llu = %llu",
-                names[g].c_str(), range,
-                (unsigned long long)cells, (unsigned long long)bpc,
-                (unsigned long long)cells * bpc);
+        fprintf(stderr, "      %s: layers = %s, budget = %llu\n",
+                names[g].c_str(), range, (unsigned long long)budgets[g]);
+        if (has_layers) {
+            fprintf(stderr, "              %-10s = %15llu\n", "tensors:", (unsigned long long)wts);
+            fprintf(stderr, "              %-10s = %15llu\n", "swa/ssm:", (unsigned long long)ssm);
+            fprintf(stderr, "              %-10s = %9llu × %15llu = %15llu\n",
+                    "cache:", (unsigned long long)cells, (unsigned long long)bpc,
+                    (unsigned long long)cache);
+            fprintf(stderr, "              %-10s = %llu + %llu + %llu = %15llu\n",
+                    "used:", (unsigned long long)wts, (unsigned long long)ssm,
+                    (unsigned long long)cache, (unsigned long long)(wts + ssm + cache));
+        }
         if (!is_last || fits) {
-            fprintf(stderr, ", not used = %llu\n",
+            fprintf(stderr, "              %-10s = %llu - %llu = %15llu\n",
+                    "not used:", (unsigned long long)budgets[g], (unsigned long long)used,
                     (unsigned long long)(budgets[g] - used));
         } else {
-            fprintf(stderr, ", over limit = %llu\n",
+            fprintf(stderr, "              %-10s = %llu - %llu = %15llu\n",
+                    "over limit:", (unsigned long long)used, (unsigned long long)budgets[g],
                     (unsigned long long)(used - budgets[g]));
         }
 
@@ -690,13 +707,12 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
                 mtp_bpc    = kv_rate[i].mtp_kv_bytes_per_cell;
                 mtp_layers = kv_rate[i].n_mtp_layers;
             }
-            // probe memory = attention KV pool + MTP draft pool (if measured)
-            //               + recurrent SSM state rows (= n_seq_max x (1 + n_rs_seq) per layer)
-            // The KV pools are shared: one pool of n_ctx cells serves all parallel
-            // streams (unified), so streams must NOT multiply its size — only the
-            // per-sequence SSM state rows do.
-            probe_kv_i  = kv_cells * (kv_bpc + mtp_bpc)
-                        + (uint64_t)state_rows * ssm_bpr;
+            // probe memory = attention KV pool + MTP draft pool (if measured).
+            // The pools are shared: one pool of n_ctx cells serves all parallel streams
+            // (unified), so streams do not multiply its size.
+            // The swa/ssm checkpoint state is NOT here — it is a fixed deployment cost
+            // subtracted in the upper-limit formula below, at the planned row count.
+            probe_kv_i  = kv_cells * (kv_bpc + mtp_bpc);
         }
         // kernels = residual after removing the two accounted-for terms
         uint64_t kernels_i = (delta > weights_i + probe_kv_i) ? delta - weights_i - probe_kv_i : 0;
@@ -738,8 +754,8 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
 
     if (have_decomp) {
         fprintf(stderr, "\n  probe-KV derivation (bytes): context x cell + mtp draft x cell"
-                        " + state rows x ssm_state:"
-                        " (unified pools: streams do not multiply the KV size)\n");
+                        " (unified pools: streams do not multiply the KV size; the swa/ssm"
+                        " state is a fixed cost accounted for in the upper-limit section)\n");
         for (const auto & r : rows) {
             fprintf(stderr, "    %s (%d attention / %d SSM layers, %s K / %s V):\n",
                     r.name, r.attn_layers, r.ssm_layers,
@@ -757,11 +773,6 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
                         "mtp draft:", r.kv_cells, r.mtp_bpc,
                         r.kv_cells * r.mtp_bpc, r.mtp_layers);
             }
-            if (r.ssm_bpr > 0) {
-                fprintf(stderr, "      %-12s %9lu × %9lu = %14lu   (%d SSM layers)\n",
-                        "checkpoints:", r.state_rows, r.ssm_bpr,
-                        r.state_rows * r.ssm_bpr, r.ssm_layers);
-            }
             fprintf(stderr, "      %s\n", "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500");
             fprintf(stderr, "      %-12s                       = %14lu\n",
                     "probe-KV:", r.probe_kv);
@@ -772,36 +783,43 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
     // How much VRAM each GPU leaves for planning:
     //   reserve   = total × keep_free
     //   budget    = total - reserve              (= total × (1 - keep_free))
-    //   loaded    = weights + probe-KV  (tensors + cache/checkpoint state)
+    //   loaded    = weights + probe-KV  (tensors + KV pools; the swa/ssm state
+    //               is charged separately in the upper-limit formula below)
     //   available = budget - loaded
     // Integer arithmetic throughout, so every printed value chains from the
     // previous one. The accumulated available across all GPUs is the budget
     // the proportional split will distribute.
     if (have_decomp && gpu_present) {
         fprintf(stderr, "\n");
-        fprintf(stderr, "  split budget (bytes): reserve = total × keep_free(%.2f); "
-                        "budget = total - reserve;\n", keep_free);
-        fprintf(stderr, "                         loaded = weights + probe-KV; "
-                        "available = budget - loaded\n\n");
-        fprintf(stderr, "    %-4s %-6s %15s %15s %15s %15s %15s  %s\n",
-                "idx", "type", "total", "reserve", "budget", "loaded", "available", "name");
+        fprintf(stderr, "  split budget (bytes): reserve = total × keep_free(%.2f);"
+                        " budget = free - kernels - reserve;\n", keep_free);
+        fprintf(stderr, "                         loaded = weights + probe-KV;"
+                        " available = budget - loaded\n");
+        fprintf(stderr, "                         (solver input = budget: it charges"
+                        " tensors + swa/ssm + cache per placed layer)\n\n");
+        fprintf(stderr, "    %-4s %-6s %15s %15s %15s %15s %15s %15s %15s  %s\n",
+                "idx", "type", "total", "free", "kernels", "reserve",
+                "budget", "loaded", "available", "name");
         int64_t accumulated_available = 0;
-        std::vector<uint64_t> gpu_budgets;   // solver input: per-GPU available, in row order
+        std::vector<uint64_t> gpu_budgets;   // solver input: per-GPU budget, in row order
         std::vector<std::string> gpu_names;  // solver input: matching device names
         for (const auto & r : rows) {
             if (!raw[r.idx].ok || raw[r.idx].total_bytes == 0) continue;
             const int64_t total   = (int64_t)raw[r.idx].total_bytes;
+            const int64_t free    = (int64_t)raw[r.idx].free_bytes;
+            const int64_t kernels = (int64_t)r.kernels;
             const int64_t reserve = (int64_t)((double)total * keep_free);
-            const int64_t budget  = total - reserve;
+            const int64_t budget  = free - kernels - reserve;
             const int64_t loaded  = (int64_t)r.weights + (int64_t)r.probe_kv;
             const int64_t available = budget - loaded;
             accumulated_available += available;
-            // negative available = overcommitted GPU: it cannot hold anything
-            gpu_budgets.push_back(available > 0 ? (uint64_t)available : 0);
+            // negative budget = overcommitted GPU: it cannot hold anything
+            gpu_budgets.push_back(budget > 0 ? (uint64_t)budget : 0);
             gpu_names.push_back(r.name);
-            fprintf(stderr, "    %-4zu %-6s %15lld %15lld %15lld %15lld %15lld  %s\n",
+            fprintf(stderr, "    %-4zu %-6s %15lld %15lld %15lld %15lld %15lld %15lld %15lld  %s\n",
                     r.idx, r.type_str,
-                    (long long)total, (long long)reserve, (long long)budget,
+                    (long long)total, (long long)free, (long long)kernels,
+                    (long long)reserve, (long long)budget,
                     (long long)loaded, (long long)available, r.name);
         }
         fprintf(stderr, "    %-76s%15lld\n",
@@ -813,16 +831,35 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
         // not multiply its size, so streams plays no role here.
         //   total cell size = sum over GPUs of attention bytes-per-cell
         //   upper limit     = total available ÷ total cell size    (integer division)
-        uint64_t cell_size_per_token = 0;
+        // the swa/ssm checkpoint state is a fixed deployment cost (state size x
+        // number of checkpoints), independent of the KV pool size: reserve it out
+        // of the total available before deriving the cell count from the remainder.
+        uint64_t ssm_state_per_row = 0, mtp_cell_size = 0;
+        for (const auto & r : rows) {
+            if (!raw[r.idx].ok || raw[r.idx].total_bytes == 0) continue;
+            ssm_state_per_row += r.ssm_bpr;
+            mtp_cell_size += r.mtp_bpc;
+        }
+        const uint64_t ssm_state_total = (uint64_t)state_rows * ssm_state_per_row;
+        if (ssm_state_per_row > 0) {
+            fprintf(stderr, "    %-27s %9llu × %15llu\n",
+                    "swa/ssm state:", (unsigned long long)state_rows,
+                    (unsigned long long)ssm_state_per_row);
+        }
+        fprintf(stderr, "    %-76s%15llu\n",
+                "swa/ssm state total:", (unsigned long long)ssm_state_total);
+
+        // per-cell cost includes BOTH pools: main KV cells + MTP draft cells
+        uint64_t cell_size_per_token = mtp_cell_size;
         for (const auto & r : rows) {
             if (!raw[r.idx].ok || raw[r.idx].total_bytes == 0) continue;
             cell_size_per_token += r.kv_bpc;
         }
         fprintf(stderr, "    %-76s%15llu\n",
                 "total cell size:", (unsigned long long)cell_size_per_token);
-        if (cell_size_per_token > 0 && accumulated_available > 0) {
+        if (cell_size_per_token > 0 && accumulated_available > (int64_t)ssm_state_total) {
             const uint64_t kv_upper =
-                (uint64_t)accumulated_available / cell_size_per_token;
+                ((uint64_t)accumulated_available - ssm_state_total) / cell_size_per_token;
             fprintf(stderr, "    %-76s%15llu   tokens\n",
                     "kv cache upper limit:", (unsigned long long)kv_upper);
 
