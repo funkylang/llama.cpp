@@ -345,11 +345,14 @@ static std::vector<layer_cost> compute_layer_costs(const llama_model * model,
 // takes layers greedily until the next one would exceed its budget; the LAST
 // GPU has no choice, it must take all remaining layers, so it only fits if
 // their total cost stays inside its budget (otherwise "over limit" is shown).
+// The last GPU also carries the model's global tensors (norm, output — they
+// are not per-layer); Michael: account them to the last GPU.
 // Every decision is traced via fprintf (verification aid).
 static bool try_place_kv_pool(uint32_t n_blocks,
                               const std::vector<layer_cost> & layers,
                               const std::vector<uint64_t> & budgets,
-                              const std::vector<std::string> & names) {
+                              const std::vector<std::string> & names,
+                              uint64_t last_gpu_extra) {
     const uint64_t cells = (uint64_t)n_blocks * 256;
     fprintf(stderr, "\n    testing with n = %-5u blocks (%llu cells)\n",
             n_blocks, (unsigned long long)cells);
@@ -383,10 +386,12 @@ static bool try_place_kv_pool(uint32_t n_blocks,
                 ++il;
             }
         } else {
-            // last GPU: no choice — all remaining layers are its, so the range
-            // total against its budget decides the candidate outright
+            // last GPU: no choice — all remaining layers are its, plus the global
+            // tensors (norm, output); the range total against its budget decides
+            // the candidate outright
             used = (p_wss[nl] - p_wss[first_layer])
-                 + cells * (p_bpc[nl] - p_bpc[first_layer]);
+                 + cells * (p_bpc[nl] - p_bpc[first_layer])
+                 + last_gpu_extra;
         }
 
         const bool has_layers = is_last || (il > first_layer);   // last GPU always "owns" the rest
@@ -399,7 +404,8 @@ static bool try_place_kv_pool(uint32_t n_blocks,
 
         // MEM-SIZE style chained arithmetic: every variable printed as
         // name(value) inside its formula, one expression per derived value.
-        const uint64_t wts = has_layers ? (p_wts[shown_last + 1] - p_wts[first_layer]) : 0;
+        const uint64_t wts = (has_layers ? (p_wts[shown_last + 1] - p_wts[first_layer]) : 0)
+                           + (is_last ? last_gpu_extra : 0);   // globals ride the last GPU's tensors
         const uint64_t ssm = has_layers ? (p_ssm[shown_last + 1] - p_ssm[first_layer]) : 0;
         const uint64_t bpc = has_layers ? (p_bpc[shown_last + 1] - p_bpc[first_layer]) : 0;
         const uint64_t cache = cells * bpc;
@@ -442,7 +448,8 @@ static bool try_place_kv_pool(uint32_t n_blocks,
 static uint32_t solve_kv_pool(uint32_t n_max,
                               const std::vector<layer_cost> & layers,
                               const std::vector<uint64_t> & budgets,
-                              const std::vector<std::string> & names) {
+                              const std::vector<std::string> & names,
+                              uint64_t last_gpu_extra) {
     fprintf(stderr, "\n  kv pool solver: bisect n of 256-cell blocks (integer arithmetic)\n");
     if (n_max == 0 || layers.empty() || budgets.empty()) {
         fprintf(stderr, "    n_max = 0 — nothing to solve\n");
@@ -458,7 +465,7 @@ static uint32_t solve_kv_pool(uint32_t n_max,
     uint32_t low = 0, high = n_max;   // bisection over the whole range
     while (low < high) {
         const uint32_t mid = low + (high - low + 1) / 2;   // rounds UP -> monotonic progress
-        if (try_place_kv_pool(mid, layers, budgets, names)) {
+        if (try_place_kv_pool(mid, layers, budgets, names, last_gpu_extra)) {
             low = mid;
         } else {
             high = mid - 1;
@@ -604,7 +611,8 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
                               ggml_type type_k, ggml_type type_v, bool flash_attn,
                               uint32_t streams, uint32_t state_rows, bool mtp_measured,
                               double keep_free,
-                              const std::map<int, int64_t> & layer_weights) {
+                              const std::map<int, int64_t> & layer_weights,
+                              uint64_t last_gpu_extra) {
     // decide row visibility first: when any GPU/IGPU is present, CPU rows are
     // noise for planning and get hidden (Michael, 2026-11-12); without GPUs the
     // CPU row is shown again so the scan never renders an empty table.
@@ -887,7 +895,7 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
                     (unsigned long long)n_max);
             auto layer_costs = compute_layer_costs(model, layer_weights,
                                                    type_k, type_v, flash_attn, state_rows);
-            solve_kv_pool(n_max, layer_costs, gpu_budgets, gpu_names);
+            solve_kv_pool(n_max, layer_costs, gpu_budgets, gpu_names, last_gpu_extra);
         } else {
             fprintf(stderr, "    %-76s%s\n", "kv cache upper limit:", "n/a");
         }
@@ -1415,7 +1423,8 @@ int main(int argc, char ** argv) {
     // device scan prints AFTER the model header block (Michael, 2026-11-12);
     // the measurements themselves were taken above, before any output.
     print_device_scan(scan_raw, scan_measure, model, n_ctx_measure, type_k, type_v, flash_attn,
-                      probe_parallel, state_rows, mtp_measured, keep_free, layer_weights);
+                      probe_parallel, state_rows, mtp_measured, keep_free, layer_weights,
+                      (uint64_t)norm_bytes + (uint64_t)output_bytes);
 
     // where the weights actually landed (GPU machines only)
     print_provisional_split(model);
