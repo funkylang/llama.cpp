@@ -194,6 +194,14 @@ static std::vector<dev_usage> compute_dev_usage(const llama_model * model) {
             break;
         }
     }
+
+    // de-dupe .layers: it collected one entry per tensor occurrence above, but
+    // downstream rate math must see each layer index exactly once
+    for (auto & u : usage) {
+        std::sort(u.layers.begin(), u.layers.end());
+        u.layers.erase(std::unique(u.layers.begin(), u.layers.end()), u.layers.end());
+    }
+
     return usage;
 }
 
@@ -227,17 +235,20 @@ static void print_provisional_split(const llama_model * model) {
 
 // Per-device attention KV cell rate (base model only — MTP off during the
 // measurement load, nextn layers TENSOR_SKIP). Indexed by backend device order.
-static std::vector<uint64_t> compute_kv_rates(const llama_model * model,
-                                              const std::vector<dev_usage> & usage,
-                                              ggml_type type_k, ggml_type type_v,
-                                              bool flash_attn) {
+struct kv_rate_info { uint64_t bytes_per_cell = 0; int n_layers = 0; };
+
+static std::vector<kv_rate_info> compute_kv_rates(const llama_model * model,
+                                                  const std::vector<dev_usage> & usage,
+                                                  ggml_type type_k, ggml_type type_v,
+                                                  bool flash_attn) {
     const auto & hp = model->hparams;
     const uint32_t n_layer_all   = hp.n_layer_all;
     const uint32_t n_layer_nextn = hp.n_layer_nextn;
     const bool v_t = !flash_attn;
-    std::vector<uint64_t> kv_rate(usage.size(), 0);
+    std::vector<kv_rate_info> kv_rate(usage.size());
     for (size_t i = 0; i < usage.size(); ++i) {
         uint64_t rate = 0;
+        int n_layers = 0;
         for (int il : usage[i].layers) {
             if (il >= (int)n_layer_all || il >= (int)(n_layer_all - n_layer_nextn)) continue; // nextn skipped
             if (!hp.has_kv(il) || hp.is_recr(il)) continue;
@@ -246,8 +257,10 @@ static std::vector<uint64_t> compute_kv_rates(const llama_model * model,
             uint64_t cb = (uint64_t)ggml_row_size(type_k, ek);
             if (!hp.is_mla()) cb += (uint64_t)ggml_row_size(type_v, ev);
             rate += cb;
+            ++n_layers;
         }
-        kv_rate[i] = rate;
+        kv_rate[i].bytes_per_cell = rate;
+        kv_rate[i].n_layers = n_layers;
     }
     return kv_rate;
 }
@@ -452,13 +465,22 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
             "idx", "type", "delta", "weights", "probe-KV", "kernels", "name");
 
     std::vector<dev_usage> usage;
-    std::vector<uint64_t> kv_rate;
+    std::vector<kv_rate_info> kv_rate;
     const bool have_decomp = (model && n_ctx_measure > 0);
     if (have_decomp) {
         usage   = compute_dev_usage(model);
         kv_rate = compute_kv_rates(model, usage, type_k, type_v, flash_attn);
     }
 
+    // per-device decomposition values: computed once, rendered in GiB and bytes.
+    // The byte view also shows the arithmetic behind probe-KV so it can be
+    // cross-checked against the [MEM-SIZE] formula lines of the same run.
+    struct dev_row {
+        size_t idx; const char * type_str; const char * name;
+        uint64_t delta, weights, probe_kv, kernels;
+        uint64_t kv_bpc; int kv_layers;   // kv_rate inputs behind probe-KV
+    };
+    std::vector<dev_row> rows;
     for (size_t i = 0; i < ndevs; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (!dev) continue;
@@ -468,24 +490,60 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
         const uint64_t delta = (raw[i].free_bytes > measure[i].free_bytes)
                              ? raw[i].free_bytes - measure[i].free_bytes : 0;
 
-        uint64_t weights_i = 0, probe_kv_i = 0;
+        uint64_t weights_i = 0, probe_kv_i = 0, kv_bpc = 0;
+        int kv_layers = 0;
         if (have_decomp && i < usage.size() && i < kv_rate.size()) {
             weights_i  = usage[i].bytes;
-            probe_kv_i = (uint64_t)n_ctx_measure * kv_rate[i];
+            kv_bpc     = kv_rate[i].bytes_per_cell;
+            kv_layers  = kv_rate[i].n_layers;
+            probe_kv_i = (uint64_t)n_ctx_measure * kv_bpc;
         }
         // kernels = residual after removing the two accounted-for terms
         uint64_t kernels_i = (delta > weights_i + probe_kv_i) ? delta - weights_i - probe_kv_i : 0;
 
+        rows.push_back({i, dev_type_str(type), ggml_backend_dev_name(dev),
+                        delta, weights_i, probe_kv_i, kernels_i, kv_bpc, kv_layers});
+    }
+
+    for (const auto & r : rows) {
         char line[512];
         snprintf(line, sizeof(line),
                  "    %-4zu %-6s %12s %12s %12s %12s  %s",
-                 i, dev_type_str(type),
-                 gib_str(delta).c_str(),
-                 have_decomp ? gib_str(weights_i).c_str() : "-",
-                 have_decomp ? gib_str(probe_kv_i).c_str() : "-",
-                 have_decomp ? gib_str(kernels_i).c_str() : "-",
-                 ggml_backend_dev_name(dev));
+                 r.idx, r.type_str,
+                 gib_str(r.delta).c_str(),
+                 have_decomp ? gib_str(r.weights).c_str() : "-",
+                 have_decomp ? gib_str(r.probe_kv).c_str() : "-",
+                 have_decomp ? gib_str(r.kernels).c_str() : "-",
+                 r.name);
         fprintf(stderr, "%s\n", line);
+    }
+
+    // byte view: exact values (no rounding), plus the probe-KV arithmetic
+    fprintf(stderr, "\n");
+    fprintf(stderr, "  measured overhead per device (bytes, exact):\n\n");
+    fprintf(stderr, "    %-4s %-6s %12s %12s %12s %12s  %s\n",
+            "idx", "type", "delta", "weights", "probe-KV", "kernels", "name");
+    for (const auto & r : rows) {
+        fprintf(stderr,
+                "    %-4zu %-6s %12s %12s %12s %12s  %s\n",
+                r.idx, r.type_str,
+                bytes_str(r.delta).c_str(),
+                have_decomp ? bytes_str(r.weights).c_str() : "-",
+                have_decomp ? bytes_str(r.probe_kv).c_str() : "-",
+                have_decomp ? bytes_str(r.kernels).c_str() : "-",
+                r.name);
+    }
+
+    if (have_decomp) {
+        fprintf(stderr, "\n  probe-KV derivation (probe pool: %u cells x kv_rate of this device):\n",
+                n_ctx_measure);
+        for (const auto & r : rows) {
+            if (r.probe_kv == 0) continue;
+            fprintf(stderr, "    %s: %u x %s = %s   (%d attention layers, %s K / %s V)\n",
+                    r.name, n_ctx_measure, bytes_str(r.kv_bpc).c_str(),
+                    bytes_str(r.probe_kv).c_str(), r.kv_layers,
+                    ggml_type_name(type_k), ggml_type_name(type_v));
+        }
     }
 
     fprintf(stderr, "\n");
@@ -688,16 +746,18 @@ int main(int argc, char ** argv) {
     }
     const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load0).count();
 
-    // measurement: context sized JUST for the warmup prompt (minimal KV pool) +
-    // decode through the real weights. Every kernel the deployment will launch is
+    // measurement: context at the common 16384-cell deployment size + decode
+    // through the real weights. Every kernel the deployment will launch is
     // uploaded during this run — kernels only materialize on their first execution
-    // (concept §17). Sizing n_ctx to n_tok keeps the probe KV negligible so the
-    // shader overhead it leaves behind reads clean in the free-VRAM delta.
+    // (concept §17). The probe KV pool is accounted for in the overhead
+    // decomposition below, so its size no longer skews the shader overhead.
     uint32_t n_ctx_measure = 0;
     {
         llama_context_params cp = llama_context_default_params();
         cp.n_batch  = 2048;   // default; exercises the large-batch decode path
         cp.n_ubatch = ubatch_size;
+        cp.type_k = type_k;   // measure what the deployment uses — not the f16 default
+        cp.type_v = type_v;
 
         // tokenize the excerpt UP FRONT so the token count is visible while the
         // (slow) warmup decode runs — the user sees what the system is processing
@@ -711,8 +771,8 @@ int main(int argc, char ** argv) {
         }
         prompt_tokens.resize(n_tok);
 
-        // n_ctx just covers the prompt + a few generate steps; 64 is headroom
-        cp.n_ctx = (uint32_t)n_tok + 64;
+        // common deployment size — the warmup prompt fits with room to spare
+        cp.n_ctx = 16384;
         n_ctx_measure = cp.n_ctx;   // capture for the overhead decomposition below
 
         // Guard 3: after the load, confirm the warmup KV pool fits in what's left.
@@ -721,7 +781,7 @@ int main(int argc, char ** argv) {
         // with exact numbers instead of an opaque OOM during context init.
         {
             std::vector<dev_usage> usage = compute_dev_usage(model);
-            std::vector<uint64_t> kv_rate = compute_kv_rates(model, usage, type_k, type_v, flash_attn);
+            std::vector<kv_rate_info> kv_rate = compute_kv_rates(model, usage, type_k, type_v, flash_attn);
 
             // Re-scan free VRAM AFTER the load to compare against what remains.
             bool fits = true;
@@ -732,7 +792,7 @@ int main(int argc, char ** argv) {
                 if (!dev) continue;
                 const auto t = ggml_backend_dev_type(dev);
                 if (!(t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU)) continue;
-                const uint64_t need_i = (uint64_t)cp.n_ctx * kv_rate[i]; // 1 stream during measurement
+                const uint64_t need_i = (uint64_t)cp.n_ctx * kv_rate[i].bytes_per_cell; // 1 stream during measurement
                 const uint64_t have_i = scan_now[i].free_bytes;
                 if (need_i > have_i) {
                     fprintf(stderr, "error: warmup KV pool too large — GPU %zu needs %s for %u cells but only %s free\n",
