@@ -714,7 +714,7 @@ static bool kvfit_measure(const char * path,
     kvfit_read_all_devices(r.scan_measure);
     r.usage = kvfit_compute_dev_usage(model);
     r.rates = kvfit_compute_rates(model, r.usage, cp.type_k, cp.type_v, cp.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED);
-    (void)n_ctx_measure;   // captured for the decomposition (see kvfit_solve_plan)
+    r.n_ctx_measure = n_ctx_measure;   // the probe pool size for the decomposition (see kvfit_plan_compute)
 
     if (ctx_mtp) llama_free(ctx_mtp);
     llama_free(ctx0);
@@ -758,7 +758,10 @@ static bool kvfit_peek_hparams(const char * path,
     llama_model_params mp = *mparams;
     mp.no_alloc  = true;
     mp.load_mode = LLAMA_LOAD_MODE_NONE;
-    mp.load_mtp  = false;
+    // MTP on by default (gpu-split convention): the peek is metadata-only (no VRAM),
+    // and load_mtp=false would make the loader print "unused tensor" warnings for
+    // every nextn tensor of an MTP model.
+    mp.load_mtp  = true;
     llama_model * model = llama_model_load_from_file(path, mp);
     if (!model) {
         LLAMA_LOG_WARN("kvfit: metadata pre-look failed — assuming no MTP block\n");
