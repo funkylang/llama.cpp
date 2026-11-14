@@ -173,8 +173,11 @@ int main(int argc, char ** argv) {
             if ((int32_t)il >= layer_bounds[g]) { exp = g; break; }
         }
         if (dev != exp) {
+            char what[32];
+            if (il == n_layer_all) strcpy(what, "output");
+            else snprintf(what, sizeof what, "layer %u", il);
             fprintf(stderr, "  MISMATCH at %s: loaded on device %d, plan says %d\n",
-                    (il == n_layer_all) ? "output" : "layer", il, dev, exp);
+                    what, dev, exp);
             return 1;   // the loader ignored the planned boundaries
         }
     }
