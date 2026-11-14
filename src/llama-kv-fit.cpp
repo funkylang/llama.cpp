@@ -1159,7 +1159,8 @@ LLAMA_API bool llama_kv_fit_auto_split(
         llama_model_params * mparams,
         llama_context_params * cparams,
         int32_t * layer_bounds,
-        const struct llama_kv_fit_params * params) {
+        const struct llama_kv_fit_params * params,
+        int32_t * n_devices_planned) {
     kvfit_plan plan = kvfit_get_plan(path_model, mparams, cparams, params);
     if (!plan.ok || layer_bounds == nullptr) {
         LLAMA_LOG_ERROR("kvfit: auto split failed or no layer_bounds buffer — "
@@ -1167,9 +1168,15 @@ LLAMA_API bool llama_kv_fit_auto_split(
         return false;
     }
 
-    // the plan's ranges ARE the loader's boundaries — write them verbatim
-    for (size_t g = 0; g < plan.first_layer.size(); ++g) {
+    // the plan's ranges ARE the loader's boundaries — write them verbatim,
+    // and report how many of them there are so the caller knows exactly
+    // which part of its buffer the plan occupies
+    const size_t nd = plan.first_layer.size();
+    for (size_t g = 0; g < nd; ++g) {
         layer_bounds[g] = plan.first_layer[g];
+    }
+    if (n_devices_planned) {
+        *n_devices_planned = (int32_t)nd;
     }
 
     mparams->n_gpu_layers       = -1;   // all layers on GPUs (loader's standard idiom)

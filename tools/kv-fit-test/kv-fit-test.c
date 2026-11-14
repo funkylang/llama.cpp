@@ -135,7 +135,7 @@ int main(int argc, char ** argv) {
 
     // ---- 1+2: plan the placement ---------------------------------------------
     fprintf(stderr, "\n== kv-fit clone: planning %s ==\n", g_path);
-    if (!llama_kv_fit_auto_split(g_path, &mparams, &cparams, layer_bounds, params)) {
+    if (!llama_kv_fit_auto_split(g_path, &mparams, &cparams, layer_bounds, params, 0)) {
         fprintf(stderr, "error: no viable plan — aborting (see reports above)\n");
         return 1;
     }

@@ -941,7 +941,7 @@ enum common_params_fit_status common_fit_params(
             // file scope: mparams->tensor_layer_bounds must stay valid for the whole load
             static int32_t g_kvfit_layer_bounds[16];   // llama_max_devices()
             auto_split_done = llama_kv_fit_auto_split(
-                path_model, mparams, cparams, g_kvfit_layer_bounds, kvfit_params.get());
+                path_model, mparams, cparams, g_kvfit_layer_bounds, kvfit_params.get(), nullptr);
         }
 
         // [FORK] Skip the standard fit procedure when placement was resolved by auto-split, or

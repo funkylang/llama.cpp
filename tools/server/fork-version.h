@@ -4,4 +4,4 @@
 // updated on every fork commit with the ACTUAL current time at update (strict ordering);
 // printed as the first startup message of llama-server so the running build can be identified
 
-static const char * FORK_VERSION = "2026-11-14 21:05:39 kv-fit-test: report free VRAM per device after planned load";
+static const char * FORK_VERSION = "2026-11-14 23:03:50 kv-fit: report planned device count from auto_split";

@@ -246,13 +246,16 @@ struct llama_kv_fit_extra {
 // llama's loader uses those boundaries directly, superseding its ratio-based
 // tensor_split logic. The caller's real load must reuse mparams unchanged.
 // layer_bounds: writable buffer of at least llama_max_devices() int32_t.
+// n_devices_planned: optional; receives how many of layer_bounds hold plan
+// boundaries (the caller learns exactly which part of its buffer to trust).
 // Returns false when no viable plan exists (no GPUs, model too large, ...).
 LLAMA_API bool llama_kv_fit_auto_split(
         const char * path_model,
         struct llama_model_params * mparams,
         struct llama_context_params * cparams,
         int32_t * layer_bounds,
-        const struct llama_kv_fit_params * params);
+        const struct llama_kv_fit_params * params,
+        int32_t * n_devices_planned);
 
 // Solve the maximum unified KV cache pool size for the planned placement, in
 // cells (256-aligned). Reuses auto_split's measurement when the inputs match.
