@@ -402,6 +402,8 @@ static uint32_t kvfit_solve(uint32_t n_max,
 // Guard 2 uses the total.
 
 struct kvfit_gguf_info {
+    std::string name;                          // general.name (model header)
+    std::string arch;                          // general.architecture (model header)
     std::map<int, int64_t> layer_weights;
     int64_t norm_bytes   = 0;
     int64_t output_bytes = 0;
@@ -422,6 +424,12 @@ static bool kvfit_read_gguf(const char * path, kvfit_gguf_info & info) {
     const char * arch = nullptr;
     int64_t id_arch = gguf_find_key(ctx, "general.architecture");
     if (id_arch >= 0) arch = gguf_get_val_str(ctx, id_arch);
+    info.arch = arch ? arch : "";
+
+    const char * name = nullptr;
+    int64_t id_name = gguf_find_key(ctx, "general.name");
+    if (id_name >= 0) name = gguf_get_val_str(ctx, id_name);
+    info.name = name ? name : "";
 
     // nextn block indices: blk.nextn.<i> maps to hp layer n_layer + i — read the
     // trunk's n_layer from GGUF metadata since this parse predates the model load
@@ -771,6 +779,47 @@ static bool kvfit_peek_hparams(const char * path,
     return true;
 }
 
+// Model summary header (gpu-split style): identifies the model being planned
+// and its capabilities. hparams come from a metadata-only peek (no VRAM).
+static void kvfit_print_model_header(const char * path,
+                                     const kvfit_gguf_info * gguf,
+                                     const llama_model * model,
+                                     const llama_context_params * cparams,
+                                     const llama_kv_fit_params * params) {
+    const auto & hp = model->hparams;
+    const uint32_t n_layer_all  = hp.n_layer_all;
+    const bool has_moe = hp.n_expert > 0;
+    const bool has_mtp = hp.n_layer_nextn > 0;
+    bool has_swa = false, has_ssm = false;
+    for (uint32_t il = 0; il < n_layer_all; ++il) {
+        has_swa |= hp.is_swa(il);
+        has_ssm |= hp.is_recr(il);
+    }
+    const double keep_free = 1.0 - params->vram_fraction;
+
+    LLAMA_LOG_PLANNING("\n      file:       %s\n", path);
+    LLAMA_LOG_PLANNING("      name:       %s\n", gguf->name.empty() ? "(unknown)" : gguf->name.c_str());
+    LLAMA_LOG_PLANNING("      arch:       %s\n", gguf->arch.empty() ? llm_arch_name(model->arch) : gguf->arch.c_str());
+    LLAMA_LOG_PLANNING("      layers:     %u (all)\n", (unsigned)n_layer_all);
+    if (has_moe) {
+        LLAMA_LOG_PLANNING("      MoE:        yes (%u experts, top-%u)\n",
+                           (unsigned)hp.n_expert, (unsigned)hp.n_expert_used_max());
+    } else {
+        LLAMA_LOG_PLANNING("      MoE:        no\n");
+    }
+    LLAMA_LOG_PLANNING("      SWA:        %s\n", has_swa ? "yes" : "no");
+    LLAMA_LOG_PLANNING("      SSM:        %s\n", has_ssm ? "yes" : "no");
+    LLAMA_LOG_PLANNING("      MTP:        %s\n", has_mtp ? "yes" : "no");
+    LLAMA_LOG_PLANNING("      kv_type_k:  %s\n", ggml_type_name(cparams->type_k));
+    LLAMA_LOG_PLANNING("      kv_type_v:  %s\n", ggml_type_name(cparams->type_v));
+    LLAMA_LOG_PLANNING("      keep_free:  %.2f\n", keep_free);
+    if (gguf->embed_bytes > 0) {
+        // token embedding stays on the CPU (no offloading benefit) — not part
+        // of what gets distributed to GPUs, so it is shown outside the budgets.
+        LLAMA_LOG_PLANNING("      embed(CPU): %lld\n", (long long)gguf->embed_bytes);
+    }
+}
+
 static kvfit_plan kvfit_plan_compute(const char * path,
                                      const llama_model_params * mparams,
                                      const llama_context_params * cparams,
@@ -793,6 +842,22 @@ static kvfit_plan kvfit_plan_compute(const char * path,
     if (!kvfit_read_gguf(path, gguf)) {
         return plan;   // kvfit_read_gguf already reported
     }
+
+    // ---- MTP: a nextn block measured in the same run as the trunk ------------
+    // On router models the trunk attends to those layers on EVERY pass (no
+    // separate draft context exists) and llama_init_from_model rejects MTP
+    // contexts for them — skip measuring there. The metadata-only peek also
+    // feeds the model header, so it runs before any device scan or load.
+    bool has_nextn = false, is_router = false;
+    llama_model * model_peek = nullptr;
+    if (kvfit_peek_hparams(path, mparams, model_peek)) {
+        kvfit_print_model_header(path, &gguf, model_peek, cparams, params);
+        has_nextn  = model_peek->hparams.n_layer_nextn > 0;
+        is_router  = model_peek->hparams.router_layer >= 0;
+        llama_model_free(model_peek);
+    }
+    const bool extra_wants_mtp = params->extra && params->extra->shares_model;
+    const bool measure_mtp = (extra_wants_mtp || !params->extra) && has_nextn && !is_router;
 
     // device scan with nothing loaded: Guard 2 and the budget denominators
     std::vector<kvfit_dev_snapshot> scan_raw;
@@ -828,22 +893,6 @@ static kvfit_plan kvfit_plan_compute(const char * path,
                         (unsigned long long)gpu_free_total, gpu_count);
         return plan;
     }
-
-    // ---- MTP: a nextn block measured in the same run as the trunk ------------
-    // On router models the trunk attends to those layers on EVERY pass (no
-    // separate draft context exists) and llama_init_from_model rejects MTP
-    // contexts for them — skip measuring there.
-    bool has_nextn = false, is_router = false;
-    {
-        llama_model * model_peek = nullptr;
-        if (kvfit_peek_hparams(path, mparams, model_peek)) {
-            has_nextn  = model_peek->hparams.n_layer_nextn > 0;
-            is_router  = model_peek->hparams.router_layer >= 0;
-            llama_model_free(model_peek);
-        }
-    }
-    const bool extra_wants_mtp = params->extra && params->extra->shares_model;
-    const bool measure_mtp = (extra_wants_mtp || !params->extra) && has_nextn && !is_router;
 
     // ---- the measurement run ----------------------------------------------------
     kvfit_measure_result meas;
@@ -979,7 +1028,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
     }
 
     // ---- layer costs: GGUF weights + hparams-derived KV/SSM rates ---------------
-    llama_model * model_peek = nullptr;
+    // (reuses the function-level peek pointer — freed after the header above)
     if (!kvfit_peek_hparams(path, mparams, model_peek)) {
         LLAMA_LOG_ERROR("kvfit: cannot read model hyperparameters for the solver\n");
         return plan;

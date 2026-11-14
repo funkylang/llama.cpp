@@ -443,11 +443,25 @@ static bool try_place_kv_pool(uint32_t n_blocks,
     return true;   // all layers placed — candidate fits
 }
 
+// per-device value row for the solver header:
+//   "budget:" / "reserve:" labels aligned, "%s = <value>" per device,
+//   comma-separated, values right-aligned (15 wide: 14-digit numbers keep their space)
+static void print_row(const char * label, const std::vector<uint64_t> & vals,
+                      const std::vector<std::string> & names) {
+    fprintf(stderr, "    %-8s", label);
+    for (size_t g = 0; g < vals.size(); ++g) {
+        fprintf(stderr, "%s%s = %15llu", g ? "," : " ", names[g].c_str(),
+                (unsigned long long)vals[g]);
+    }
+    fprintf(stderr, "\n");
+}
+
 // Bisect for the largest fitting n of 256-cell blocks: at most log2(n_max)
 // steps. Returns the winning block count (0 = nothing fits).
 static uint32_t solve_kv_pool(uint32_t n_max,
                               const std::vector<layer_cost> & layers,
                               const std::vector<uint64_t> & budgets,
+                              const std::vector<uint64_t> & reserves,
                               const std::vector<std::string> & names,
                               uint64_t last_gpu_extra) {
     fprintf(stderr, "\n  kv pool solver: bisect n of 256-cell blocks (integer arithmetic)\n");
@@ -455,13 +469,9 @@ static uint32_t solve_kv_pool(uint32_t n_max,
         fprintf(stderr, "    n_max = 0 — nothing to solve\n");
         return 0;
     }
-    // the budgets each candidate is checked against
-    fprintf(stderr, "    budgets:");
-    for (size_t g = 0; g < budgets.size(); ++g) {
-        fprintf(stderr, " %s = %llu", names[g].c_str(),
-                (unsigned long long)budgets[g]);
-    }
-    fprintf(stderr, "\n");
+    // the budgets each candidate is checked against (+ the reserves kept back)
+    print_row("budget:", budgets, names);
+    print_row("reserve:", reserves, names);
     uint32_t low = 0, high = n_max;   // bisection over the whole range
     while (low < high) {
         const uint32_t mid = low + (high - low + 1) / 2;   // rounds UP -> monotonic progress
@@ -813,10 +823,10 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
         fprintf(stderr, "    %-4s %-6s %15s %15s %15s %15s %15s  %s\n",
                 "idx", "type", "total", "free", "kernels", "reserve",
                 "budget", "name");
-        int64_t accumulated_available = 0;
         int64_t total_budget = 0;   // sums across GPUs for the upper-limit formula
         uint64_t total_weights = 0;
         std::vector<uint64_t> gpu_budgets;   // solver input: per-GPU budget, in row order
+        std::vector<uint64_t> gpu_reserves;  // solver header: per-GPU reserve (total x keep_free)
         std::vector<std::string> gpu_names;  // solver input: matching device names
         for (const auto & r : rows) {
             if (!raw[r.idx].ok || raw[r.idx].total_bytes == 0) continue;
@@ -825,21 +835,18 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
             const int64_t kernels = (int64_t)r.kernels;
             const int64_t reserve = (int64_t)((double)total * keep_free);
             const int64_t budget  = free - kernels - reserve;
-            const int64_t loaded  = (int64_t)r.weights + (int64_t)r.probe_kv;
-            const int64_t available = budget - loaded;
-            accumulated_available += available;
             total_budget += budget;
             total_weights += r.weights;   // readback incl. MTP weights when measured
             // negative budget = overcommitted GPU: it cannot hold anything
             gpu_budgets.push_back(budget > 0 ? (uint64_t)budget : 0);
+            gpu_reserves.push_back((uint64_t)reserve);
             gpu_names.push_back(r.name);
             fprintf(stderr, "    %-4zu %-6s %15lld %15lld %15lld %15lld %15lld  %s\n",
                     r.idx, r.type_str,
                     (long long)total, (long long)free, (long long)kernels,
                     (long long)reserve, (long long)budget, r.name);
         }
-        fprintf(stderr, "    %-76s%15lld\n",
-                "total available:", (long long)accumulated_available);
+        fprintf(stderr, "\n");
 
         // theoretical kv-cache upper limit (Michael's formula, all global totals):
         //   numerator = total budget - (tensors + mtp tensors) - swa/ssm state total
@@ -860,13 +867,16 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
                 "total budget:", (long long)total_budget);
         fprintf(stderr, "    %-76s%15llu\n",
                 "total tensors + mtp:", (unsigned long long)total_weights);
+        // chained: rows × bytes/row = total (the upper limit subtracts the total)
         if (ssm_state_per_row > 0) {
-            fprintf(stderr, "    %-27s %9llu × %15llu\n",
+            fprintf(stderr, "    %-76s%9llu × %15llu = %15llu\n",
                     "swa/ssm state:", (unsigned long long)state_rows,
-                    (unsigned long long)ssm_state_per_row);
+                    (unsigned long long)ssm_state_per_row,
+                    (unsigned long long)ssm_state_total);
+        } else {
+            fprintf(stderr, "    %-76s%15llu\n",
+                    "swa/ssm state:", 0ULL);
         }
-        fprintf(stderr, "    %-76s%15llu\n",
-                "swa/ssm state total:", (unsigned long long)ssm_state_total);
 
         // per-cell cost includes BOTH pools: main KV cells + MTP draft cells
         uint64_t cell_size_per_token = 0;
@@ -884,7 +894,7 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
                     "kv cache upper limit:", "negative numerator — no room");
         } else if (cell_size_per_token > 0) {
             const uint64_t kv_upper = (uint64_t)upper_num / cell_size_per_token;
-            fprintf(stderr, "    %-76s%15llu   tokens\n",
+            fprintf(stderr, "    %-76s%15llu tokens\n",
                     "kv cache upper limit:", (unsigned long long)kv_upper);
 
             // ---- kv pool solver ----------------------------------------------
@@ -895,7 +905,7 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
                     (unsigned long long)n_max);
             auto layer_costs = compute_layer_costs(model, layer_weights,
                                                    type_k, type_v, flash_attn, state_rows);
-            solve_kv_pool(n_max, layer_costs, gpu_budgets, gpu_names, last_gpu_extra);
+            solve_kv_pool(n_max, layer_costs, gpu_budgets, gpu_reserves, gpu_names, last_gpu_extra);
         } else {
             fprintf(stderr, "    %-76s%s\n", "kv cache upper limit:", "n/a");
         }
