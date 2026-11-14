@@ -7,6 +7,8 @@
 //   4. real model load with the planned params; per-layer placement verified
 //      against the plan (proves the loader applies the boundaries verbatim)
 //   5. unified context at the planned pool — proves the plan fits on VRAM
+//   6. Shakespeare warmup decode on that context — forces every lazy
+//      allocation a decode pays (init alone can pass while decoding OOMs)
 //
 // Planning traces flow through the standard log callback at the PLANNING level.
 // Run next to tools/gpu-split with the same options on the same machine: the
@@ -14,6 +16,7 @@
 
 #include "llama.h"
 #include "../../src/llama-ext.h"
+#include "../../src/warmup-text.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -34,6 +37,74 @@ static void print_free_vram(const struct llama_model * model, int ndev, const ch
         fprintf(stderr, "  %d    %-12s total=%zu     free=%zu\n", i,
                 ggml_backend_dev_name(dev), total_mem, free_mem);
     }
+}
+
+// Re-run the planning excerpt on the production context: every lazy
+// allocation a decode pays (kernels materializing, graph re-reservation)
+// happens here. Context init alone proves nothing — fllama's OOM appeared
+// only at the first decode. Batch construction mirrors fllama.c / gpu-split:
+// raw mallocs, one shared seq_id pointer, manual frees.
+// Returns the decoded token count, or -1 on a failed decode (e.g. VRAM).
+static int warmup_decode(struct llama_context * ctx, const llama_token * tokens, int n_tok) {
+    if (n_tok <= 0) return 0;
+
+    int seq_id = 0;   // non-const: batch.seq_id pointers must stay valid during llama_decode
+
+    // prefill: n_batch-sized chunks; positions contiguous across chunks
+    const int32_t n_batch = llama_n_batch(ctx);
+    for (int32_t start = 0; start < n_tok; start += n_batch) {
+        const int32_t end   = start + n_batch < n_tok ? start + n_batch : n_tok;
+        const int32_t n     = end - start;
+        llama_batch batch;
+        batch.n_tokens = n;
+        batch.token    = malloc(n * sizeof(llama_token));
+        batch.embd     = NULL;
+        batch.pos      = malloc(n * sizeof(llama_pos));
+        batch.n_seq_id = malloc(n * sizeof(int32_t));
+        batch.seq_id   = malloc(n * sizeof(llama_seq_id *));
+        batch.logits   = malloc(n);
+        for (int32_t i = 0; i < n; ++i) {
+            batch.token[i]    = tokens[start + i];
+            batch.pos[i]      = start + i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i]   = &seq_id;
+            // output only at the final chunk's last position
+            batch.logits[i]   = (end == n_tok && i == n - 1) ? 1 : 0;
+        }
+
+        const int rc = llama_decode(ctx, batch);
+        free(batch.token); free(batch.pos); free(batch.n_seq_id); free(batch.seq_id); free(batch.logits);
+        if (rc != 0) {
+            fprintf(stderr, "  warmup: prefill decode failed at token %d\n", start);
+            return -1;
+        }
+    }
+
+    // a few generate steps so the single-token decode path is exercised too
+    for (int g = 0; g < 4; ++g) {
+        llama_batch batch;
+        batch.n_tokens = 1;
+        batch.token    = malloc(sizeof(llama_token));
+        batch.embd     = NULL;
+        batch.pos      = malloc(sizeof(llama_pos));
+        batch.n_seq_id = malloc(sizeof(int32_t));
+        batch.seq_id   = malloc(sizeof(llama_seq_id *));
+        batch.logits   = malloc(1);
+        batch.token[0]    = tokens[n_tok - 1];
+        batch.pos[0]      = n_tok + g;
+        batch.n_seq_id[0] = 1;
+        batch.seq_id[0]   = &seq_id;
+        batch.logits[0]   = 1;
+
+        const int rc = llama_decode(ctx, batch);
+        free(batch.token); free(batch.pos); free(batch.n_seq_id); free(batch.seq_id); free(batch.logits);
+        if (rc != 0) {
+            fprintf(stderr, "  warmup: generate decode %d failed\n", g);
+            return -1;
+        }
+    }
+
+    return n_tok;
 }
 
 // planning traces + warnings + errors are shown; everything else stays quiet
@@ -215,11 +286,31 @@ int main(int argc, char ** argv) {
     // headroom AFTER the full deployment exists: pool + compute buffers in place
     print_free_vram(model, ndev, "free VRAM after context init at the planned pool");
 
+    // ---- 6: run Shakespeare — force every lazy allocation a decode pays -------
+    fprintf(stderr, "\n== warmup decode (same Hamlet excerpt as planning) ==\n");
+    {
+        int32_t * p_tokens = malloc((strlen(WARMUP_TEXT) + 8) * sizeof(int32_t));
+        const int n_tok = llama_tokenize(
+            llama_model_get_vocab(model), WARMUP_TEXT, strlen(WARMUP_TEXT),
+            p_tokens, (int)(strlen(WARMUP_TEXT) + 8), true, false);
+        if (n_tok <= 0) {
+            fprintf(stderr, "error: warmup tokenization failed\n");
+            return 1;
+        }
+        const int rc = warmup_decode(ctx, p_tokens, n_tok);
+        free(p_tokens);
+        if (rc < 0) {
+            fprintf(stderr, "error: warmup decode at the planned pool failed — lazy allocations over-committed VRAM\n");
+            return 1;
+        }
+        print_free_vram(model, ndev, "free VRAM after warmup decode");
+    }
+
     llama_free(ctx);
     llama_model_free(model);
     llama_kv_fit_params_free(params);
     llama_backend_free();
 
-    fprintf(stderr, "\nkv-fit clone: PASS — plan fits, placement verified, pool %d cells\n", n_cells);
+    fprintf(stderr, "\nkv-fit clone: PASS — plan fits, placement verified, decode ran, pool %d cells\n", n_cells);
     return 0;
 }
