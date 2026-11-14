@@ -90,9 +90,6 @@ struct llama_device_memory_data {
 using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data>;
 
 LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
-LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
-
-LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
@@ -189,19 +186,46 @@ LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
 #endif // __cplusplus
 
 //
-// Unified KV pool fit (fork): compute how large a physical unified KV cache pool
-// (llama_context_params.n_kv_cache) can be while still fitting the devices' VRAM,
-// given the model's layer placement and any extra context sharing those devices.
-// Pure measurement: no_alloc probes; call before the real load while VRAM is free.
-//
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+// Unified KV pool planning (fork) — the gpu-split algorithm.
+//
+// Solves the optimal tensor split and the maximum unified KV cache pool size
+// (llama_context_params.n_kv_cache) against the live devices' VRAM. The
+// application supplies its deployment parameters; the library solves.
+// Measurement-based: one real model load with a warmup decode materializes
+// kernels/shaders; per-device readback plus the solver derive the plan —
+// what is measured is exactly what the deployment will pay.
+//
+// ABI discipline: the options struct is allocated and initialized by the
+// LIBRARY — a caller's header may be stale, so never trust your own sizeof().
+// Existing field positions are IMMUTABLE: future versions append fields only;
+// llama_kv_fit_params_new() refuses to run when this library is older than
+// the version the caller requires.
+//
+
+#define LLAMA_KV_FIT_PARAMS_VERSION 1
+
+struct llama_kv_fit_params {
+    double vram_fraction;                 // hard cap on device usage (default 0.97)
+    const size_t * margins;               // per-device bytes to keep free; NULL = none
+    const struct llama_kv_fit_extra * extra;   // e.g. MTP draft context; NULL = none
+    uint32_t min_pool_cells;              // viability floor, reported below it (default 32768)
+    // FUTURE FIELDS: append here; initialize in llama_kv_fit_params_new()
+};
+
+// Allocates + initializes the options struct with library defaults. Terminates
+// the program when this library implements a version older than min_version —
+// running on a mismatched libllama is a deployment error, never a fallback.
+LLAMA_API struct llama_kv_fit_params * llama_kv_fit_params_new(uint32_t min_version);
+LLAMA_API void llama_kv_fit_params_free(struct llama_kv_fit_params * p);
+
 // an extra model + context that competes with the main one for the same devices
-//   - its context follows the main one, so its pool size is probed at the same value
-//   - shares_model tells the fit the weights are already counted in the main model,
-//     as for an MTP draft context running on the target model's weights
+//   - its context follows the main one, so its pool size mirrors the main pool
+//   - shares_model tells the fit the weights are already counted in the main
+//     model, as for an MTP draft context running on the target model's weights
 struct llama_kv_fit_extra {
     const char * path_model;
     struct llama_model_params * mparams;
@@ -209,32 +233,42 @@ struct llama_kv_fit_extra {
     bool shares_model;
 };
 
-// Solve the maximum unified KV cache pool size for the given (already placed) params.
-//   - probes the model with no_alloc at two pool sizes to derive exact per-device KV rates
-//   - the budget covers model weights, compute buffers and the extra (e.g. MTP) model memory
-//   - hard cap: vram_fraction of each device's total memory (headroom for the driver),
-//     further limited by measured free memory minus margins (co-located processes)
-// cparams must have kv_unified set; n_kv_cache may be left 0.
-// margins may be NULL (no extra headroom kept) or a per-device byte budget to leave free.
-// Returns the maximum pool size in cells (256-aligned), or 0 if no pool fits at all.
-LLAMA_API int32_t llama_kv_fit_max_pool(
-                         const char * path_model,
-               struct llama_model_params * mparams,
-             struct llama_context_params * cparams,
-                           const size_t * margins,           // per-device margin to keep free (bytes), or NULL
-          const struct llama_kv_fit_extra * extra,           // e.g. MTP context sharing the devices, or NULL
-                                 double vram_fraction);       // hard cap as fraction of total memory, e.g. 0.97
-
-// Compute an optimal placement for a unified KV cache: sets tensor_split proportional to
-// device VRAM and finds the largest n_gpu_layers that still leaves room for a usable pool.
-//   - tensor_split must be a writable buffer of at least llama_max_devices() floats
-//   - mparams->n_gpu_layers is set on success; on multi-GPU, mparams->tensor_split too
-// Returns true if a valid split was computed, false otherwise (e.g. no GPU devices).
+// Solve the optimal layer placement: measures with a provisional load (llama's
+// native free-VRAM auto-split), then runs the pool solver and applies its
+// placement verbatim: writes the per-device layer boundaries into layer_bounds
+// and points mparams->tensor_layer_bounds at it (plus n_gpu_layers = -1) —
+// llama's loader uses those boundaries directly, superseding its ratio-based
+// tensor_split logic. The caller's real load must reuse mparams unchanged.
+// layer_bounds: writable buffer of at least llama_max_devices() int32_t.
+// Returns false when no viable plan exists (no GPUs, model too large, ...).
 LLAMA_API bool llama_kv_fit_auto_split(
-                         const char * path_model,
-               struct llama_model_params * mparams,
-             struct llama_context_params * cparams,
-                                float * tensor_split);       // writable buffer for proportional split
+        const char * path_model,
+        struct llama_model_params * mparams,
+        struct llama_context_params * cparams,
+        int32_t * layer_bounds,
+        const struct llama_kv_fit_params * params);
+
+// Solve the maximum unified KV cache pool size for the planned placement, in
+// cells (256-aligned). Reuses auto_split's measurement when the inputs match.
+// Returns 0 when no pool fits; a result below params->min_pool_cells is
+// reported as a non-viable deployment. cparams must have kv_unified set.
+LLAMA_API int32_t llama_kv_fit_max_pool(
+        const char * path_model,
+        struct llama_model_params * mparams,
+        struct llama_context_params * cparams,
+        const struct llama_kv_fit_params * params);
+
+LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
+
+LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
+
+// [FORK] total transformer layers including the nextn (MTP) block.
+LLAMA_API uint32_t llama_model_n_layer_all(const struct llama_model * model);
+
+// [FORK] physical device index (0..llama_model_n_devices()-1) holding layer il;
+// pass il == n_layer_all for the output pseudo-layer. Returns -1 when the layer
+// sits on CPU or il is out of range. Verifies a planned load's placement.
+LLAMA_API int32_t llama_model_layer_device_index(const struct llama_model * model, int il);
 
 #ifdef __cplusplus
 } // extern "C"

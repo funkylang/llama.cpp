@@ -1679,7 +1679,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
-        const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
+        const int layer_gpu = [&]() -> int {
+            // [FORK] planned placement: the KV-fit plan owns the layer mapping —
+            // apply its boundaries verbatim instead of deriving them from ratios.
+            // bounds[g] = first layer on device g (bounds[0] == 0): layer il is
+            // owned by the last device whose boundary does not exceed il; the
+            // output pseudo-layer (il == n_layer_all) falls through to the last.
+            if (const int32_t * bounds = params.tensor_layer_bounds) {
+                const size_t g = std::upper_bound(bounds, bounds + n_devices(), il) - bounds;
+                return static_cast<int>(std::max<size_t>(g, 1) - 1);
+            }
+            return static_cast<int>(std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin());
+        }();
         auto * dev = devices.at(layer_gpu).dev;
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};
@@ -3383,6 +3394,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.tensor_layer_bounds         =*/ nullptr,   // [FORK] KV-fit plan placement
     };
 
     return result;
@@ -3833,6 +3845,32 @@ ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int 
         return nullptr;
     }
     return model->devices[i].dev;
+}
+
+uint32_t llama_model_n_layer_all(const struct llama_model * model) {
+    return model ? model->hparams.n_layer_all : 0;
+}
+
+int32_t llama_model_layer_device_index(const struct llama_model * model, int il) {
+    if (!model) {
+        return -1;
+    }
+    const auto & hp = model->hparams;
+    ggml_backend_dev_t dev = nullptr;
+    if (il >= 0 && il < (int)hp.n_layer_all) {
+        dev = model->dev_layer(il);
+    } else if (il == (int)hp.n_layer_all) {
+        dev = model->dev_output();   // the output pseudo-layer
+    }
+    if (!dev) {
+        return -1;   // CPU or unknown layer index
+    }
+    for (size_t i = 0; i < model->devices.size(); ++i) {
+        if (model->devices[i].dev == dev) {
+            return (int32_t)i;
+        }
+    }
+    return -1;
 }
 
 void llama_model_set_attn_rot(struct llama_model * model, bool value) {

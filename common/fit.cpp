@@ -8,6 +8,7 @@
 #include <array>
 #include <cassert>
 #include <stdexcept>
+#include <memory>
 #include <cinttypes>
 #include <set>
 #include <string>
@@ -916,14 +917,31 @@ enum common_params_fit_status common_fit_params(
     // unified KV pool requested: kv_unified with the pool size left to us (n_kv_cache == 0)
     const bool unified_pool_requested = cparams->kv_unified && cparams->n_kv_cache == 0;
 
+    // [FORK] planning options for the measurement-based fit API (§23.6/§23.8 of the
+    // gpu-split concept doc): allocated by libllama (stale-header safe), freed by RAII
+    // on every path. It must outlive BOTH fit calls below so the plan is computed once
+    // and reused — never call the kv_fit APIs with different params pointers in one run.
+    struct kvfit_params_deleter {   // C++17: unique_ptr needs a functor, not &function, as deleter
+        void operator()(llama_kv_fit_params * p) const { llama_kv_fit_params_free(p); }
+    };
+    std::unique_ptr<llama_kv_fit_params, kvfit_params_deleter> kvfit_params;   // null until unified pool requested
+    if (unified_pool_requested) {
+        kvfit_params.reset(llama_kv_fit_params_new(LLAMA_KV_FIT_PARAMS_VERSION));
+        kvfit_params->vram_fraction = 0.97;   // hard cap on device usage (old VRAM_FRACTION)
+        kvfit_params->margins       = margins;
+        kvfit_params->extra         = lib_extra_ptr;
+    }
+
     try {
         // [FORK] Auto-split optimization: compute optimal n_gpu_layers and tensor_split
         // if the user hasn't explicitly set them and we're using unified KV cache
         if (unified_pool_requested && !user_set_ngl && !user_set_split) {
             LOG_INF("%s: attempting auto-split optimization for unified KV cache\n", __func__);
 
+            // file scope: mparams->tensor_layer_bounds must stay valid for the whole load
+            static int32_t g_kvfit_layer_bounds[16];   // llama_max_devices()
             auto_split_done = llama_kv_fit_auto_split(
-                path_model, mparams, cparams, tensor_split);
+                path_model, mparams, cparams, g_kvfit_layer_bounds, kvfit_params.get());
         }
 
         // [FORK] Skip the standard fit procedure when placement was resolved by auto-split, or
@@ -942,8 +960,7 @@ enum common_params_fit_status common_fit_params(
         // [FORK] Unified KV pool maximization: run whenever the pool size was left unset, using
         // whatever placement is in effect (auto-split, standard fit, or user-set)
         if (unified_pool_requested && cparams->n_kv_cache == 0) {
-            constexpr double VRAM_FRACTION = 0.97;
-            const int32_t n_max = llama_kv_fit_max_pool(path_model, mparams, cparams, margins, lib_extra_ptr, VRAM_FRACTION);
+            const int32_t n_max = llama_kv_fit_max_pool(path_model, mparams, cparams, kvfit_params.get());
 
             if (n_max > 0) {
                 cparams->n_kv_cache = (uint32_t) n_max;

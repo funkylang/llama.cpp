@@ -1,799 +1,1138 @@
-// [FORK] Unified KV pool fitting for the main library.
+// [FORK] Unified KV pool planning — the gpu-split algorithm, library-side.
 //
-// Provides the memory-probe + affine-solve machinery that computes how large a
-// physical unified KV cache pool (n_kv_cache) can be while still fitting on the
-// devices' VRAM, given a model's layer placement and any extra context that
-// competes for the same memory (e.g. an MTP draft context).
+// The application supplies its deployment parameters (model params, context
+// params, an optional extra/MTP context); this library SOLVES the optimal
+// tensor split and the maximum unified KV cache pool size against live
+// device VRAM. All C++ lives here; callers speak the public C API in
+// llama-ext.h only.
 //
-// External tools such as fllama call these through llama-ext.h without linking
-// libllama-common; llama-server's common_fit_params() reuses them too.
+// Measurement-based (algorithm verified on rocky2 via tools/gpu-split): one
+// REAL model load with llama_model's native free-VRAM auto-split as the
+// provisional placement, a measurement context at a common deployment size,
+// and a Hamlet warmup decode so every kernel the deployment will launch is
+// uploaded to the devices — kernels only materialize on their first execution
+// (no preload/prewarm API exists on any backend). Readback of the actual
+// placement plus architecture-derived KV/SSM rates and a greedy bisection
+// solver derive the plan from that single measurement: what is measured is
+// exactly what the deployment will pay.
+//
+// Logging: detailed traces use LLAMA_LOG_PLANNING (visible without all of
+// llama.cpp's debug logs); failures and conclusions use the standard levels.
+// The consumer decides visibility.
 
-#include "llama-impl.h"
-#include "llama-ext.h"
+#include "llama-impl.h"   // LLAMA_LOG_* macros
+#include "llama-ext.h"    // public planning API declarations
+#include "llama-model.h"  // llama_internal_get_tensor_map, llama_hparams
 
 #include <algorithm>
-#include <cmath>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
-#include <stdexcept>
+#include <mutex>
 #include <string>
 #include <vector>
 
-// Query VRAM on every GPU-like device at fit time. Historical note: an earlier
-// rocky2 run suggested ggml_backend_dev_memory() returns 0/0 before any
-// backend allocation ("lazy hipInit"), so this did a dummy 4 KB alloc+free first.
-// On 2026-11-10 the pre-allocation read already returned real values, and
-// Michael's CUDA experience matches (no allocation needed); the dummy alloc is
-// therefore dropped. If a future run shows total=0 again, restore it.
-static void llama_kv_fit_warmup_devices() {
-    static bool done = false;
-    if (done) {
-        return;
+#include "warmup-text.h"   // Hamlet excerpt (shared with tools/gpu-split)
+
+// ============================================================================
+// Options struct (public API, ABI versioned — see llama-ext.h for the rules)
+// ============================================================================
+
+LLAMA_API struct llama_kv_fit_params * llama_kv_fit_params_new(uint32_t min_version) {
+    if (min_version > LLAMA_KV_FIT_PARAMS_VERSION) {
+        fprintf(stderr, "error: libllama KV-fit planning is too old for the caller's "
+                        "params version (%u > %u) — update libllama\n",
+                (unsigned)min_version, (unsigned)LLAMA_KV_FIT_PARAMS_VERSION);
+        exit(EXIT_FAILURE);   // a mismatched libllama is a deployment error, never a fallback
     }
 
+    auto * p = new llama_kv_fit_params();
+    p->vram_fraction  = 0.97;   // keep 3% of each device's VRAM free (gpu-split default)
+    p->margins        = nullptr;
+    p->extra          = nullptr;
+    p->min_pool_cells = 32768;  // report deployments that cannot plan at least this many cells
+    return p;
+}
+
+LLAMA_API void llama_kv_fit_params_free(struct llama_kv_fit_params * p) {
+    delete p;
+}
+
+// ============================================================================
+// Device scan
+// ============================================================================
+
+static const char * kvfit_dev_type_str(enum ggml_backend_dev_type type) {
+    switch (type) {
+        case GGML_BACKEND_DEVICE_TYPE_CPU:  return "CPU";
+        case GGML_BACKEND_DEVICE_TYPE_GPU:  return "GPU";
+        case GGML_BACKEND_DEVICE_TYPE_IGPU: return "IGPU";
+        case GGML_BACKEND_DEVICE_TYPE_META: return "META";
+        default:                            return "other";
+    }
+}
+
+struct kvfit_dev_snapshot { size_t free_bytes = 0, total_bytes = 0; bool ok = false; };
+
+static void kvfit_read_all_devices(std::vector<kvfit_dev_snapshot> & snaps) {
     const size_t ndevs = ggml_backend_dev_count();
-    fprintf(stderr, "[KV-FIT-DBG] warmup: ggml_backend_dev_count() = %zu\n", ndevs);
+    snaps.resize(ndevs);
     for (size_t i = 0; i < ndevs; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (dev == nullptr) {
-            continue;
-        }
-        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
-        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
-            continue; // only GPU-like backends report VRAM worth printing
-        }
-
-        size_t free = 0, total = 0;
-        ggml_backend_dev_memory(dev, &free, &total);
-
-        fprintf(stderr, "[KV-FIT-DBG] warmup: dev %s (type=%d) VRAM total %lld / free %lld\n",
-                ggml_backend_dev_name(dev), (int)type,
-                (long long)total, (long long)free);
+        if (!dev) continue;
+        ggml_backend_dev_memory(dev, &snaps[i].free_bytes, &snaps[i].total_bytes);
+        snaps[i].ok = true;
     }
-
-    done = true;
 }
 
-// [KV-FIT-DBG] instrumentation: dump raw total/free VRAM of every device, as-is.
-static void llama_kv_fit_dbg_vram_all(const char * tag) {
-    fprintf(stderr, "[KV-FIT-DBG] vram@%s:\n", tag);
+static bool kvfit_gpus_present() {
     const size_t ndevs = ggml_backend_dev_count();
     for (size_t i = 0; i < ndevs; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (dev == nullptr) {
-            continue;
+        if (!dev) continue;
+        const enum ggml_backend_dev_type t = ggml_backend_dev_type(dev);
+        if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            return true;
         }
-        size_t free = 0, total = 0;
-        ggml_backend_dev_memory(dev, &free, &total);
-        fprintf(stderr, "[KV-FIT-DBG]   %s: total=%lld free=%lld\n",
-                ggml_backend_dev_name(dev), (long long)total, (long long)free);
     }
+    return false;
 }
 
-// Load a model + context with no_alloc and return the per-device memory
-// breakdown plus each device's total/free memory. The last entry is the host.
-static std::vector<llama_device_memory_data> llama_kv_fit_probe(
-        const char * path_model,
-        const llama_model_params * mparams,
-        const llama_context_params * cparams,
-        std::vector<ggml_backend_dev_t> & devs,
-        uint32_t & hp_ngl,
-        uint32_t & hp_n_ctx_train,
-        uint32_t & hp_n_expert) {
-    llama_model_params mparams_copy = *mparams;
-    mparams_copy.no_alloc  = true;
-    mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+// ============================================================================
+// Provisional placement readback
+// ============================================================================
+// Read back where a loaded model ACTUALLY placed its weights: every tensor
+// carries its buffer, and the buffer's type maps back to its owning device
+// via ggml_backend_buft_get_device(). CRITICAL: do NOT match on
+// ggml_backend_dev_host_buffer_type(dev) — that host buft collides across
+// GPUs sharing a backend (both ROCm0 and ROCm1 report the same HIP host buft).
 
-    fprintf(stderr, "[KV-FIT-DBG] probe enter: mparams=%p no_alloc=%d load_mode=%d n_ctx=%llu kv_cache=%u\n",
-            reinterpret_cast<const void*>(mparams), (int)mparams_copy.no_alloc, (int)mparams_copy.load_mode,
-            (unsigned long long)cparams->n_ctx, (unsigned)cparams->n_kv_cache);
+struct kvfit_dev_usage { size_t bytes = 0; int first_layer = -1, last_layer = -1; std::vector<int> layers; };
 
-    llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
-    if (model == nullptr) {
-        throw std::runtime_error("failed to load model");
-    }
-    llama_kv_fit_dbg_vram_all("after model load");
+static std::vector<kvfit_dev_usage> kvfit_compute_dev_usage(const llama_model * model) {
+    const size_t ndevs = ggml_backend_dev_count();
+    std::vector<kvfit_dev_usage> usage(ndevs);
 
-    llama_context * ctx = llama_init_from_model(model, *cparams);
-    if (ctx == nullptr) {
-        llama_model_free(model);
-        throw std::runtime_error("failed to create llama_context from model");
-    }
-    llama_kv_fit_dbg_vram_all("after ctx init");
+    for (const auto & [tname, tensor] : llama_internal_get_tensor_map(model)) {
+        if (!tensor || !tensor->buffer) continue;   // not on a device buffer
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(tensor->buffer);
+        ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
+        if (!buft_dev) continue;
+        const size_t bytes = ggml_nbytes(tensor);
 
-    const size_t nd = llama_model_n_devices(model);
-    std::vector<llama_device_memory_data> ret(nd + 1);
-
-    llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
-
-    for (const auto & [buft, mb] : memory_breakdown) {
-        if (ggml_backend_buft_is_host(buft)) {
-            ret.back().mb.model   += mb.model;
-            ret.back().mb.context += mb.context;
-            ret.back().mb.compute += mb.compute;
-            continue;
+        int il = -1;
+        const char * t = tname.c_str();
+        if (!strncmp(t, "blk.nextn.", 10)) {
+            // nextn block <i> sits at hp index n_layer + i (trunk is [0, n_layer))
+            il = (int)model->hparams.n_layer() + atoi(t + 10);
+        } else if (!strncmp(t, "blk.", 4)) {
+            il = atoi(t + 4);
         }
 
-        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-        if (!dev) {
-            continue;
-        }
-        for (size_t i = 0; i < nd; i++) {
-            if (dev == llama_model_get_device(model, i)) {
-                ret[i].mb.model   += mb.model;
-                ret[i].mb.context += mb.context;
-                ret[i].mb.compute += mb.compute;
-                break;
+        for (size_t i = 0; i < ndevs; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (!dev || dev != buft_dev) continue;
+            usage[i].bytes += bytes;
+            if (il >= 0) {
+                usage[i].layers.push_back(il);
+                if (usage[i].first_layer < 0 || il < usage[i].first_layer) usage[i].first_layer = il;
+                if (il > usage[i].last_layer) usage[i].last_layer = il;
             }
+            break;
         }
     }
 
-    {
-        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        if (cpu_dev == nullptr) {
-            llama_free(ctx);
-            llama_model_free(model);
-            throw std::runtime_error("no CPU backend found");
-        }
-        size_t free, total;
-        ggml_backend_dev_memory(cpu_dev, &free, &total);
-        ret.back().free  = free;
-        ret.back().total = total;
+    // de-dupe .layers: one entry per tensor occurrence was collected above, but
+    // downstream rate math must see each layer index exactly once
+    for (auto & u : usage) {
+        std::sort(u.layers.begin(), u.layers.end());
+        u.layers.erase(std::unique(u.layers.begin(), u.layers.end()), u.layers.end());
     }
-    for (size_t i = 0; i < nd; i++) {
-        ggml_backend_dev_t dev = llama_model_get_device(model, i);
-
-        size_t free, total;
-        ggml_backend_dev_memory(dev, &free, &total);
-
-        // Some non-GPU accelerator backends (BLAS etc.) report 0/0 and rely on the
-        // host-memory fallback. For GPU-like backends keep 0/0 so fitting does not
-        // assign anything to a device with an unknown memory budget.
-        if (free == 0 && total == 0) {
-            const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
-            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                LLAMA_LOG_WARN("%s: device %s did not report memory; it will not be used\n",
-                        __func__, ggml_backend_dev_name(dev));
-            } else {
-                free  = ret.back().free;
-                total = ret.back().total;
-            }
-        }
-        ret[i].free  = free;
-        ret[i].total = total;
-    }
-
-    devs.clear();
-    for (int i = 0; i < llama_model_n_devices(model); i++) {
-        devs.push_back(llama_model_get_device(model, i));
-    }
-
-    hp_ngl         = llama_model_n_layer(model);
-    if (mparams->load_mtp) {
-        hp_ngl     += llama_model_n_layer_nextn(model);
-    }
-    hp_n_ctx_train = llama_model_n_ctx_train(model);
-    hp_n_expert    = llama_model_n_expert(model);
-
-    llama_free(ctx);
-    llama_model_free(model);
-    llama_kv_fit_dbg_vram_all("after free");
-
-    return ret;
+    return usage;
 }
 
-// Measure per-device VRAM consumed by everything a real context needs BEYOND what
-// the no_alloc probes already account for (weights via `model`, KV rows + recurrent
-// state via `rate`/`fixed`, sched graph buffers via `compute`). Evidence (rocky2
-// 2026-11-11, u256 OOM run): the output/sampling buffers and the scheduler compute
-// buffers are allocated DURING llama_init_from_model - after a ctx-init-anchored
-// baseline they are invisible, which left ~0.9 GiB uncounted on dev1 while the pool
-// was sized to the cap and OOMed at the first decode.
-//
-// Design: free-memory snapshot right after the real model load (F0) - this is the
-// exact landscape a real run will face, probe residuals included. Then init both
-// contexts (tiny pools) and decode each once; F_last is the post-everything state.
-// Returns:
-//   overhead[g] = F0[g] - F_last[g]           (raw bytes of ctx init + decodes)
-//   baseline[g] = F0[g]                       (caller logs it; pool_room math still
-//                                              uses the no_alloc probe's free values)
-// The solver subtracts the measured contexts' own KV rows (fixed + rate*n_probe_tok)
-// from overhead before using it, so nothing is counted twice.
-struct llama_kv_fit_runtime_result {
-    bool               ok = false;       // probe actually ran (model + ctxs + decodes)
-    uint32_t           probe_cells = 0;  // pool size used by the measurement contexts
-    std::vector<uint64_t> overhead; // per-GPU-device raw bytes (no host entry)
-    std::vector<size_t>   baseline_free; // per-GPU-device free at model-load point (no host)
+// ============================================================================
+// Architecture-derived per-device memory rates
+// ============================================================================
+// Per-device probe-memory rates (nextn layers counted separately — they serve
+// the MTP draft context, not the main one). Indexed by backend device order.
+
+struct kvfit_rate_info {
+    uint64_t kv_bytes_per_cell = 0; int n_attn_layers = 0; // attention KV pool
+    uint64_t ssm_bytes_per_row = 0; int n_ssm_layers = 0;  // recurrent state, per checkpoint row
+    uint64_t mtp_kv_bytes_per_cell = 0; int n_mtp_layers = 0; // nextn KV pool (MTP draft)
 };
 
-static llama_kv_fit_runtime_result llama_kv_fit_runtime_overhead(
-        const char * path_model,
-        llama_model_params * mparams,
-        llama_context_params * cparams,
-        const llama_kv_fit_extra * extra,
-        std::vector<ggml_backend_dev_t> & devs) {
-    const size_t nd = devs.size(); // GPU devices only; NO host entry (see llama_kv_fit_probe)
-    llama_kv_fit_runtime_result ret;
-    std::vector<uint64_t> overhead(nd, 0);
-    std::vector<size_t> baseline_free(nd, 0);
-
-    const llama_model_params mp_real = *mparams; // real weights: no no_alloc override
-    llama_model * model = llama_model_load_from_file(path_model, mp_real);
-    if (model == nullptr) {
-        LLAMA_LOG_WARN("%s: runtime overhead probe failed to load model\n", __func__);
-        ret.overhead      = std::move(overhead);
-        ret.baseline_free = std::move(baseline_free);
-        return ret; // ok = false
-    }
-
-    // Baseline: everything already resident here (probe leftovers via the caching
-    // allocator included) is what a real run must live with. devs holds GPU devices
-    // only (no trailing host), so every entry must be read.
-    for (size_t g = 0; g < devs.size(); g++) {
-        size_t f, t;
-        ggml_backend_dev_memory(devs[g], &f, &t);
-        baseline_free[g] = f;
-    }
-
-    // Effective worst-case ubatch: what the scheduler reserves/launches at runtime is
-    // min(n_ctx, n_ubatch). Decode exactly that many tokens so batch-dependent lazy
-    // buffers (cuBLAS/HIPBLASLt workspaces) allocate at their real size. Fall back to a
-    // safe default when the caller leaves it unset.
-    uint32_t n_probe_tok = 4096;
-    if (cparams->n_ubatch > 0) {
-        n_probe_tok = cparams->n_ubatch;
-        if (cparams->n_ctx > 0 && cparams->n_ctx < n_probe_tok) {
-            n_probe_tok = cparams->n_ctx;
+static std::vector<kvfit_rate_info> kvfit_compute_rates(const llama_model * model,
+                                                        const std::vector<kvfit_dev_usage> & usage,
+                                                        ggml_type type_k, ggml_type type_v,
+                                                        bool flash_attn) {
+    const auto & hp = model->hparams;
+    const uint32_t n_layer_all   = hp.n_layer_all;
+    const uint32_t n_layer_nextn = hp.n_layer_nextn;
+    const bool v_t = !flash_attn;
+    std::vector<kvfit_rate_info> out(usage.size());
+    for (size_t i = 0; i < usage.size(); ++i) {
+        for (int il : usage[i].layers) {
+            if (il >= (int)n_layer_all) continue;
+            // nextn layers: their KV pool lives in the MTP draft context
+            if (il >= (int)(n_layer_all - n_layer_nextn)) {
+                const uint32_t ek = hp.n_embd_k_gqa(il);
+                const uint32_t ev = v_t ? hp.n_embd_v_gqa_max() : hp.n_embd_v_gqa(il);
+                uint64_t cb = (uint64_t)ggml_row_size(type_k, ek);
+                if (!hp.is_mla()) cb += (uint64_t)ggml_row_size(type_v, ev);
+                out[i].mtp_kv_bytes_per_cell += cb;
+                ++out[i].n_mtp_layers;
+                continue;
+            }
+            if (hp.is_recr(il)) {
+                // recurrent state rows are always F32 (create_memory hardcodes them)
+                uint64_t cb = (uint64_t)ggml_row_size(GGML_TYPE_F32, hp.n_embd_r());
+                cb += (uint64_t)ggml_row_size(GGML_TYPE_F32, hp.n_embd_s());
+                if (hp.ple_conv_state() > 0 && hp.is_ple(il)) {
+                    cb += (uint64_t)ggml_row_size(GGML_TYPE_F32, hp.ple_conv_state());
+                }
+                out[i].ssm_bytes_per_row += cb;
+                ++out[i].n_ssm_layers;
+            } else if (hp.has_kv(il)) {
+                const uint32_t ek = hp.n_embd_k_gqa(il);
+                const uint32_t ev = v_t ? hp.n_embd_v_gqa_max() : hp.n_embd_v_gqa(il);
+                uint64_t cb = (uint64_t)ggml_row_size(type_k, ek);
+                if (!hp.is_mla()) cb += (uint64_t)ggml_row_size(type_v, ev);
+                out[i].kv_bytes_per_cell += cb;
+                ++out[i].n_attn_layers;
+            }
         }
     }
+    return out;
+}
 
-    llama_context_params cp = *cparams;
-    // OOM-proof: the measurement pool only needs to hold one worst-case ubatch. It stays
-    // tiny compared to the real pool (hundreds of thousands of cells) even at large ubatch.
-    cp.n_kv_cache = std::max<uint32_t>(n_probe_tok, 256);
-    if (cp.n_batch < n_probe_tok) { // the probe decode below wants all tokens in one batch
-        cp.n_batch = n_probe_tok;
+// ============================================================================
+// KV pool solver
+// ============================================================================
+// Largest KV pool size (in 256-cell blocks) that a greedy layer placement
+// affords on every GPU's budget, found by bisecting (log2 steps). Integer
+// arithmetic throughout; every step is traced so the search and each
+// decision can be verified.
+
+struct kvfit_layer_cost {
+    uint64_t weights = 0;       // tensor bytes for this layer (GGUF metadata)
+    uint64_t kv_bpc  = 0;       // KV-cache bytes per cell, main pool (attention layers)
+    uint64_t mtp_kv_bpc = 0;    // KV-cache bytes per cell, MTP draft pool (nextn layers)
+    uint64_t ssm_state = 0;     // recurrent checkpoint state (rows x row-set), else 0
+};
+
+static std::vector<kvfit_layer_cost> kvfit_compute_layer_costs(const llama_model * model,
+                                                               const std::map<int, int64_t> & layer_weights,
+                                                               ggml_type type_k, ggml_type type_v,
+                                                               bool flash_attn, uint32_t state_rows) {
+    const auto & hp = model->hparams;
+    const bool v_t = !flash_attn;
+    const uint32_t n_nextn_first = hp.n_layer_all - hp.n_layer_nextn;   // first nextn index
+    std::vector<kvfit_layer_cost> out(hp.n_layer_all);
+    for (uint32_t il = 0; il < hp.n_layer_all; ++il) {
+        auto it = layer_weights.find((int)il);
+        if (it != layer_weights.end()) {
+            out[il].weights = (uint64_t)it->second;
+        }
+        if (hp.is_recr(il)) {
+            uint64_t cb = (uint64_t)ggml_row_size(GGML_TYPE_F32, hp.n_embd_r());
+            cb += (uint64_t)ggml_row_size(GGML_TYPE_F32, hp.n_embd_s());
+            if (hp.ple_conv_state() > 0 && hp.is_ple(il)) {
+                cb += (uint64_t)ggml_row_size(GGML_TYPE_F32, hp.ple_conv_state());
+            }
+            out[il].ssm_state = cb * state_rows;
+        } else if (hp.has_kv(il)) {
+            const uint32_t ek = hp.n_embd_k_gqa(il);
+            const uint32_t ev = v_t ? hp.n_embd_v_gqa_max() : hp.n_embd_v_gqa(il);
+            uint64_t cb = (uint64_t)ggml_row_size(type_k, ek);
+            if (!hp.is_mla()) {
+                cb += (uint64_t)ggml_row_size(type_v, ev);
+            }
+            // nextn layers back the MTP draft context, not the main pool
+            if (il >= n_nextn_first) {
+                out[il].mtp_kv_bpc = cb;
+            } else {
+                out[il].kv_bpc = cb;
+            }
+        }
+    }
+    return out;
+}
+
+// Try placing n 256-cell blocks: walk layers in order — each intermediate GPU
+// takes layers greedily until the next one would exceed its budget; the LAST
+// GPU has no choice, it must take all remaining layers, so it only fits if
+// their total cost stays inside its budget. The last GPU also carries the
+// model's global tensors (norm, output — they are not per-layer).
+static bool kvfit_try_place(uint32_t n_blocks,
+                            const std::vector<kvfit_layer_cost> & layers,
+                            const std::vector<uint64_t> & budgets,
+                            const std::vector<std::string> & names,
+                            uint64_t last_gpu_extra) {
+    const uint64_t cells = (uint64_t)n_blocks * 256;
+    LLAMA_LOG_PLANNING("\n        testing with n = %-5u blocks (%llu cells)\n",
+                       n_blocks, (unsigned long long)cells);
+
+    // prefix sums over layers: O(1) range queries for each cost component.
+    // The per-cell charge covers BOTH pools a layer's cells live in: the main
+    // KV pool (attention layers) and the MTP draft pool (nextn layers).
+    const size_t nl = layers.size();
+    std::vector<uint64_t> p_wss(nl + 1, 0), p_bpc(nl + 1, 0), p_wts(nl + 1, 0), p_ssm(nl + 1, 0);
+    for (size_t i = 0; i < nl; ++i) {
+        p_wss[i + 1] = p_wss[i] + layers[i].weights + layers[i].ssm_state;
+        p_bpc[i + 1] = p_bpc[i] + layers[i].kv_bpc + layers[i].mtp_kv_bpc;
+        p_wts[i + 1] = p_wts[i] + layers[i].weights;
+        p_ssm[i + 1] = p_ssm[i] + layers[i].ssm_state;
     }
 
-    llama_context * ctx = llama_init_from_model(model, cp);
-    if (ctx == nullptr) {
-        LLAMA_LOG_WARN("%s: runtime overhead probe failed to init context\n", __func__);
-        llama_model_free(model);
-        ret.overhead      = std::move(overhead);
-        ret.baseline_free = std::move(baseline_free);
-        return ret; // ok = false
-    }
-    ret.probe_cells = cp.n_kv_cache;
+    size_t il = 0;
+    for (size_t g = 0; g < budgets.size() && il < nl; ++g) {
+        const bool is_last = (g + 1 == budgets.size());
+        const size_t first_layer = il;
+        uint64_t used = 0;
 
-    // One worst-case decode: content is irrelevant; the point is to make every kernel
-    // type run at full ubatch size so all lazy buffers are allocated before the deltas.
+        if (!is_last) {
+            // intermediate GPU: take layers while they fit, hand over the rest
+            while (il < nl) {
+                const uint64_t cost = layers[il].weights + cells * (layers[il].kv_bpc
+                                                                   + layers[il].mtp_kv_bpc)
+                                    + layers[il].ssm_state;
+                if (used + cost > budgets[g]) break;   // next GPU continues at il
+                used += cost;
+                ++il;
+            }
+        } else {
+            // last GPU: no choice — all remaining layers are its, plus the global
+            // tensors (norm, output); the range total against its budget decides
+            // the candidate outright
+            used = (p_wss[nl] - p_wss[first_layer])
+                 + cells * (p_bpc[nl] - p_bpc[first_layer])
+                 + last_gpu_extra;
+        }
+
+        const bool has_layers = is_last || (il > first_layer);   // last GPU always "owns" the rest
+        const size_t shown_last = has_layers ? (is_last ? nl - 1 : il - 1) : 0;
+        std::string range = has_layers ? "" : "(none)";
+        if (has_layers) {
+            char rb[64];
+            snprintf(rb, sizeof rb, "%zu..%zu", first_layer, shown_last);
+            range = rb;
+        }
+
+        const uint64_t wts = (has_layers ? (p_wts[shown_last + 1] - p_wts[first_layer]) : 0)
+                           + (is_last ? last_gpu_extra : 0);   // globals ride the last GPU's tensors
+        const uint64_t ssm = has_layers ? (p_ssm[shown_last + 1] - p_ssm[first_layer]) : 0;
+        const uint64_t bpc = has_layers ? (p_bpc[shown_last + 1] - p_bpc[first_layer]) : 0;
+        const uint64_t cache = cells * bpc;
+        const bool fits = (used <= budgets[g]);   // always true for intermediate GPUs (greedy)
+
+        LLAMA_LOG_PLANNING("          %s: layers = %s\n"
+                           "            tensors   = %llu\n"
+                           "            swa/ssm   = %llu\n"
+                           "            cache     = cells(%llu) × bpc(%llu) = %llu\n",
+                           names[g].c_str(), range.c_str(),
+                           (unsigned long long)wts, (unsigned long long)ssm,
+                           (unsigned long long)cells, (unsigned long long)bpc,
+                           (unsigned long long)cache);
+        if (!is_last || fits) {
+            LLAMA_LOG_PLANNING("            used      = tensors(%llu) + swa/ssm(%llu) + cache(%llu) = %llu\n"
+                               "            not used  = budget(%llu) - used(%llu) = %llu\n",
+                               (unsigned long long)wts, (unsigned long long)ssm,
+                               (unsigned long long)cache, (unsigned long long)used,
+                               (unsigned long long)budgets[g], (unsigned long long)used,
+                               (unsigned long long)(budgets[g] - used));
+        } else {
+            LLAMA_LOG_PLANNING("            used      = tensors(%llu) + swa/ssm(%llu) + cache(%llu) = %llu\n"
+                               "            over limit = used(%llu) - budget(%llu) = %llu\n",
+                               (unsigned long long)wts, (unsigned long long)ssm,
+                               (unsigned long long)cache, (unsigned long long)used,
+                               (unsigned long long)used, (unsigned long long)budgets[g],
+                               (unsigned long long)(used - budgets[g]));
+        }
+
+        if (is_last) return fits;
+    }
+    return true;   // all layers placed — candidate fits
+}
+
+// Bisect for the largest fitting n of 256-cell blocks: at most log2(n_max)
+// steps. Returns the winning block count (0 = nothing fits).
+static uint32_t kvfit_solve(uint32_t n_max,
+                            const std::vector<kvfit_layer_cost> & layers,
+                            const std::vector<uint64_t> & budgets,
+                            const std::vector<std::string> & names,
+                            uint64_t last_gpu_extra) {
+    LLAMA_LOG_PLANNING("\n        kv pool solver: bisect n of 256-cell blocks (integer arithmetic)\n");
+    if (n_max == 0 || layers.empty() || budgets.empty()) {
+        LLAMA_LOG_PLANNING("          n_max = 0 — nothing to solve\n");
+        return 0;
+    }
     {
-        std::vector<llama_token> toks(n_probe_tok, 1); // any in-vocab ids work
-        llama_batch batch = llama_batch_get_one(toks.data(), (int32_t) n_probe_tok);
-        llama_decode(ctx, batch);
-    }
-
-    // Mirror fllama's deployment: when an MTP context shares this model it adds its own
-    // contexts and kernels (nextn layers), so measure those first-use allocations too.
-    if (extra != nullptr && extra->shares_model) {
-        llama_context_params cpe = *extra->cparams;
-        cpe.n_kv_cache  = std::max<uint32_t>(n_probe_tok, 256);
-        cpe.ctx_other   = ctx;
-        if (cpe.n_batch < n_probe_tok) { // keep the probe decode in one batch
-            cpe.n_batch = n_probe_tok;
+        std::string blines = "          budgets:";
+        for (size_t g = 0; g < budgets.size(); ++g) {
+            char b[64];
+            snprintf(b, sizeof b, " %s = %llu", names[g].c_str(), (unsigned long long)budgets[g]);
+            blines += b;
         }
-        llama_context * mctx = llama_init_from_model(model, cpe);
-        if (mctx != nullptr) {
-            // The MTP graph takes a hidden-state input per token (llama-graph.cpp:
-            // llm_graph_input_embd_h::set_input asserts ubatch->embd_state), so this
-            // decode must use the batch_ext API with embd_state set, like fllama does.
-            // Content is irrelevant for the overhead measurement; only the layout matters
-            // (contiguous n_embd_out floats per token).
-            const int32_t n_state = llama_model_n_embd_out(model);
-
-            std::vector<llama_token> toks(n_probe_tok, 1);
-            std::vector<float> state((size_t) n_probe_tok * (size_t) n_state, 0.0f);
-
-            llama_batch_ext * bext = llama_batch_ext_init(mctx);
-            for (uint32_t t = 0; t < n_probe_tok; ++t) {
-                const int32_t idx = llama_batch_ext_add_token(bext, 0, toks[t]);
-                if (idx < 0) {
-                    break; // n_tokens_max reached: still a valid (shorter) worst-case probe
-                }
-                const llama_pos pos = (llama_pos) t;
-                llama_batch_ext_set_pos(bext, idx, &pos);
-
-                struct llama_embd embd;
-                embd.data   = state.data() + (size_t) t * n_state;
-                embd.n_rows = 1;
-                embd.n_embd = (size_t) n_state;
-                llama_batch_ext_set_embd_state(bext, idx, embd);
-
-                llama_batch_ext_set_output_logits(bext, idx, true);
-            }
-            llama_process(mctx, LLAMA_PROCESS_TYPE_DECODE, bext);
-            llama_batch_ext_free(bext);
-            llama_free(mctx);
+        LLAMA_LOG_PLANNING("%s\n", blines.c_str());
+    }
+    uint32_t low = 0, high = n_max;   // bisection over the whole range
+    while (low < high) {
+        const uint32_t mid = low + (high - low + 1) / 2;   // rounds UP -> monotonic progress
+        if (kvfit_try_place(mid, layers, budgets, names, last_gpu_extra)) {
+            low = mid;
         } else {
-            LLAMA_LOG_WARN("%s: runtime overhead probe could not init the extra context\n", __func__);
+            high = mid - 1;
         }
     }
-
-    for (size_t g = 0; g < devs.size(); g++) {
-        size_t f, t;
-        ggml_backend_dev_memory(devs[g], &f, &t);
-        if (baseline_free[g] > f) {
-            overhead[g] = baseline_free[g] - f;
-        }
-    }
-
-    llama_free(ctx);
-    llama_model_free(model);
-    ret.ok          = true; // main ctx measured; the production config that matters is covered
-    ret.overhead    = std::move(overhead);
-    ret.baseline_free = std::move(baseline_free);
-    return ret;
+    LLAMA_LOG_PLANNING("          OPTIMAL: n=%-7u blocks = %llu kv cells\n",
+                       low, (unsigned long long)low * 256ULL);
+    return low;
 }
 
-// Pure computation: solve the maximum unified KV pool size from two no_alloc
-// probes taken at N0 and N1 cells. Has no device/model dependencies of its own;
-// everything is measured into the dmds vectors by the caller.
-// runtime_overhead[id] is the RAW measured bytes (ctx init + decodes, see
-// llama_kv_fit_runtime_overhead): it already contains the sched compute buffers and
-// the measurement contexts' own KV rows, so the solver adds only model + the residual
-// (raw - fixed - rate*n_probe_cells). n_probe_cells = pool size of the measurement
-// contexts (0 when no overhead data is available).
-static uint32_t llama_kv_fit_max_pool_solve(
-        const std::vector<llama_device_memory_data> & dmds_low,
-        const std::vector<llama_device_memory_data> & dmds_high,
-                                uint32_t N0, uint32_t N1,
-                                const size_t * margins,      // per-device margin to keep free (bytes)
-                                const uint64_t * runtime_overhead, // raw measured ctx-init+decode bytes per device
-                                uint32_t n_probe_cells,        // pool size of the measurement contexts
-                                double vram_fraction) {      // hard cap: max usage of each device's total memory
-    fprintf(stderr, "[KV-FIT-DBG] solve: %zu entries (last = host), N0=%u N1=%u vram_fraction=%.2f rt_overhead=%s\n",
-            dmds_low.size(), N0, N1, vram_fraction,
-            runtime_overhead != nullptr ? "measured" : "none");
-    if (dmds_low.empty() || dmds_low.size() != dmds_high.size()) {
-        fprintf(stderr, "[KV-FIT-DBG] solve: giving up - probe vectors empty or size mismatch (%zu vs %zu)\n",
-                dmds_low.size(), dmds_high.size());
+// ============================================================================
+// GGUF metadata (device-invariant weight accounting)
+// ============================================================================
+// Per-layer weight bytes, global tensors and the total model size — pure GGUF
+// contents, read without loading the model. The solver charges these per layer;
+// Guard 2 uses the total.
+
+struct kvfit_gguf_info {
+    std::map<int, int64_t> layer_weights;
+    int64_t norm_bytes   = 0;
+    int64_t output_bytes = 0;
+    int64_t embed_bytes  = 0;
+    int64_t model_bytes  = 0;   // all tensors (Guard 2)
+};
+
+static bool kvfit_read_gguf(const char * path, kvfit_gguf_info & info) {
+    gguf_init_params params;
+    params.no_alloc = true;
+    params.ctx = nullptr;
+    struct gguf_context * ctx = gguf_init_from_file(path, params);
+    if (!ctx) {
+        LLAMA_LOG_ERROR("kvfit: failed to open GGUF metadata for %s\n", path);
+        return false;
+    }
+
+    const char * arch = nullptr;
+    int64_t id_arch = gguf_find_key(ctx, "general.architecture");
+    if (id_arch >= 0) arch = gguf_get_val_str(ctx, id_arch);
+
+    // nextn block indices: blk.nextn.<i> maps to hp layer n_layer + i — read the
+    // trunk's n_layer from GGUF metadata since this parse predates the model load
+    int64_t n_layer_meta = 0;
+    if (arch) {
+        const std::string nk = std::string(arch) + ".n_layer";
+        int64_t id_nlayer = gguf_find_key(ctx, nk.c_str());
+        if (id_nlayer >= 0) {
+            n_layer_meta = (int64_t)gguf_get_val_u32(ctx, id_nlayer);
+        }
+    }
+
+    const int64_t n_tensors = gguf_get_n_tensors(ctx);
+    for (int64_t tid = 0; tid < n_tensors; tid++) {
+        const char * tname = gguf_get_tensor_name(ctx, tid);
+        const int64_t tsize = (int64_t)gguf_get_tensor_size(ctx, tid);
+        info.model_bytes += tsize;
+
+        if (!strcmp(tname, "token_embd.weight")) { info.embed_bytes += tsize; continue; }
+        if (!strcmp(tname, "output_norm.weight")) { info.norm_bytes += tsize; continue; }
+        if (!strcmp(tname, "output.weight"))      { info.output_bytes += tsize; continue; }
+
+        int il = -1;
+        const char * p_nextn = strstr(tname, "blk.nextn.");
+        if (p_nextn) {
+            int nin = 0;
+            if (n_layer_meta > 0 && sscanf(p_nextn + strlen("blk.nextn."), "%d", &nin) == 1) {
+                il = (int)n_layer_meta + nin;
+            }
+        } else if (strstr(tname, "blk.")) {
+            const char * p = strstr(tname, "blk.");
+            sscanf(p + 4, "%d", &il);
+        }
+        if (il >= 0) {
+            info.layer_weights[il] += tsize;
+        }
+    }
+
+    gguf_free(ctx);
+    return true;
+}
+
+// ============================================================================
+// Warmup decode
+// ============================================================================
+// The measurement load must execute the real deployment's compute paths so
+// every kernel the run will launch is uploaded to the devices — only a live
+// decode measures what a live run pays. The prompt is ~20K chars of Hamlet
+// (warmup-text.h): natural-language tokens with high diversity, so a MoE
+// router exercises many experts and their kernels load too. Returns the
+// number of tokens decoded in prefill (0 on failure).
+
+static int kvfit_warmup_decode(llama_context * ctx, const std::vector<int32_t> & tokens) {
+    const int n_tok = (int)tokens.size();
+    if (n_tok <= 0) {
         return 0;
     }
 
-    const size_t nd = dmds_low.size() - 1; // devices only; the host entry (last) is excluded on purpose:
-                                           // auto-maximizing into system RAM stays an explicit option
-    for (size_t id = 0; id < nd; id++) { // GPU devices only (host excluded)
-        const auto & lmb = dmds_low[id].mb;
-        const auto & hmb = dmds_high[id].mb;
-        fprintf(stderr, "[KV-FIT-DBG] dev%zu -- measured:\n", id);
-        fprintf(stderr, "[KV-FIT-DBG]   model    = %lld B\n", (long long)lmb.model);
-        fprintf(stderr, "[KV-FIT-DBG]   compute  = %lld B\n", (long long)lmb.compute);
-        fprintf(stderr, "[KV-FIT-DBG]   ctx@%u   = %lld B\n", N0, (long long)lmb.context);
-        fprintf(stderr, "[KV-FIT-DBG]   ctx@%u   = %lld B\n", N1, (long long)hmb.context);
-        fprintf(stderr, "[KV-FIT-DBG]   total    = %lld B\n", (long long)dmds_low[id].total);
-        fprintf(stderr, "[KV-FIT-DBG]   free     = %lld B\n", (long long)dmds_low[id].free);
-        if (runtime_overhead != nullptr) {
-            fprintf(stderr, "[KV-FIT-DBG]   rt_raw   = %lld B (ctx-init+decode window)\n",
-                    (long long)runtime_overhead[id]);
+    // batch construction follows fllama.c exactly (and it does not crash):
+    // raw mallocs, a flat seq_id pointer array without per-token inner
+    // allocations, and manual frees.
+    int seq_id = 0;   // non-const: batch.seq_id pointers must stay valid during llama_decode
+
+    auto build_batch = [&](std::vector<int32_t> * tok_vec, int32_t pos_start, bool logits_last_only) {
+        const size_t n = tok_vec->size();
+        llama_batch batch;
+        batch.n_tokens = (int32_t)n;
+        batch.token    = (llama_token *)  malloc(n * sizeof(llama_token));
+        batch.embd     = nullptr;
+        batch.pos      = (llama_pos *)     malloc(n * sizeof(llama_pos));
+        batch.n_seq_id = (int32_t *)       malloc(n * sizeof(int32_t));
+        batch.seq_id   = (llama_seq_id **) malloc(n * sizeof(llama_seq_id *));
+        batch.logits   = (int8_t *)        malloc(n);
+        for (size_t i = 0; i < n; ++i) {
+            batch.token[i]    = (*tok_vec)[i];
+            batch.pos[i]      = pos_start + (llama_pos)i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i]   = &seq_id;
+            // output only at the single marked position, else no outputs
+            batch.logits[i]   = logits_last_only && i == n - 1 ? 1 : 0;
         }
-    }
-    uint32_t n_max = UINT32_MAX;
-    bool have_constraint = false;
-
-    for (size_t id = 0; id < nd; id++) {
-        const auto & lo = dmds_low[id].mb;
-        const auto & hi = dmds_high[id].mb;
-
-        if (lo.model != hi.model) {
-            fprintf(stderr, "[KV-FIT-DBG] solve: giving up - model bytes differ between probes on device %zu (%lld vs %lld)\n",
-                    id, (long long)lo.model, (long long)hi.model);
-            return 0;
-        }
-
-        // Model bytes are a real allocation measurement and MUST match.
-        const uint64_t compute = std::max(lo.compute, hi.compute);
-
-        const int64_t delta_ctx = (int64_t) hi.context - (int64_t) lo.context;
-        const int64_t dns       = (int64_t) (N1 - N0);
-        if (delta_ctx < 0 || delta_ctx % dns != 0) {
-            fprintf(stderr, "[KV-FIT-DBG] solve: giving up - non-affine context size on device %zu (%lld -> %lld)\n",
-                    id, (long long)lo.context, (long long)hi.context);
-            return 0;
-        }
-        const int64_t rate  = delta_ctx / dns;
-        const int64_t fixed = rate > 0 ? (int64_t) lo.context - rate * (int64_t) N0 : (int64_t) lo.context;
-
-        if (rate == 0) {
-            fprintf(stderr, "[KV-FIT-DBG] solve: device %zu hosts no KV layers (rate=0), no constraint\n", id);
-            continue; // this device hosts no KV layers: no pool constraint
-        }
-
-        const llama_device_memory_data & dmd = dmds_low[id];
-        if (dmd.total <= 0 || dmd.free <= 0 || dmd.free > dmd.total) {
-            fprintf(stderr, "[KV-FIT-DBG] solve: giving up - device %zu invalid memory but hosts KV layers (total=%lld free=%lld)\n",
-                    id, (long long)dmd.total, (long long)dmd.free);
-            return 0;
-        }
-
-        // what this device may still allocate for the pool:
-        //   - hard cap so total usage never exceeds vram_fraction of the device (driver headroom)
-        //   - limited by measured free memory, minus the margins to keep for other purposes
-        const int64_t used       = dmd.total > dmd.free ? dmd.total - dmd.free : 0;
-        const int64_t cap_driver = (int64_t) ((double) dmd.total * vram_fraction) - used;
-        const int64_t margin_i   = margins != nullptr ? (int64_t) margins[id] : 0;
-        const int64_t cap_free   = (int64_t) dmd.free - margin_i;
-        const int64_t pool_room  = std::min(cap_driver, cap_free);
-
-        // non-pool bytes. Two accounting modes:
-        // (a) measured window available (llama_kv_fit_max_pool): model + (raw - rate*n_pc).
-        //     The window carries everything a real run pays before the pool grows -
-        //     output/sampling buffers, recurrent state, sched compute buffers, kernels -
-        //     so no separate fixed/compute terms (they would double-count).
-        // (b) no measurement (Phase D split-consistency check): model + compute + fixed from
-        //     the no_alloc breakdowns, same basis Phase C fits against.
-        int64_t rt_oh_used = 0;
-        int64_t non_pool;
-        if (runtime_overhead != nullptr) {
-            if (runtime_overhead[id] > 0) {
-                rt_oh_used = (int64_t) runtime_overhead[id] - rate * (int64_t) n_probe_cells;
-                if (rt_oh_used < 0) {
-                    rt_oh_used = 0; // allocator recycling edge: keep raw measurement, never negative
-                }
-            }
-            non_pool = (int64_t) lo.model + rt_oh_used;
-        } else {
-            non_pool = (int64_t) lo.model + (int64_t) compute + fixed;
-        }
-
-        uint32_t n_dev = 0;
-        if (non_pool < pool_room) {
-            const int64_t cells = (pool_room - non_pool) / rate;
-            n_dev = (uint32_t) (cells / 256u * 256u);
-        }
-
-        fprintf(stderr, "[KV-FIT-DBG] dev%zu -- derived:\n", id);
-        fprintf(stderr, "[KV-FIT-DBG]   rate       = (ctx@%u - ctx@%u) / (%u-%u) = (%lld-%lld)/%lld = %lld B/cell\n",
-                N1, N0, N1, N0, (long long)hi.context, (long long)lo.context, (long long)dns, (long long)rate);
-        fprintf(stderr, "[KV-FIT-DBG]   fixed      = ctx@%u - rate*%u = %lld B\n", N0, N0, (long long)fixed);
-        fprintf(stderr, "[KV-FIT-DBG]   used       = total - free = %lld B\n", (long long)used);
-        fprintf(stderr, "[KV-FIT-DBG]   cap_driver = total*%.*f - used = %lld B\n", 2, vram_fraction, (long long)cap_driver);
-        fprintf(stderr, "[KV-FIT-DBG]   cap_free   = free - margin = %lld B\n", (long long)cap_free);
-        fprintf(stderr, "[KV-FIT-DBG]   pool_room  = min(cap_driver, cap_free) = %lld B\n", (long long)pool_room);
-        if (runtime_overhead != nullptr) {
-            fprintf(stderr, "[KV-FIT-DBG]   rt_used    = rt_raw - rate*n_probe(%u) = %lld B\n",
-                    n_probe_cells, (long long)rt_oh_used);
-            fprintf(stderr, "[KV-FIT-DBG]   non_pool   = model + rt_used = %lld B\n", (long long)non_pool);
-        } else {
-            fprintf(stderr, "[KV-FIT-DBG]   non_pool   = model + compute + fixed = %lld B\n", (long long)non_pool);
-        }
-        fprintf(stderr, "[KV-FIT-DBG]   max cells  = (pool_room - non_pool) / rate = (%lld-%lld)/%lld -> %u cells\n",
-                (long long)pool_room, (long long)non_pool, (long long)rate, n_dev);
-
-        have_constraint = true;
-        n_max = std::min(n_max, n_dev);
-    }
-
-    if (!have_constraint) {
-        fprintf(stderr, "[KV-FIT-DBG] solve: no device with a VRAM constraint hosts KV layers -> 0\n");
-        return 0;
-    }
-    if (n_max < N0) {
-        return 0; // not even one padding unit of pool fits anywhere
-    }
-
-    return n_max;
-}
-
-// See llama-ext.h.
-LLAMA_API int32_t llama_kv_fit_max_pool(
-        const char * path_model,
-        llama_model_params * mparams,
-        llama_context_params * cparams,
-        const size_t * margins,
-        const llama_kv_fit_extra * extra,
-        double vram_fraction) {
-    if (mparams == nullptr || cparams == nullptr || !cparams->kv_unified) {
-        return 0; // pool math is only defined for unified mode
-    }
-
-    llama_kv_fit_warmup_devices();
-
-    // two probes one padding unit apart decompose the per-device context bytes into
-    // fixed + rate * n_cells; what they measure is what create_memory() allocates,
-    // so SWA/MLA/hybrid quirks are handled by construction
-    const uint32_t N0 = 256;
-    const uint32_t N1 = 2 * 256;
-
-    // shared between probe() and the runtime-overhead measurement below: the real-load
-    // context must use exactly the devices the no_alloc probes measured
-    std::vector<ggml_backend_dev_t> devs_main;
-
-    auto probe = [&](uint32_t n_pool) -> std::vector<llama_device_memory_data> {
-        llama_context_params cp_copy = *cparams;
-        cp_copy.n_kv_cache = n_pool;
-
-        devs_main.clear();
-        uint32_t hp_ngl = 0, hp_nct = 0, hp_nex = 0;
-
-        std::vector<llama_device_memory_data> dmds;
-        fprintf(stderr, "[KV-FIT-DBG] probe(n_pool=%u): MAIN cparams n_seq_max=%u n_ctx=%llu n_kv_cache=%u kv_unified=%d ctx_type=%d\n",
-                (unsigned)n_pool, (unsigned)cp_copy.n_seq_max,
-                (unsigned long long)cp_copy.n_ctx, (unsigned)cp_copy.n_kv_cache,
-                (int)cp_copy.kv_unified, (int)cp_copy.ctx_type);
-        try {
-            dmds = llama_kv_fit_probe(path_model, mparams, &cp_copy, devs_main, hp_ngl, hp_nct, hp_nex);
-        } catch (const std::runtime_error & e) {
-            fprintf(stderr, "[KV-FIT-DBG] MAIN probe threw: %s\n", e.what());
-            LLAMA_LOG_ERROR("%s: probing failed for the main model: %s\n", __func__, e.what());
-            return {};
-        }
-
-        if (extra != nullptr && !devs_main.empty()) {
-            // the extra (e.g. MTP) context competes for the same devices; its pool follows
-            // the probed size so its KV rows are part of the measured rate
-            const uint32_t n_pool_saved = extra->cparams->n_kv_cache;
-            extra->cparams->n_kv_cache  = n_pool;
-
-            fprintf(stderr, "[KV-FIT-DBG] probe(n_pool=%u): EXTRA/MTP cparams ptr=%p n_seq_max=%u n_ctx=%llu n_kv_cache=%u kv_unified=%d ctx_type=%d\n",
-                    (unsigned)n_pool, (void*)extra->cparams, (unsigned)extra->cparams->n_seq_max,
-                    (unsigned long long)extra->cparams->n_ctx, (unsigned)extra->cparams->n_kv_cache,
-                    (int)extra->cparams->kv_unified, (int)extra->cparams->ctx_type);
-            std::vector<ggml_backend_dev_t> devs_extra;
-            uint32_t ngl_e = 0, nct_e = 0, nex_e = 0;
-            std::vector<llama_device_memory_data> measured;
-            try {
-                measured = llama_kv_fit_probe(extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_e, nct_e, nex_e);
-            } catch (const std::runtime_error & e) {
-                fprintf(stderr, "[KV-FIT-DBG] EXTRA/MTP probe threw: %s\n", e.what());
-                LLAMA_LOG_WARN("%s: probing failed for the extra model, continuing without it: %s\n", __func__, e.what());
-            }
-            extra->cparams->n_kv_cache = n_pool_saved;
-
-            if (!measured.empty()) {
-                // fold the extra model's memory into the matching devices (same mapping as common)
-                std::vector<llama_device_memory_data> merged(devs_main.size() + 1);
-                merged.back().mb = measured.back().mb;
-                for (size_t je = 0; je < devs_extra.size(); je++) {
-                    for (size_t id = 0; id < devs_main.size(); id++) {
-                        if (devs_extra[je] == devs_main[id]) {
-                            merged[id].mb.model   += measured[je].mb.model;
-                            merged[id].mb.context += measured[je].mb.context;
-                            merged[id].mb.compute += measured[je].mb.compute;
-                            break;
-                        }
-                    }
-                }
-                if (extra->shares_model) {
-                    for (llama_device_memory_data & dmd : merged) {
-                        dmd.mb.model = 0; // weights already counted in the main model
-                    }
-                }
-                for (size_t id = 0; id < dmds.size() && id < merged.size(); id++) {
-                    dmds[id].mb.model   += merged[id].mb.model;
-                    dmds[id].mb.context += merged[id].mb.context;
-                    dmds[id].mb.compute += merged[id].mb.compute;
-                }
-            }
-        }
-
-        return dmds;
+        return batch;
     };
 
-    fprintf(stderr, "[KV-FIT-DBG] probing max KV pool at n_kv_cache = %u / %u\n", N0, N1);
-    const std::vector<llama_device_memory_data> dmds_low  = probe(N0);
-    if (dmds_low.empty()) {
-        return 0;
-    }
-    const std::vector<llama_device_memory_data> dmds_high = probe(N1);
-    if (dmds_high.empty() || dmds_high.size() != dmds_low.size()) {
-        LLAMA_LOG_ERROR("%s: inconsistent probe sizes (%zu vs %zu devices), giving up\n", __func__,
-                dmds_high.size(), dmds_low.size());
-        return 0;
+    auto free_batch = [](llama_batch & batch) {
+        free(batch.token);
+        free(batch.pos);
+        free(batch.n_seq_id);
+        free(batch.seq_id);   // the pointer array only — seq_id[i] point into seq_id above
+        free(batch.logits);
+    };
+
+    // prefill: submit the prompt in n_batch-sized chunks (the backend
+    // subdivides each into ubatches internally — same graph sizes as
+    // production). Positions stay contiguous across chunks.
+    const int32_t n_batch = llama_n_batch(ctx);
+    for (int32_t start = 0; start < n_tok; start += n_batch) {
+        const int32_t end = std::min(n_tok, start + n_batch);
+        std::vector<int32_t> chunk(tokens.begin() + start, tokens.begin() + end);
+        // only the final chunk's last token produces logits
+        llama_batch batch = build_batch(&chunk, start, end == n_tok);
+        const int rc = llama_decode(ctx, batch);
+        free_batch(batch);
+        if (rc != 0) {
+            LLAMA_LOG_ERROR("kvfit: warmup prefill decode failed at token %d\n", start);
+            return 0;
+        }
     }
 
-    // The no_alloc probes cannot see what a real context allocates beyond weight bytes:
-    // output/sampling buffers, recurrent state, scheduler compute buffers and decode-time
-    // kernels all land in VRAM during llama_init_from_model() / llama_decode(). Measure
-    // them with one real load + tiny-pool ctxs + worst-case ubatch decodes at the solved
-    // placement (F0 baseline right after model load). If the measurement itself fails we
-    // must NOT size optimistically on incomplete data - return 0 and let the caller fall
-    // back to an explicit --kv-cache-size or the conservative default.
-    const llama_kv_fit_runtime_result rt =
-            llama_kv_fit_runtime_overhead(path_model, mparams, cparams, extra, devs_main);
-    fprintf(stderr, "[KV-FIT-DBG] runtime overhead probe: ok=%d probe_cells=%u\n", (int)rt.ok, rt.probe_cells);
-    for (size_t g = 0; g < rt.overhead.size(); g++) {
-        fprintf(stderr, "[KV-FIT-DBG]   - device %zu: raw=%8.2f MiB (baseline free %8.2f MiB)\n",
-                g, rt.overhead[g] / 1048576.0, rt.baseline_free[g] / 1048576.0);
-    }
-    if (!rt.ok) {
-        fprintf(stderr, "[KV-FIT-DBG] solve: giving up - runtime overhead probe failed (no unsafe sizing)\n");
-        return 0;
+    // a few generate steps so the single-token decode path is exercised too
+    std::vector<int32_t> next(1);
+    for (int g = 0; g < 4; ++g) {
+        next[0] = tokens[n_tok - 1];
+        llama_batch gb = build_batch(&next, n_tok + g, true);
+        const int rc = llama_decode(ctx, gb);
+        free_batch(gb);
+        if (rc != 0) {
+            LLAMA_LOG_ERROR("kvfit: warmup generate decode %d failed\n", g);
+            break;
+        }
     }
 
-    const uint32_t n_max = llama_kv_fit_max_pool_solve(
-            dmds_low, dmds_high, N0, N1, margins, rt.overhead.data(), rt.probe_cells, vram_fraction);
-    if (n_max > 0) {
-        fprintf(stderr, "[KV-FIT-DBG] ==> conclusion: max unified KV pool = %u cells\n", n_max);
-    }
-    return (int32_t) n_max;
+    return n_tok;
 }
 
 // ============================================================================
-// Automatic tensor-split optimizer — physics, not extrapolation.
-//
-// 2026-11-11 (Michael): the previous water-fill solver (Phase A placement
-// sweep -> affine cost-model fit -> water-filling) is GONE. It fit an
-// unconstrained model to three extreme sweep points and extrapolated into
-// non-physical territory: rocky2 measured a NEGATIVE KV-rate intercept on
-// device 1, which made it predict a pool ~6.5% above what actually fits
-// (dev1 landed at 99%, OOM at the first allocation).
-//
-// The split is now decided on physics: each device takes its FREE-VRAM share
-// of the model tensors. The binding pool decision is made by direct
-// measurement afterwards (llama_kv_fit_max_pool, which enforces non-negative
-// affine context deltas per device).
+// Measurement run
 // ============================================================================
+// One REAL model load (llama_model's native free-VRAM auto-split — the exact
+// provisional placement production would do), a measurement context, and the
+// Hamlet warmup decode. The measured device deltas cover: weights + probe KV
+// pools + SSM state + kernels/shaders + compute buffers — everything a live
+// deployment pays before its own pool exists. Returns false on any failure.
+// Results come back through the out parameters; all model/contexts are freed
+// before returning (the measurement is self-contained).
+
+struct kvfit_measure_result {
+    bool ok = false;
+    std::vector<kvfit_dev_snapshot> scan_raw;      // free VRAM, nothing loaded
+    std::vector<kvfit_dev_snapshot> scan_measure;  // after load + warmup (+ MTP)
+    std::vector<kvfit_dev_usage> usage;            // readback: weights/layers per device
+    std::vector<kvfit_rate_info> rates;             // KV/SSM/MTP rates per device
+    bool mtp_measured = false;                      // nextn KV pool is in the measured delta
+    uint32_t n_ctx_measure = 0;                     // measurement pool size (decomposition input)
+};
+
+static bool kvfit_measure(const char * path,
+                          const llama_model_params * mparams,
+                          const llama_context_params * cparams,
+                          bool measure_mtp,
+                          kvfit_measure_result & r) {
+    // ---- device scan: raw VRAM, nothing loaded yet --------------------------
+    kvfit_read_all_devices(r.scan_raw);
+
+    LLAMA_LOG_PLANNING("\n      device scan (raw, nothing loaded):\n");
+    for (size_t i = 0; i < r.scan_raw.size(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev || !r.scan_raw[i].ok) continue;
+        LLAMA_LOG_PLANNING("        %-4zu %-6s total=%-15llu free=%-15llu %s\n",
+                           i, kvfit_dev_type_str(ggml_backend_dev_type(dev)),
+                           (unsigned long long)r.scan_raw[i].total_bytes,
+                           (unsigned long long)r.scan_raw[i].free_bytes,
+                           ggml_backend_dev_name(dev));
+    }
+
+    // REAL model load: the caller's params define how production loads (mmap
+    // etc.); override placement so llama_model's native auto-split-by-free-VRAM
+    // decides the provisional layout — exactly as a from-scratch deployment does.
+    llama_model_params mp = *mparams;
+    mp.n_gpu_layers  = -1;      // all layers GPU
+    mp.tensor_split  = nullptr; // -> native free-VRAM proportional split
+    mp.tensor_layer_bounds = nullptr; // provisional load: never a planned placement
+    mp.load_mtp      = measure_mtp;
+
+    LLAMA_LOG_PLANNING("      loading: %s (all layers GPU, auto-split by free VRAM, load_mtp=%d)\n",
+                       path, (int)mp.load_mtp);
+    const auto t_load0 = std::chrono::steady_clock::now();
+    llama_model * model = llama_model_load_from_file(path, mp);
+    if (!model) {
+        LLAMA_LOG_ERROR("kvfit: failed to load model %s\n", path);
+        return false;
+    }
+    const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load0).count();
+
+    // measurement context at a common deployment size. n_kv_cache stays 0 with
+    // kv_unified: the pool is then PAD(n_ctx) cells — its size is subtracted in
+    // the decomposition below, so it no longer skews the shader overhead.
+    // Deployment shape (batch sizes, KV types, streams, rollback rows) comes
+    // from the caller's production params — measure what deployment will pay.
+    llama_context_params cp = *cparams;
+    cp.kv_unified = true;
+    cp.n_ctx      = 16384;   // common deployment size (warmup prompt fits with room)
+    cp.n_kv_cache = 0;
+    const uint32_t n_ctx_measure = cp.n_ctx;
+
+    std::vector<int32_t> prompt_tokens(strlen(WARMUP_TEXT) + 8);
+    const int n_tok = llama_tokenize(
+            llama_model_get_vocab(model), WARMUP_TEXT, strlen(WARMUP_TEXT),
+            prompt_tokens.data(), (int)prompt_tokens.size(), true, false);
+    if (n_tok <= 0) {
+        LLAMA_LOG_ERROR("kvfit: warmup tokenization failed\n");
+        llama_model_free(model);
+        return false;
+    }
+    prompt_tokens.resize(n_tok);
+
+    // Guard 3: confirm the warmup KV pool fits in what's left after the load —
+    // exact numbers instead of an opaque OOM at context init.
+    {
+        std::vector<kvfit_dev_usage> usage_now = kvfit_compute_dev_usage(model);
+        std::vector<kvfit_rate_info> rates_now = kvfit_compute_rates(model, usage_now, cp.type_k, cp.type_v, cp.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED);
+
+        std::vector<kvfit_dev_snapshot> scan_now;
+        kvfit_read_all_devices(scan_now);
+        for (size_t i = 0; i < scan_now.size(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (!dev || !scan_now[i].ok) continue;
+            const auto t = ggml_backend_dev_type(dev);
+            if (!(t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU)) continue;
+            const uint64_t mtp_bpc = measure_mtp ? rates_now[i].mtp_kv_bytes_per_cell : 0;
+            const uint64_t need_i = (uint64_t)n_ctx_measure * (rates_now[i].kv_bytes_per_cell + mtp_bpc);
+            if (need_i > scan_now[i].free_bytes) {
+                LLAMA_LOG_ERROR("kvfit: warmup KV pool too large — GPU %zu needs %llu B for %u unified cells but only %llu B free\n",
+                                i, (unsigned long long)need_i, n_ctx_measure,
+                                (unsigned long long)scan_now[i].free_bytes);
+                llama_model_free(model);
+                return false;
+            }
+        }
+    }
+
+    LLAMA_LOG_PLANNING("      measuring: n_ctx=%u n_batch=%u n_ubatch=%u seq_max=%u rs_seq=%u mtp=%s (warmup: Hamlet excerpt, %d tokens)\n",
+                       cp.n_ctx, cp.n_batch, cp.n_ubatch, cp.n_seq_max, cp.n_rs_seq,
+                       measure_mtp ? "yes" : "no", n_tok);
+
+    const auto t_warmup0 = std::chrono::steady_clock::now();
+    llama_context * ctx0 = llama_init_from_model(model, cp);
+    if (!ctx0) {
+        LLAMA_LOG_ERROR("kvfit: measurement context init failed\n");
+        llama_model_free(model);
+        return false;
+    }
+
+    kvfit_warmup_decode(ctx0, prompt_tokens);
+
+    // MTP draft context (speculative.cpp pattern): same n_ctx as the target, no
+    // recurrent state of its own, reads h_nextn from the main context. It must
+    // still exist when scan_measure runs so its nextn KV pool is part of the
+    // measured delta — freed only afterwards.
+    llama_context * ctx_mtp = nullptr;
+    if (measure_mtp) {
+        llama_context_params cp_mtp = cp;
+        cp_mtp.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+        cp_mtp.n_rs_seq  = 0;
+        cp_mtp.ctx_other = ctx0;
+        ctx_mtp = llama_init_from_model(model, cp_mtp);
+        if (ctx_mtp) {
+            // one single-token MTP graph run at the first position after the
+            // prompt: uploads every kernel an MTP deployment will launch
+            int seq_id = 0;
+            llama_batch mb;
+            mb.n_tokens = 1;
+            mb.token    = (llama_token *)  malloc(sizeof(llama_token));
+            mb.pos      = (llama_pos *)     malloc(sizeof(llama_pos));
+            mb.n_seq_id = (int32_t *)       malloc(sizeof(int32_t));
+            mb.seq_id   = (llama_seq_id **) malloc(sizeof(llama_seq_id *));
+            mb.logits   = (int8_t *)        malloc(1);
+            mb.token[0]    = prompt_tokens.back();
+            mb.pos[0]      = (llama_pos)prompt_tokens.size();
+            mb.n_seq_id[0] = 1;
+            mb.seq_id[0]   = &seq_id;
+            mb.logits[0]   = 1;
+            const int rc = llama_decode(ctx_mtp, mb);
+            free(mb.token); free(mb.pos); free(mb.n_seq_id); free(mb.seq_id); free(mb.logits);
+            if (rc != 0) {
+                LLAMA_LOG_ERROR("kvfit: MTP draft decode failed (%d)\n", rc);
+            } else {
+                r.mtp_measured = true;
+            }
+        } else {
+            LLAMA_LOG_WARN("kvfit: MTP draft context init failed — nextn KV pool NOT in the measured delta\n");
+        }
+    }
+
+    const double warmup_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warmup0).count();
+    LLAMA_LOG_PLANNING("      measurement: done; load %.1f s + warmup %.1f s (%.0f tok/s)%s\n",
+                       load_s, warmup_s, warmup_s > 0 ? (double)n_tok / warmup_s : 0.0,
+                       r.mtp_measured ? " [mtp draft context ready]" : "");
+
+    kvfit_read_all_devices(r.scan_measure);
+    r.usage = kvfit_compute_dev_usage(model);
+    r.rates = kvfit_compute_rates(model, r.usage, cp.type_k, cp.type_v, cp.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED);
+    (void)n_ctx_measure;   // captured for the decomposition (see kvfit_solve_plan)
+
+    if (ctx_mtp) llama_free(ctx_mtp);
+    llama_free(ctx0);
+    llama_model_free(model);
+    r.ok = true;
+    return true;
+}
+
+// ============================================================================
+// Plan: measurement → decomposition → budgets → upper limit → solve → layout
+// ============================================================================
+// One measurement run (kvfit_measure) prices everything the deployment will
+// pay per device; the plan derives the solver inputs from it:
+//   delta[i]   = free VRAM consumed by load + warmup on device i
+//   kernels[i] = delta - weights(readback) - probe-KV - SSM(state rows x bpr)
+//                (shaders + compute buffers: the fixed overhead every
+//                 deployment pays — subtracted from each device's budget)
+//   budget[i]  = free[i] - kernels[i] - reserve[i],
+//   reserve[i] = total[i] x keep_free (+ per-device margin),
+//                keep_free = 1 - vram_fraction
+// The global ceiling for the pool, over all GPUs together:
+//   kv upper limit = (sum budgets - sum weights(readback, incl. MTP)
+//                    - state rows x sum SSM bytes/row) / sum KV bytes/cell
+// and n_max = kv upper limit / 256 blocks. Greedy bisection then finds the
+// largest block count whose layers fit every GPU's budget; the winning
+// placement becomes the plan the caller applies to its real load.
+
+struct kvfit_plan {
+    bool ok = false;
+    uint32_t n_cells = 0;            // pool size (blocks x 256), the solver's result
+    uint32_t n_layer_all = 0;        // trunk + nextn layer count (hparams)
+    std::vector<int> first_layer;    // per GPU: first layer index of its range
+    std::vector<std::string> names;  // per GPU, solver row order
+};
+
+// One metadata-only model load for hparams (router/nextn flags, n_layer_all):
+// no_alloc LLAMA_LOAD_MODE_NONE reads the GGUF header without touching VRAM.
+static bool kvfit_peek_hparams(const char * path,
+                               const llama_model_params * mparams,
+                               llama_model * & model_out) {
+    llama_model_params mp = *mparams;
+    mp.no_alloc  = true;
+    mp.load_mode = LLAMA_LOAD_MODE_NONE;
+    mp.load_mtp  = false;
+    llama_model * model = llama_model_load_from_file(path, mp);
+    if (!model) {
+        LLAMA_LOG_WARN("kvfit: metadata pre-look failed — assuming no MTP block\n");
+        return false;
+    }
+    model_out = model;
+    return true;
+}
+
+static kvfit_plan kvfit_plan_compute(const char * path,
+                                     const llama_model_params * mparams,
+                                     const llama_context_params * cparams,
+                                     const llama_kv_fit_params * params) {
+    kvfit_plan plan;
+    if (!params) {
+        LLAMA_LOG_ERROR("kvfit: params is null — use llama_kv_fit_params_new()\n");
+        return plan;
+    }
+
+    // ---- Guard 1: GPU deployments only (no CPU-only mode) -------------------
+    if (!kvfit_gpus_present()) {
+        LLAMA_LOG_ERROR("kvfit: no GPU devices found — planning requires at least one "
+                        "GPU (there is no CPU-only mode)\n");
+        return plan;
+    }
+
+    // ---- GGUF metadata: Guard 2 + the solver's per-layer weights -------------
+    kvfit_gguf_info gguf;
+    if (!kvfit_read_gguf(path, gguf)) {
+        return plan;   // kvfit_read_gguf already reported
+    }
+
+    // device scan with nothing loaded: Guard 2 and the budget denominators
+    std::vector<kvfit_dev_snapshot> scan_raw;
+    kvfit_read_all_devices(scan_raw);
+    LLAMA_LOG_PLANNING("\n      device scan (raw, nothing loaded):\n");
+    for (size_t i = 0; i < scan_raw.size(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev || !scan_raw[i].ok) continue;
+        const auto t = ggml_backend_dev_type(dev);
+        if (t == GGML_BACKEND_DEVICE_TYPE_CPU) continue;   // hidden while GPUs are present
+        LLAMA_LOG_PLANNING("        %-4zu %-6s total=%-15llu free=%-15llu %s\n",
+                           i, kvfit_dev_type_str(t),
+                           (unsigned long long)scan_raw[i].total_bytes,
+                           (unsigned long long)scan_raw[i].free_bytes,
+                           ggml_backend_dev_name(dev));
+    }
+
+    // Guard 2: weights alone exceeding total free GPU VRAM is a definite no —
+    // report it instead of paying for a load that cannot work.
+    uint64_t gpu_free_total = 0, gpu_count = 0;
+    for (size_t i = 0; i < scan_raw.size(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev || !scan_raw[i].ok) continue;
+        const auto t = ggml_backend_dev_type(dev);
+        if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
+        gpu_free_total += scan_raw[i].free_bytes;
+        ++gpu_count;
+    }
+    if ((uint64_t)gguf.model_bytes > gpu_free_total) {
+        LLAMA_LOG_ERROR("kvfit: model too large — weights (%llu B) exceed total free GPU "
+                        "VRAM (%llu B on %zu GPUs)\n",
+                        (unsigned long long)gguf.model_bytes,
+                        (unsigned long long)gpu_free_total, gpu_count);
+        return plan;
+    }
+
+    // ---- MTP: a nextn block measured in the same run as the trunk ------------
+    // On router models the trunk attends to those layers on EVERY pass (no
+    // separate draft context exists) and llama_init_from_model rejects MTP
+    // contexts for them — skip measuring there.
+    bool has_nextn = false, is_router = false;
+    {
+        llama_model * model_peek = nullptr;
+        if (kvfit_peek_hparams(path, mparams, model_peek)) {
+            has_nextn  = model_peek->hparams.n_layer_nextn > 0;
+            is_router  = model_peek->hparams.router_layer >= 0;
+            llama_model_free(model_peek);
+        }
+    }
+    const bool extra_wants_mtp = params->extra && params->extra->shares_model;
+    const bool measure_mtp = (extra_wants_mtp || !params->extra) && has_nextn && !is_router;
+
+    // ---- the measurement run ----------------------------------------------------
+    kvfit_measure_result meas;
+    if (!kvfit_measure(path, mparams, cparams, measure_mtp, meas)) {
+        return plan;   // kvfit_measure already reported
+    }
+    const bool mtp_measured = meas.mtp_measured;
+    const uint32_t n_ctx_measure = meas.n_ctx_measure;
+
+    // deployment shape for the SSM state: rows per recurrent layer the
+    // production contexts will allocate (n_seq_max x (live row + rollback rows))
+    const uint32_t n_seq_max  = (cparams->n_seq_max > 0) ? (uint32_t)cparams->n_seq_max : 1;
+    const uint32_t n_rs_seq   = (cparams->n_rs_seq  > 0) ? (uint32_t)cparams->n_rs_seq  : 0;
+    const uint32_t state_rows = n_seq_max * (1u + n_rs_seq);
+
+    // ---- per-device decomposition of the measured delta -------------------------
+    LLAMA_LOG_PLANNING("\n      overhead decomposition: "
+                       "kernels = delta - weights - probe-KV - SSM(state rows x bytes/row)\n");
+    const uint64_t probe_cells = ((uint64_t)n_ctx_measure + 255u) / 256u * 256u; // GGML_PAD, as the cache does
+    size_t nd_gpus = 0;
+    for (size_t i = 0; i < scan_raw.size(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev || !scan_raw[i].ok || i >= meas.scan_measure.size() || !meas.scan_measure[i].ok) continue;
+        const auto t = ggml_backend_dev_type(dev);
+        if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) ++nd_gpus;
+    }
+    std::vector<uint64_t> d_delta(nd_gpus), d_weights(nd_gpus), d_probe_kv(nd_gpus), d_kernels(nd_gpus);
+    std::vector<uint64_t> d_ssm_bpr(nd_gpus, 0), d_kv_bpc(nd_gpus, 0), d_mtp_bpc(nd_gpus, 0);
+    {
+        size_t gi = 0;
+        for (size_t i = 0; i < scan_raw.size() && gi < nd_gpus; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (!dev || !scan_raw[i].ok || i >= meas.scan_measure.size() || !meas.scan_measure[i].ok) continue;
+            const auto t = ggml_backend_dev_type(dev);
+            if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
+
+            const uint64_t delta   = scan_raw[i].free_bytes > meas.scan_measure[i].free_bytes
+                                   ? scan_raw[i].free_bytes - meas.scan_measure[i].free_bytes : 0;
+            const uint64_t weights = i < meas.usage.size() ? meas.usage[i].bytes : 0;
+            const uint64_t kv_bpc  = i < meas.rates.size() ? meas.rates[i].kv_bytes_per_cell : 0;
+            const uint64_t mtp_bpc = (mtp_measured && i < meas.rates.size()) ? meas.rates[i].mtp_kv_bytes_per_cell : 0;
+            const uint64_t ssm_bpr = i < meas.rates.size() ? meas.rates[i].ssm_bytes_per_row : 0;
+
+            // probe-KV: the measurement context's own pools (main + MTP draft when
+            // measured). Unified pools are shared across streams — streams do not
+            // multiply the size. SSM state rows: charged here AND in the upper
+            // limit, at the deployment's planned row count.
+            d_probe_kv[gi] = probe_cells * (kv_bpc + mtp_bpc);
+            const uint64_t ssm_alloc = (uint64_t)state_rows * ssm_bpr;
+            d_kernels[gi]  = (delta > weights + d_probe_kv[gi] + ssm_alloc)
+                           ? delta - weights - d_probe_kv[gi] - ssm_alloc : 0;
+            d_delta[gi]   = delta;
+            d_weights[gi] = weights;
+            d_ssm_bpr[gi] = ssm_bpr;
+            d_kv_bpc[gi]  = kv_bpc;
+            d_mtp_bpc[gi] = mtp_bpc;
+
+            LLAMA_LOG_PLANNING("        %s: delta=%llu weights=%llu probe-KV=%llu "
+                               "(cells(%llu) x bpc(%llu)) SSM=%llu kernels=%llu\n",
+                               ggml_backend_dev_name(dev),
+                               (unsigned long long)d_delta[gi], (unsigned long long)d_weights[gi],
+                               (unsigned long long)d_probe_kv[gi],
+                               (unsigned long long)probe_cells, (unsigned long long)(kv_bpc + mtp_bpc),
+                               (unsigned long long)ssm_alloc,
+                               (unsigned long long)d_kernels[gi]);
+            ++gi;
+        }
+    }
+
+    // ---- budgets: what each GPU leaves for weights + KV -------------------------
+    const double keep_free = 1.0 - params->vram_fraction;
+    LLAMA_LOG_PLANNING("\n      split budget: reserve = total x keep_free(%.2f)%s; "
+                       "budget = free - kernels - reserve\n",
+                       keep_free, (params->margins ? " + margin" : ""));
+    std::vector<uint64_t> budgets(nd_gpus);
+    std::vector<std::string> names;
+    int64_t total_budget = 0, total_weights = 0;
+    uint64_t ssm_per_row_total = 0, cell_size_total = 0;
+    {
+        size_t gi = 0;
+        for (size_t i = 0; i < scan_raw.size() && gi < nd_gpus; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (!dev || !scan_raw[i].ok) continue;
+            const auto t = ggml_backend_dev_type(dev);
+            if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
+
+            int64_t total   = (int64_t)scan_raw[i].total_bytes;
+            int64_t free    = (int64_t)scan_raw[i].free_bytes;
+            int64_t kernels = (int64_t)d_kernels[gi];
+            int64_t reserve = (int64_t)((double)total * keep_free);
+            if (params->margins) reserve += (int64_t)params->margins[i]; // indexed by backend device order
+            int64_t budget = free - kernels - reserve;
+
+            budgets[gi] = budget > 0 ? (uint64_t)budget : 0;  // negative = overcommitted GPU
+            names.push_back(ggml_backend_dev_name(dev));
+            total_budget  += budget;
+            total_weights += (int64_t)d_weights[gi];
+            ssm_per_row_total += d_ssm_bpr[gi];
+            cell_size_total   += d_kv_bpc[gi] + d_mtp_bpc[gi];
+
+            LLAMA_LOG_PLANNING("        %s: budget = free(%lld) - kernels(%lld) - "
+                               "reserve(total(%lld) x keep_free(%.2f)%s) = %lld\n",
+                               names.back().c_str(),
+                               (long long)free, (long long)kernels, (long long)total, keep_free,
+                               (params->margins ? " + margin" : ""),
+                               (long long)budgets[gi]);
+            ++gi;
+        }
+    }
+
+    // ---- theoretical upper limit: the perfect-split ceiling ----------------------
+    const uint64_t ssm_state_total = (uint64_t)state_rows * ssm_per_row_total;
+    const int64_t upper_num = total_budget - total_weights - (int64_t)ssm_state_total;
+    LLAMA_LOG_PLANNING("\n      kv cache upper limit: (total budget(%lld) - tensors(%lld)"
+                       " - SSM state(%u x %llu)) / cell size(%llu)\n",
+                       (long long)total_budget, (long long)total_weights,
+                       (unsigned)state_rows, (unsigned long long)ssm_per_row_total,
+                       (unsigned long long)cell_size_total);
+    if (upper_num < 0 || cell_size_total == 0) {
+        LLAMA_LOG_ERROR("kvfit: even a perfect split cannot host the KV pool — "
+                        "numerator(%lld), total cell size(%llu B)\n",
+                        (long long)upper_num, (unsigned long long)cell_size_total);
+        return plan;
+    }
+    const uint64_t kv_upper = (uint64_t)upper_num / cell_size_total;
+    const uint32_t n_max = (uint32_t)(kv_upper / 256u);
+    LLAMA_LOG_PLANNING("        kv upper limit = %llu cells -> n_max = %llu / 256 = %u blocks\n",
+                       (unsigned long long)kv_upper, (unsigned long long)kv_upper, (unsigned)n_max);
+    if (n_max == 0) {
+        LLAMA_LOG_ERROR("kvfit: even the perfect split fits fewer than 256 KV cells — "
+                        "not a viable GPU deployment\n");
+        return plan;
+    }
+
+    // ---- layer costs: GGUF weights + hparams-derived KV/SSM rates ---------------
+    llama_model * model_peek = nullptr;
+    if (!kvfit_peek_hparams(path, mparams, model_peek)) {
+        LLAMA_LOG_ERROR("kvfit: cannot read model hyperparameters for the solver\n");
+        return plan;
+    }
+    auto layer_costs = kvfit_compute_layer_costs(model_peek, gguf.layer_weights,
+                                                 (ggml_type)cparams->type_k, (ggml_type)cparams->type_v,
+                                                 cparams->flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED, state_rows);
+    plan.n_layer_all = model_peek->hparams.n_layer_all;
+    llama_model_free(model_peek);
+
+    const uint64_t last_gpu_extra = (uint64_t)gguf.norm_bytes + (uint64_t)gguf.output_bytes;
+    const uint32_t n_blocks = kvfit_solve(n_max, layer_costs, budgets, names, last_gpu_extra);
+    if (n_blocks == 0) {
+        LLAMA_LOG_ERROR("kvfit: solver found no placement — even the perfect split cannot "
+                        "hold all layers on the GPUs\n");
+        return plan;
+    }
+
+    const uint32_t n_cells = n_blocks * 256u;
+    if (n_cells < params->min_pool_cells) {
+        LLAMA_LOG_WARN("kvfit: planned pool %u cells is below the viability floor "
+                       "(min_pool_cells=%u) — a tiny KV cache for this deployment\n",
+                       (unsigned)n_cells, (unsigned)params->min_pool_cells);
+    }
+
+    // ---- winning layout: re-run the greedy walk at n_blocks ---------------------
+    // llama's loader assigns layer il to the first GPU whose CUMULATIVE split
+    // fraction exceeds il/(N+1) (llama-model.cpp get_layer_buft_list, with
+    // n_gpu_layers = -1). To make it reproduce the solver's ranges exactly,
+    // each boundary a_g (first layer on GPU g) becomes cum[g-1] = a_g / (N+1);
+    // llama normalizes splits, so tensor_split holds those cumulative values
+    // directly. The output pseudo-layer N lands on the last GPU with any share.
+    const uint32_t N = plan.n_layer_all;
+    std::vector<int> first_layer(budgets.size(), 0);
+    {
+        size_t il = 0;
+        for (size_t g = 0; g < budgets.size() && il < layer_costs.size(); ++g) {
+            first_layer[g] = (int)il;
+            if (g + 1 == budgets.size()) break;   // last GPU takes everything remaining
+            uint64_t used = 0;
+            while (il < layer_costs.size()) {
+                const uint64_t cost = layer_costs[il].weights
+                    + (uint64_t)n_blocks * 256u * (layer_costs[il].kv_bpc + layer_costs[il].mtp_kv_bpc)
+                    + layer_costs[il].ssm_state;
+                if (used + cost > budgets[g]) break;   // hand over at il
+                used += cost;
+                ++il;
+            }
+        }
+    }
+
+    plan.ok          = true;
+    plan.n_cells     = n_cells;
+    plan.first_layer = std::move(first_layer);
+    plan.names       = names;
+
+    LLAMA_LOG_PLANNING("\n      ==> plan: pool %u cells, placement:\n", (unsigned)n_cells);
+    for (size_t g = 0; g < plan.first_layer.size(); ++g) {
+        const int a = plan.first_layer[g];
+        const int b = (g + 1 < plan.first_layer.size()) ? plan.first_layer[g + 1] : (int)N;
+        LLAMA_LOG_PLANNING("        %s: layers %d..%d%s\n", plan.names[g].c_str(), a, b - 1,
+                           (a >= b) ? " (empty)" : "");
+    }
+    return plan;
+}
 
 
-// See llama-ext.h.
+// ============================================================================
+// Public API
+// ============================================================================
+// Measurement + plan are expensive (a real load plus warmup decode); both
+// entry points need the same result, so the last computation is cached and
+// reused when the inputs match: same model path plus the same params object
+// addresses (fllama passes identical structs to both calls). Any change ->
+// a fresh measurement; stale results are never served.
+
+namespace {
+
+struct kvfit_cache_entry {
+    bool valid = false;
+    char path[1024] = "";
+    const void * mp  = nullptr;   // mparams address
+    const void * cp  = nullptr;   // cparams address
+    const void * pp  = nullptr;   // planning params address
+    kvfit_plan plan;
+};
+
+kvfit_cache_entry g_kvfit_cache;
+std::mutex g_kvfit_cache_mu;
+
+} // anonymous namespace
+
+static bool kvfit_cache_match(const char * path, const void * mp, const void * cp, const void * pp) {
+    return g_kvfit_cache.valid
+        && strcmp(g_kvfit_cache.path, path) == 0
+        && g_kvfit_cache.mp == mp
+        && g_kvfit_cache.cp == cp
+        && g_kvfit_cache.pp == pp;
+}
+
+static kvfit_plan kvfit_get_plan(const char * path,
+                                 const llama_model_params * mparams,
+                                 const llama_context_params * cparams,
+                                 const llama_kv_fit_params * params) {
+    std::lock_guard<std::mutex> lock(g_kvfit_cache_mu);
+    if (!kvfit_cache_match(path, mparams, cparams, params)) {
+        LLAMA_LOG_PLANNING("kvfit: new plan computation for %s\n", path);
+        g_kvfit_cache = kvfit_cache_entry{};
+        strncpy(g_kvfit_cache.path, path, sizeof(g_kvfit_cache.path) - 1);
+        g_kvfit_cache.mp = mparams;
+        g_kvfit_cache.cp = cparams;
+        g_kvfit_cache.pp = params;
+        g_kvfit_cache.plan = kvfit_plan_compute(path, mparams, cparams, params);
+        g_kvfit_cache.valid = true;
+    } else {
+        LLAMA_LOG_PLANNING("kvfit: reusing computed plan for %s\n", path);
+    }
+    return g_kvfit_cache.plan;   // copied out under the lock
+}
+
 LLAMA_API bool llama_kv_fit_auto_split(
         const char * path_model,
         llama_model_params * mparams,
         llama_context_params * cparams,
-        float * tensor_split) {
-
-    llama_kv_fit_warmup_devices();
-
-    // Step 1: Get initial device memory data to find out how many devices we have
-    std::vector<ggml_backend_dev_t> devs;
-    uint32_t hp_ngl = 0, hp_nct = 0, hp_nex = 0;
-    try {
-        llama_kv_fit_probe(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex);
-    } catch (const std::runtime_error & e) {
-        LLAMA_LOG_ERROR("%s: probing failed: %s\n", __func__, e.what());
+        int32_t * layer_bounds,
+        const struct llama_kv_fit_params * params) {
+    kvfit_plan plan = kvfit_get_plan(path_model, mparams, cparams, params);
+    if (!plan.ok || layer_bounds == nullptr) {
+        LLAMA_LOG_ERROR("kvfit: auto split failed or no layer_bounds buffer — "
+                        "the caller must not load this model as-is\n");
         return false;
     }
 
-    const size_t nd = devs.size();
-    if (nd == 0 || nd > llama_max_devices()) {
-        LLAMA_LOG_WARN("%s: no GPU devices found or too many devices (%zu), aborting auto split\n", __func__, nd);
-        return false;
+    // the plan's ranges ARE the loader's boundaries — write them verbatim
+    for (size_t g = 0; g < plan.first_layer.size(); ++g) {
+        layer_bounds[g] = plan.first_layer[g];
     }
 
-    // For N=1, there's no split to optimize. Return success with the single device getting everything.
-    if (nd == 1) {
-        tensor_split[0] = 1.0f;
-        mparams->n_gpu_layers = static_cast<int32_t>(hp_ngl);
-        fprintf(stderr, "[KV-FIT-DBG] ==> conclusion: single GPU, no split needed\n");
-        return true;
-    }
+    mparams->n_gpu_layers       = -1;   // all layers on GPUs (loader's standard idiom)
+    mparams->tensor_layer_bounds = layer_bounds;
+    mparams->tensor_split       = nullptr;   // the boundaries supersede ratio logic
 
-    auto run_probe_pair = [&](float * split, const char * phase) -> std::pair<std::vector<llama_device_memory_data>, std::vector<llama_device_memory_data>> {
-        // Set the split for this probe
-        mparams->tensor_split = split;
-
-        fprintf(stderr, "[KV-FIT-DBG] %s - probing tensor_split [", phase);
-        for (size_t i = 0; i < nd; i++) {
-            fprintf(stderr, "%s", i > 0 ? ", " : "");
-            fprintf(stderr, "%.4f", split[i]);
-        }
-        fprintf(stderr, "]\n");
-
-        // Low pool probe (256 cells)
-        llama_context_params cp_low  = *cparams;
-        cp_low.n_kv_cache  = 256;
-        std::vector<ggml_backend_dev_t> devs_lo;
-        uint32_t ngl_lo = 0, nct_lo = 0, nex_lo = 0;
-        std::vector<llama_device_memory_data> dmds_lo;
-        try {
-            dmds_lo = llama_kv_fit_probe(path_model, mparams, &cp_low, devs_lo, ngl_lo, nct_lo, nex_lo);
-        } catch (const std::runtime_error & e) {
-            LLAMA_LOG_WARN("%s: low pool probe failed: %s\n", __func__, e.what());
-            return {{}, {}};
-        }
-
-        // High pool probe (512 cells)
-        llama_context_params cp_hi  = *cparams;
-        cp_hi.n_kv_cache  = 512;
-        std::vector<ggml_backend_dev_t> devs_hi;
-        uint32_t ngl_hi = 0, nct_hi = 0, nex_hi = 0;
-        std::vector<llama_device_memory_data> dmds_hi;
-        try {
-            dmds_hi = llama_kv_fit_probe(path_model, mparams, &cp_hi, devs_hi, ngl_hi, nct_hi, nex_hi);
-        } catch (const std::runtime_error & e) {
-            LLAMA_LOG_WARN("%s: high pool probe failed: %s\n", __func__, e.what());
-            return {{}, {}};
-        }
-
-        // Log the per-device measurements so the decisions are auditable.
-        for (size_t i = 0; i < nd && i + 1 < dmds_lo.size(); i++) {
-            const auto & lo = dmds_lo[i].mb;
-            const auto & hi = dmds_hi[i].mb;
-            // measured (raw) parameters
-            const long long model   = (long long)lo.model;
-            const long long compute = (long long)lo.compute;
-            const long long ctx256  = (long long)lo.context;
-            const long long ctx512  = (long long)hi.context;
-            // derived parameters
-            const double rate  = (ctx512 - ctx256) / 256.0;                 // B per KV cell
-            const double fixed = ctx256 - rate * 256.0;                      // context bytes independent of pool size
-
-            fprintf(stderr, "[KV-FIT-DBG] %s dev%zu -- measured:\n", phase, i);
-            fprintf(stderr, "[KV-FIT-DBG]   model      = %lld B\n",  model);
-            fprintf(stderr, "[KV-FIT-DBG]   compute    = %lld B\n",  compute);
-            fprintf(stderr, "[KV-FIT-DBG]   ctx@256    = %lld B\n",  ctx256);
-            fprintf(stderr, "[KV-FIT-DBG]   ctx@512    = %lld B\n",  ctx512);
-            fprintf(stderr, "[KV-FIT-DBG] %s dev%zu -- derived:\n", phase, i);
-            fprintf(stderr, "[KV-FIT-DBG]   rate       = (ctx@512 - ctx@256) / (512-256) = (%lld-%lld)/256 = %.0f B/cell\n",
-                    ctx512, ctx256, rate);
-            fprintf(stderr, "[KV-FIT-DBG]   fixed      = ctx@256 - rate*256 = %lld - %.0f*256 = %.0f B\n",
-                    ctx256, rate, fixed);
-        }
-
-        return {std::move(dmds_lo), std::move(dmds_hi)};
-    };
-
-    // Phase A: distribute by relative FREE-VRAM share — the bigger card takes the
-    // bigger share of the tensors. No model fitting, nothing to extrapolate wrong.
-    {
-        double sum_free = 0.0;
-        std::vector<double> free_nd(nd);
-        std::vector<double> total_nd(nd);
-        for (size_t g = 0; g < nd; g++) {
-            size_t free, total;
-            ggml_backend_dev_memory(devs[g], &free, &total);
-            free_nd[g]  = static_cast<double>(free);
-            total_nd[g] = static_cast<double>(total);
-            sum_free   += free_nd[g];
-        }
-        if (sum_free <= 0.0) {
-            LLAMA_LOG_WARN("%s: total free VRAM is zero; aborting auto split\n", __func__);
-            return false;
-        }
-
-        fprintf(stderr, "[KV-FIT-DBG] PhaseA -- measured (free/total per device):\n");
-        for (size_t g = 0; g < nd; g++) {
-            fprintf(stderr, "[KV-FIT-DBG]   dev%zu: free=%.0f B total=%.0f B\n",
-                    g, free_nd[g], total_nd[g]);
-        }
-
-        for (size_t g = 0; g < nd; g++) {
-            tensor_split[g] = static_cast<float>(free_nd[g] / sum_free);
-        }
-        fprintf(stderr, "[KV-FIT-DBG] PhaseA -- derived: split[dev] = free[dev] / sum(free)\n");
-        for (size_t g = 0; g < nd; g++) {
-            fprintf(stderr, "[KV-FIT-DBG]   dev%zu: %.0f / %.0f = %.4f (%.1f%%)\n",
-                    g, free_nd[g], sum_free, tensor_split[g], 100.0 * tensor_split[g]);
-        }
-    }
-
-    // Set mparams to use all layers on GPU with the split.
-    mparams->n_gpu_layers = static_cast<int32_t>(hp_ngl);
-    if (nd > 1) {
-        mparams->tensor_split = tensor_split;
-    }
-    fprintf(stderr, "[KV-FIT-DBG] set n_gpu_layers=%u tensor_split for %zu devices\n", hp_ngl, nd);
-
-    // Phase B: measure the pool this split actually yields. Uses the same 256/512
-    // probe + affine solve as llama_kv_fit_max_pool() so what is logged is what
-    // fllama will get; rocky2 verification greps one line. No prediction to compare —
-    // the free-VRAM split is decided on physics, this just confirms the measured pool.
-    {
-        const double vram_fraction = 0.95; // conservative margin
-        auto [lo_ver, hi_ver] = run_probe_pair(tensor_split, "Phase B");
-
-        if (!lo_ver.empty() && !hi_ver.empty()) {
-            // runtime (lazy) overhead is not passed here: it is measured later, inside
-            // llama_kv_fit_max_pool(), which produces the binding pool decision. Phase D
-            // stays slightly optimistic on purpose - it checks split consistency, not the
-            // final budget.
-            const uint32_t n_ver = llama_kv_fit_max_pool_solve(
-                    lo_ver, hi_ver, 256, 512, nullptr, nullptr, 0, vram_fraction);
-            fprintf(stderr, "[KV-FIT-DBG] ==> conclusion: free-VRAM split gives measured pool %u cells\n", n_ver);
-        } else {
-            LLAMA_LOG_WARN("%s: Phase B verification probes failed\n", __func__);
-        }
-    }
-
+    LLAMA_LOG_PLANNING("kvfit: applied placement to mparams (pool %u cells) — "
+                       "reuse these params unchanged for the real load\n",
+                       (unsigned)plan.n_cells);
     return true;
+}
+
+LLAMA_API int32_t llama_kv_fit_max_pool(
+        const char * path_model,
+        llama_model_params * mparams,
+        llama_context_params * cparams,
+        const struct llama_kv_fit_params * params) {
+    kvfit_plan plan = kvfit_get_plan(path_model, mparams, cparams, params);
+    if (!plan.ok) {
+        return 0;   // failure already reported by the plan computation
+    }
+    return (int32_t)plan.n_cells;   // 256-aligned; below min_pool_cells is warned above
 }

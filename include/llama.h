@@ -354,6 +354,14 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+
+        // [FORK] Explicit per-device layer placement from a KV-fit plan (the
+        // gpu-split algorithm): tensor_layer_bounds[i] is the index of the
+        // first layer device i receives (non-decreasing, covers all layers).
+        // The loader applies this placement VERBATIM instead of its ratio-
+        // based tensor_split logic. Size at least llama_max_devices(); must
+        // be used with n_gpu_layers = -1. NULL = standard behavior.
+        const int32_t * tensor_layer_bounds;
     };
 
     struct llama_sampler_seq_config {

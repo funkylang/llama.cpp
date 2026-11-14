@@ -657,6 +657,8 @@ extern "C" {
         GGML_LOG_LEVEL_WARN  = 3,
         GGML_LOG_LEVEL_ERROR = 4,
         GGML_LOG_LEVEL_CONT  = 5, // continue previous log
+        // [FORK] planning/KV-fit traces; consumer-side filtering like all levels
+        GGML_LOG_LEVEL_PLANNING = 6,
     };
 
     // this tensor...
