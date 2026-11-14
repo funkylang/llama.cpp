@@ -108,7 +108,7 @@ int main(int argc, char ** argv) {
 
     struct llama_context_params cparams = llama_context_default_params();
     cparams.kv_unified = true;  // the deployment model
-    cparams.n_ctx      = 0;     // the solved pool becomes the context (filled below)
+    cparams.n_ctx      = 0;     // natural context (library default) — the pool extends the cache, never the context
     cparams.n_batch    = 2048;
     cparams.n_ubatch   = ubatch_size;
     cparams.type_k     = type_k;
@@ -151,7 +151,6 @@ int main(int argc, char ** argv) {
                 n_cells, params->min_pool_cells);
         return 1;
     }
-    cparams.n_ctx = (uint32_t)n_cells;
 
     // ---- 4: load with the plan and verify the placement -----------------------
     struct llama_model * model = llama_model_load_from_file(g_path, mparams);
