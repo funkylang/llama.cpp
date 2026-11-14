@@ -186,6 +186,17 @@ int main(int argc, char ** argv) {
     }
     fprintf(stderr, "  all layers on their planned devices\n");
 
+    // free VRAM after the final placement: headroom left for KV pools + compute
+    // buffers when the deployment actually runs (raw bytes, nothing subtracted)
+    fprintf(stderr, "\nfree VRAM after planned load:\n");
+    for (int i = 0; i < ndev; ++i) {
+        ggml_backend_dev_t dev = llama_model_get_device(model, i);
+        size_t free_mem = 0, total_mem = 0;
+        ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+        fprintf(stderr, "  %d    %-12s total=%zu     free=%zu\n", i,
+                ggml_backend_dev_name(dev), total_mem, free_mem);
+    }
+
     // ---- 5: the real proof — context at the planned pool -----------------------
     fprintf(stderr, "\n== context init at n_kv_cache = %d cells ==\n", n_cells);
     cparams.n_kv_cache = (uint32_t)n_cells;
