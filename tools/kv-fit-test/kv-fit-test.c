@@ -6,9 +6,11 @@
 //   3. llama_kv_fit_max_pool()      — pool size (reuses step 2's measurement)
 //   4. real model load with the planned params; per-layer placement verified
 //      against the plan (proves the loader applies the boundaries verbatim)
-//   5. unified context at the planned pool — proves the plan fits on VRAM
+//   5. unified context at the planned pool — proves the plan fits on VRAM;
+//      plus the MTP draft context when the model has a nextn block (fllama shape)
 //   6. Shakespeare warmup decode on that context — forces every lazy
-//      allocation a decode pays (init alone can pass while decoding OOMs)
+//      allocation a decode pays (init alone can pass while decoding OOMs),
+//      including one single-token MTP draft decode when measured in planning
 //
 // Planning traces flow through the standard log callback at the PLANNING level.
 // Run next to tools/gpu-split with the same options on the same machine: the
@@ -283,10 +285,28 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // The MTP draft context when the deployment has one (fllama + planner shape):
+    // same model weights, own nextn KV pool at the full planned size.
+    struct llama_context * ctx_mtp = NULL;
+    if (llama_model_n_layer_nextn(model) > 0) {
+        fprintf(stderr, "\n== MTP draft context init at n_kv_cache = %d cells ==\n", n_cells);
+        struct llama_context_params cp_mtp = cparams;
+        cp_mtp.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+        cp_mtp.n_rs_seq  = 0;
+        cp_mtp.ctx_other = ctx;
+        ctx_mtp = llama_init_from_model(model, cp_mtp);
+        if (!ctx_mtp) {
+            fprintf(stderr, "error: MTP context init at the planned pool failed — plan over-committed VRAM\n");
+            return 1;
+        }
+    }
+
     // headroom AFTER the full deployment exists: pool + compute buffers in place
     print_free_vram(model, ndev, "free VRAM after context init at the planned pool");
 
     // ---- 6: run Shakespeare — force every lazy allocation a decode pays -------
+    // exactly what planning measured: main prefill + generate steps, and (with
+    // MTP) one single-token draft decode to upload every kernel an MTP run launches
     fprintf(stderr, "\n== warmup decode (same Hamlet excerpt as planning) ==\n");
     {
         int32_t * p_tokens = malloc((strlen(WARMUP_TEXT) + 8) * sizeof(int32_t));
@@ -298,14 +318,40 @@ int main(int argc, char ** argv) {
             return 1;
         }
         const int rc = warmup_decode(ctx, p_tokens, n_tok);
-        free(p_tokens);
         if (rc < 0) {
+            free(p_tokens);
             fprintf(stderr, "error: warmup decode at the planned pool failed — lazy allocations over-committed VRAM\n");
             return 1;
         }
+        if (ctx_mtp) {
+            int seq_id = 0;   // non-const: batch.seq_id must point to a stable llama_seq_id
+            llama_batch mb;
+            mb.n_tokens = 1;
+            mb.token    = malloc(sizeof(llama_token));
+            mb.embd     = NULL;
+            mb.pos      = malloc(sizeof(llama_pos));
+            mb.n_seq_id = malloc(sizeof(int32_t));
+            mb.seq_id   = malloc(sizeof(llama_seq_id *));
+            mb.logits   = malloc(1);
+            mb.token[0]    = p_tokens[n_tok - 1];
+            mb.pos[0]      = n_tok;
+            mb.n_seq_id[0] = 1;
+            mb.seq_id[0]   = &seq_id;
+            mb.logits[0]   = 1;
+
+            const int rc_mtp = llama_decode(ctx_mtp, mb);
+            free(mb.token); free(mb.pos); free(mb.n_seq_id); free(mb.seq_id); free(mb.logits);
+            if (rc_mtp != 0) {
+                free(p_tokens);
+                fprintf(stderr, "error: MTP draft decode failed — lazy allocations over-committed VRAM\n");
+                return 1;
+            }
+        }
+        free(p_tokens);
         print_free_vram(model, ndev, "free VRAM after warmup decode");
     }
 
+    llama_free(ctx_mtp);
     llama_free(ctx);
     llama_model_free(model);
     llama_kv_fit_params_free(params);
