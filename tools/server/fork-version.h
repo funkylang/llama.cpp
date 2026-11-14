@@ -4,4 +4,4 @@
 // updated on every fork commit with the ACTUAL current time at update (strict ordering);
 // printed as the first startup message of llama-server so the running build can be identified
 
-static const char * FORK_VERSION = "2026-11-14 18:05:14 kv-fit: model summary header; gpu-split log refinements";
+static const char * FORK_VERSION = "2026-11-14 19:14:07 kv-fit: GPU-tool guards, no CPU rows, trimmed loading line; 14-wide size fields both tools";

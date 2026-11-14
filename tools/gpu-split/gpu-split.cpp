@@ -445,12 +445,12 @@ static bool try_place_kv_pool(uint32_t n_blocks,
 
 // per-device value row for the solver header:
 //   "budget:" / "reserve:" labels aligned, "%s = <value>" per device,
-//   comma-separated, values right-aligned (15 wide: 14-digit numbers keep their space)
+//   comma+space separated, values right-aligned (14 wide: up to 99 TB)
 static void print_row(const char * label, const std::vector<uint64_t> & vals,
                       const std::vector<std::string> & names) {
     fprintf(stderr, "    %-8s", label);
     for (size_t g = 0; g < vals.size(); ++g) {
-        fprintf(stderr, "%s%s = %15llu", g ? "," : " ", names[g].c_str(),
+        fprintf(stderr, "%s%s = %14llu", g ? ", " : " ", names[g].c_str(),
                 (unsigned long long)vals[g]);
     }
     fprintf(stderr, "\n");
@@ -820,7 +820,7 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
                         " budget = free - kernels - reserve;\n", keep_free);
         fprintf(stderr, "                         (solver input = budget: it charges"
                         " tensors + swa/ssm + cache per placed layer)\n\n");
-        fprintf(stderr, "    %-4s %-6s %15s %15s %15s %15s %15s  %s\n",
+        fprintf(stderr, "    %-4s %-6s %14s %14s %14s %14s %14s  %s\n",
                 "idx", "type", "total", "free", "kernels", "reserve",
                 "budget", "name");
         int64_t total_budget = 0;   // sums across GPUs for the upper-limit formula
@@ -841,7 +841,7 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
             gpu_budgets.push_back(budget > 0 ? (uint64_t)budget : 0);
             gpu_reserves.push_back((uint64_t)reserve);
             gpu_names.push_back(r.name);
-            fprintf(stderr, "    %-4zu %-6s %15lld %15lld %15lld %15lld %15lld  %s\n",
+            fprintf(stderr, "    %-4zu %-6s %14lld %14lld %14lld %14lld %14lld  %s\n",
                     r.idx, r.type_str,
                     (long long)total, (long long)free, (long long)kernels,
                     (long long)reserve, (long long)budget, r.name);
@@ -863,18 +863,21 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
             ssm_state_per_row += r.ssm_bpr;
         }
         const uint64_t ssm_state_total = (uint64_t)state_rows * ssm_state_per_row;
-        fprintf(stderr, "    %-76s%15lld\n",
+        fprintf(stderr, "    %-76s%14lld\n",
                 "total budget:", (long long)total_budget);
-        fprintf(stderr, "    %-76s%15llu\n",
+        fprintf(stderr, "    %-76s%14llu\n",
                 "total tensors + mtp:", (unsigned long long)total_weights);
-        // chained: rows × bytes/row = total (the upper limit subtracts the total)
+        // chained: rows × bytes/row = total (the upper limit subtracts the total).
+        // factors print adjacent to the '×' (no spaces); the result field is the
+        // same 14-wide right-aligned column as every value above, so all final
+        // values end on one column.
         if (ssm_state_per_row > 0) {
-            fprintf(stderr, "    %-76s%9llu × %15llu = %15llu\n",
+            fprintf(stderr, "    %-44s%14llu×%14llu = %14llu\n",
                     "swa/ssm state:", (unsigned long long)state_rows,
                     (unsigned long long)ssm_state_per_row,
                     (unsigned long long)ssm_state_total);
         } else {
-            fprintf(stderr, "    %-76s%15llu\n",
+            fprintf(stderr, "    %-76s%14llu\n",
                     "swa/ssm state:", 0ULL);
         }
 
@@ -884,17 +887,17 @@ static void print_device_scan(const std::vector<dev_snapshot> & raw,
             if (!raw[r.idx].ok || raw[r.idx].total_bytes == 0) continue;
             cell_size_per_token += r.kv_bpc + r.mtp_bpc;
         }
-        fprintf(stderr, "    %-76s%15llu\n",
+        fprintf(stderr, "    %-76s%14llu\n",
                 "total cell size:", (unsigned long long)cell_size_per_token);
 
         const int64_t upper_num = total_budget - (int64_t)total_weights
                                 - (int64_t)ssm_state_total;
         if (upper_num < 0) {
-            fprintf(stderr, "    %-76s%-15s\n",
+            fprintf(stderr, "    %-76s%-14s\n",
                     "kv cache upper limit:", "negative numerator — no room");
         } else if (cell_size_per_token > 0) {
             const uint64_t kv_upper = (uint64_t)upper_num / cell_size_per_token;
-            fprintf(stderr, "    %-76s%15llu tokens\n",
+            fprintf(stderr, "    %-76s%14llu tokens\n",
                     "kv cache upper limit:", (unsigned long long)kv_upper);
 
             // ---- kv pool solver ----------------------------------------------

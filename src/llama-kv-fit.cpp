@@ -372,10 +372,13 @@ static uint32_t kvfit_solve(uint32_t n_max,
         return 0;
     }
     {
+        // same layout as gpu-split's solver header: "%s = <value>" per device,
+        // comma+space separated, 14-wide right-aligned values (up to 99 TB)
         std::string blines = "          budgets:";
         for (size_t g = 0; g < budgets.size(); ++g) {
             char b[64];
-            snprintf(b, sizeof b, " %s = %llu", names[g].c_str(), (unsigned long long)budgets[g]);
+            snprintf(b, sizeof b, "%s%s = %14llu",
+                     (g ? ", " : " "), names[g].c_str(), (unsigned long long)budgets[g]);
             blines += b;
         }
         LLAMA_LOG_PLANNING("%s\n", blines.c_str());
@@ -568,7 +571,6 @@ static int kvfit_warmup_decode(llama_context * ctx, const std::vector<int32_t> &
 
 struct kvfit_measure_result {
     bool ok = false;
-    std::vector<kvfit_dev_snapshot> scan_raw;      // free VRAM, nothing loaded
     std::vector<kvfit_dev_snapshot> scan_measure;  // after load + warmup (+ MTP)
     std::vector<kvfit_dev_usage> usage;            // readback: weights/layers per device
     std::vector<kvfit_rate_info> rates;             // KV/SSM/MTP rates per device
@@ -581,19 +583,8 @@ static bool kvfit_measure(const char * path,
                           const llama_context_params * cparams,
                           bool measure_mtp,
                           kvfit_measure_result & r) {
-    // ---- device scan: raw VRAM, nothing loaded yet --------------------------
-    kvfit_read_all_devices(r.scan_raw);
-
-    LLAMA_LOG_PLANNING("\n      device scan (raw, nothing loaded):\n");
-    for (size_t i = 0; i < r.scan_raw.size(); ++i) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (!dev || !r.scan_raw[i].ok) continue;
-        LLAMA_LOG_PLANNING("        %-4zu %-6s total=%-15llu free=%-15llu %s\n",
-                           i, kvfit_dev_type_str(ggml_backend_dev_type(dev)),
-                           (unsigned long long)r.scan_raw[i].total_bytes,
-                           (unsigned long long)r.scan_raw[i].free_bytes,
-                           ggml_backend_dev_name(dev));
-    }
+    // raw-device scan is the caller's job (Guard 2 + budget denominators); it
+    // prints once and its snapshot feeds the delta decomposition below.
 
     // REAL model load: the caller's params define how production loads (mmap
     // etc.); override placement so llama_model's native auto-split-by-free-VRAM
@@ -604,7 +595,7 @@ static bool kvfit_measure(const char * path,
     mp.tensor_layer_bounds = nullptr; // provisional load: never a planned placement
     mp.load_mtp      = measure_mtp;
 
-    LLAMA_LOG_PLANNING("      loading: %s (all layers GPU, auto-split by free VRAM, load_mtp=%d)\n",
+    LLAMA_LOG_PLANNING("\n      loading: %s (auto-split by free VRAM, load_mtp=%d)\n",
                        path, (int)mp.load_mtp);
     const auto t_load0 = std::chrono::steady_clock::now();
     llama_model * model = llama_model_load_from_file(path, mp);
@@ -862,12 +853,13 @@ static kvfit_plan kvfit_plan_compute(const char * path,
     // device scan with nothing loaded: Guard 2 and the budget denominators
     std::vector<kvfit_dev_snapshot> scan_raw;
     kvfit_read_all_devices(scan_raw);
+    // This is a GPU planning tool — CPU devices are never shown or planned.
     LLAMA_LOG_PLANNING("\n      device scan (raw, nothing loaded):\n");
     for (size_t i = 0; i < scan_raw.size(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (!dev || !scan_raw[i].ok) continue;
         const auto t = ggml_backend_dev_type(dev);
-        if (t == GGML_BACKEND_DEVICE_TYPE_CPU) continue;   // hidden while GPUs are present
+        if (t == GGML_BACKEND_DEVICE_TYPE_CPU) continue;   // GPU tool: never show CPU
         LLAMA_LOG_PLANNING("        %-4zu %-6s total=%-15llu free=%-15llu %s\n",
                            i, kvfit_dev_type_str(t),
                            (unsigned long long)scan_raw[i].total_bytes,
@@ -886,6 +878,13 @@ static kvfit_plan kvfit_plan_compute(const char * path,
         gpu_free_total += scan_raw[i].free_bytes;
         ++gpu_count;
     }
+
+    // Guard 1: no GPUs — this tool plans GPU deployments, there is nothing to do.
+    if (gpu_count == 0) {
+        LLAMA_LOG_ERROR("kvfit: no GPU devices found — kv-fit requires at least one GPU\n");
+        return plan;
+    }
+
     if ((uint64_t)gguf.model_bytes > gpu_free_total) {
         LLAMA_LOG_ERROR("kvfit: model too large — weights (%llu B) exceed total free GPU "
                         "VRAM (%llu B on %zu GPUs)\n",
@@ -1019,7 +1018,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
     }
     const uint64_t kv_upper = (uint64_t)upper_num / cell_size_total;
     const uint32_t n_max = (uint32_t)(kv_upper / 256u);
-    LLAMA_LOG_PLANNING("        kv upper limit = %llu cells -> n_max = %llu / 256 = %u blocks\n",
+    LLAMA_LOG_PLANNING("        kv upper limit = %llu cells -> n_max = %7llu / 256 = %3u blocks\n",
                        (unsigned long long)kv_upper, (unsigned long long)kv_upper, (unsigned)n_max);
     if (n_max == 0) {
         LLAMA_LOG_ERROR("kvfit: even the perfect split fits fewer than 256 KV cells — "
