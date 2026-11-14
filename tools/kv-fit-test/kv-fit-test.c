@@ -22,6 +22,20 @@
 
 static const char * g_path = NULL;
 
+// Device memory snapshot at one stage of the test — raw bytes, nothing
+// subtracted. Printed before the context (weights only) AND after it, so the
+// planned pool's actual landing in VRAM is visible instead of assumed.
+static void print_free_vram(const struct llama_model * model, int ndev, const char * header) {
+    fprintf(stderr, "\n%s:\n", header);
+    for (int i = 0; i < ndev; ++i) {
+        ggml_backend_dev_t dev = llama_model_get_device(model, i);
+        size_t free_mem = 0, total_mem = 0;
+        ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+        fprintf(stderr, "  %d    %-12s total=%zu     free=%zu\n", i,
+                ggml_backend_dev_name(dev), total_mem, free_mem);
+    }
+}
+
 // planning traces + warnings + errors are shown; everything else stays quiet
 static void log_callback(enum ggml_log_level level, const char * text, void * user_data) {
     (void)user_data;
@@ -186,16 +200,8 @@ int main(int argc, char ** argv) {
     }
     fprintf(stderr, "  all layers on their planned devices\n");
 
-    // free VRAM after the final placement: headroom left for KV pools + compute
-    // buffers when the deployment actually runs (raw bytes, nothing subtracted)
-    fprintf(stderr, "\nfree VRAM after planned load:\n");
-    for (int i = 0; i < ndev; ++i) {
-        ggml_backend_dev_t dev = llama_model_get_device(model, i);
-        size_t free_mem = 0, total_mem = 0;
-        ggml_backend_dev_memory(dev, &free_mem, &total_mem);
-        fprintf(stderr, "  %d    %-12s total=%zu     free=%zu\n", i,
-                ggml_backend_dev_name(dev), total_mem, free_mem);
-    }
+    // ---- 4b: where the pool will come from --------------------------------------
+    print_free_vram(model, ndev, "free VRAM after planned load (weights only)");
 
     // ---- 5: the real proof — context at the planned pool -----------------------
     fprintf(stderr, "\n== context init at n_kv_cache = %d cells ==\n", n_cells);
@@ -205,6 +211,10 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "error: context init at the planned pool failed — plan over-committed VRAM\n");
         return 1;
     }
+
+    // headroom AFTER the full deployment exists: pool + compute buffers in place
+    print_free_vram(model, ndev, "free VRAM after context init at the planned pool");
+
     llama_free(ctx);
     llama_model_free(model);
     llama_kv_fit_params_free(params);
