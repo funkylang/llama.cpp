@@ -54,6 +54,7 @@ LLAMA_API struct llama_kv_fit_params * llama_kv_fit_params_new(uint32_t min_vers
     p->margins        = nullptr;
     p->extra          = nullptr;
     p->min_pool_cells = 32768;  // report deployments that cannot plan at least this many cells
+    p->n_checkpoints  = 0;      // legacy: derive from context params when not set
     return p;
 }
 
@@ -902,10 +903,15 @@ static kvfit_plan kvfit_plan_compute(const char * path,
     const uint32_t n_ctx_measure = meas.n_ctx_measure;
 
     // deployment shape for the SSM state: rows per recurrent layer the
-    // production contexts will allocate (n_seq_max x (live row + rollback rows))
+    // production contexts will allocate (n_seq_max x (live row + rollback rows)).
+    // The application alone knows its checkpoint policy, so it passes the final
+    // count via params->n_checkpoints; the planner uses it verbatim. 0 = legacy
+    // fallback: derive from the context params (n_seq_max * (1 + n_rs_seq)).
     const uint32_t n_seq_max  = (cparams->n_seq_max > 0) ? (uint32_t)cparams->n_seq_max : 1;
     const uint32_t n_rs_seq   = (cparams->n_rs_seq  > 0) ? (uint32_t)cparams->n_rs_seq  : 0;
-    const uint32_t state_rows = n_seq_max * (1u + n_rs_seq);
+    const uint32_t state_rows = (params->n_checkpoints > 0)
+                              ? params->n_checkpoints
+                              : n_seq_max * (1u + n_rs_seq);
 
     // ---- per-device decomposition of the measured delta -------------------------
     LLAMA_LOG_PLANNING("\n      overhead decomposition: "

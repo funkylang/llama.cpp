@@ -125,6 +125,10 @@ int main(int argc, char ** argv) {
     // planning options — allocated by the library (stale-header safe)
     struct llama_kv_fit_params * params = llama_kv_fit_params_new(LLAMA_KV_FIT_PARAMS_VERSION);
     params->vram_fraction = 1.0 - keep_free;
+    // the app knows its own checkpoint policy: SSM rows per recurrent layer it
+    // will allocate (= n_seq_max x (live + rollback rows)). Pass it explicitly —
+    // the planner uses it verbatim rather than re-deriving from context params.
+    params->n_checkpoints = cparams.n_seq_max * (1u + cparams.n_rs_seq);
 
     int32_t layer_bounds[16];   // llama_max_devices(); auto_split fills the used entries
     memset(layer_bounds, 0, sizeof(layer_bounds));

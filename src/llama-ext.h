@@ -206,13 +206,19 @@ extern "C" {
 // the version the caller requires.
 //
 
-#define LLAMA_KV_FIT_PARAMS_VERSION 1
+#define LLAMA_KV_FIT_PARAMS_VERSION 2
 
 struct llama_kv_fit_params {
     double vram_fraction;                 // hard cap on device usage (default 0.97)
     const size_t * margins;               // per-device bytes to keep free; NULL = none
     const struct llama_kv_fit_extra * extra;   // e.g. MTP draft context; NULL = none
     uint32_t min_pool_cells;              // viability floor, reported below it (default 32768)
+    // v2: recurrent-state rows per recurrent layer the deployment allocates —
+    // the SSM "checkpoints" of gpu-split. The application alone knows its own
+    // checkpoint policy (parallelism x rollback rows), so it passes the final
+    // count; the planner uses it verbatim, never re-derives it. 0 = legacy:
+    // derive n_seq_max * (1 + n_rs_seq) from the context params.
+    uint32_t n_checkpoints;
     // FUTURE FIELDS: append here; initialize in llama_kv_fit_params_new()
 };
 
