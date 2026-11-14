@@ -324,24 +324,25 @@ int main(int argc, char ** argv) {
             return 1;
         }
         if (ctx_mtp) {
-            int seq_id = 0;   // non-const: batch.seq_id must point to a stable llama_seq_id
-            llama_batch mb;
-            mb.n_tokens = 1;
-            mb.token    = malloc(sizeof(llama_token));
-            mb.embd     = NULL;
-            mb.pos      = malloc(sizeof(llama_pos));
-            mb.n_seq_id = malloc(sizeof(int32_t));
-            mb.seq_id   = malloc(sizeof(llama_seq_id *));
-            mb.logits   = malloc(1);
-            mb.token[0]    = p_tokens[n_tok - 1];
-            mb.pos[0]      = n_tok;
-            mb.n_seq_id[0] = 1;
-            mb.seq_id[0]   = &seq_id;
-            mb.logits[0]   = 1;
+            // The nextn graph takes hidden-state embeddings as input: fllama
+            // feeds it real h_nextn rows; a zero row of the right width
+            // forces the same lazy allocations. pos 0 — the MTP KV here is
+            // its own (empty), not the mirrored production layout.
+            const int n_embd = llama_model_n_embd(model);
+            float * state = calloc((size_t)n_embd, sizeof(float));
 
-            const int rc_mtp = llama_decode(ctx_mtp, mb);
-            free(mb.token); free(mb.pos); free(mb.n_seq_id); free(mb.seq_id); free(mb.logits);
-            if (rc_mtp != 0) {
+            struct llama_batch_ext * mb = llama_batch_ext_init(ctx_mtp);
+            const int32_t idx = llama_batch_ext_add_token(mb, 0, p_tokens[n_tok - 1]);
+            const llama_pos pos = 0;
+            llama_batch_ext_set_pos(mb, idx, &pos);
+            struct llama_embd embd_state = { state, 1, (size_t)n_embd };
+            llama_batch_ext_set_embd_state(mb, idx, embd_state);
+            llama_batch_ext_set_output_logits(mb, idx, true);
+
+            const int rc_mtp = llama_process(ctx_mtp, LLAMA_PROCESS_TYPE_DECODE, mb);
+            llama_batch_ext_free(mb);
+            free(state);
+            if (rc_mtp != 0 && rc_mtp != 1) {
                 free(p_tokens);
                 fprintf(stderr, "error: MTP draft decode failed — lazy allocations over-committed VRAM\n");
                 return 1;
