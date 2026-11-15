@@ -165,7 +165,26 @@ struct kvfit_rate_info {
     uint64_t kv_bytes_per_cell = 0; int n_attn_layers = 0; // attention KV pool
     uint64_t ssm_bytes_per_row = 0; int n_ssm_layers = 0;  // recurrent state, per checkpoint row
     uint64_t mtp_kv_bytes_per_cell = 0; int n_mtp_layers = 0; // nextn KV pool (MTP draft)
+    bool main_ctx = false;   // main context runs attention on this device (trunk layers)
+    bool mtp_ctx  = false;   // MTP draft context runs on this device (nextn layers, when measured)
 };
+
+// Worst-case graph width sched_reserve builds the pp reservation with
+// (llama-context.cpp:422-424 + :832): n_batch capped by n_ctx, n_ubatch
+// min(n_batch, requested), reserve tokens = min(n_ctx, n_ubatch). The kq_mask
+// graph input is sized from this, so pool-dependent compute buffers track it.
+static uint32_t kvfit_n_tokens_reserve(const llama_context_params * cparams, uint32_t n_ctx_eff) {
+    const uint32_t n_batch  = std::min(n_ctx_eff, (cparams->n_batch > 0) ? (uint32_t)cparams->n_batch : n_ctx_eff);
+    const uint32_t n_ubatch = (cparams->n_ubatch > 0) ? (uint32_t)cparams->n_ubatch : n_batch;
+    return std::min(n_ctx_eff, std::min(n_batch, n_ubatch));
+}
+
+// Per-context mask factor: one shared kq_mask graph input per context on the
+// device, bytes per pool cell = n_tokens_reserve x element size of the mask.
+static uint64_t kvfit_mask_bpc_per_ctx(const llama_context_params * cparams, uint32_t n_ctx_eff) {
+    const bool fa = (cparams->flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED);
+    return (uint64_t)kvfit_n_tokens_reserve(cparams, n_ctx_eff) * (fa ? 2u : 4u);
+}
 
 static std::vector<kvfit_rate_info> kvfit_compute_rates(const llama_model * model,
                                                         const std::vector<kvfit_dev_usage> & usage,
@@ -187,6 +206,7 @@ static std::vector<kvfit_rate_info> kvfit_compute_rates(const llama_model * mode
                 if (!hp.is_mla()) cb += (uint64_t)ggml_row_size(type_v, ev);
                 out[i].mtp_kv_bytes_per_cell += cb;
                 ++out[i].n_mtp_layers;
+                out[i].mtp_ctx = true;   // MTP draft context computes on this device
                 continue;
             }
             if (hp.is_recr(il)) {
@@ -205,6 +225,7 @@ static std::vector<kvfit_rate_info> kvfit_compute_rates(const llama_model * mode
                 if (!hp.is_mla()) cb += (uint64_t)ggml_row_size(type_v, ev);
                 out[i].kv_bytes_per_cell += cb;
                 ++out[i].n_attn_layers;
+                out[i].main_ctx = true;   // main context computes on this device
             }
         }
     }
@@ -264,16 +285,67 @@ static std::vector<kvfit_layer_cost> kvfit_compute_layer_costs(const llama_model
     return out;
 }
 
+// Greedy walk shared by the solver, the placement check and the final layout:
+// each GPU g takes layers [first_layer[g], first_layer[g+1)) while they fit;
+// the last GPU gets everything remaining. Returns per-GPU start indices
+// (size = budgets.size() + 1 sentinel so range queries are one subtraction).
+static std::vector<size_t> kvfit_greedy_walk(uint32_t n_blocks,
+                                             const std::vector<kvfit_layer_cost> & layers,
+                                             const std::vector<uint64_t> & budgets) {
+    const uint64_t cells = (uint64_t)n_blocks * 256;
+    const size_t nl = layers.size();
+    std::vector<size_t> first(budgets.size() + 1, nl);
+
+    size_t il = 0;
+    for (size_t g = 0; g < budgets.size(); ++g) {
+        first[g] = il;
+        if (g + 1 == budgets.size()) break;   // last GPU takes everything remaining
+        uint64_t used = 0;
+        while (il < nl) {
+            const uint64_t cost = layers[il].weights + cells * (layers[il].kv_bpc
+                                                               + layers[il].mtp_kv_bpc)
+                                + layers[il].ssm_state;
+            if (used + cost > budgets[g]) break;   // hand over at il
+            used += cost;
+            ++il;
+        }
+    }
+    return first;
+}
+
+// Does GPU g's range in this walk hold any nextn layer? Range =
+// [first_layer[g], first_layer[g+1]); nextn layers have mtp_kv_bpc > 0.
+static bool kvfit_mtp_here(size_t g,
+                           const std::vector<size_t> & first_layer,
+                           const std::vector<kvfit_layer_cost> & layers) {
+    if (g >= first_layer.size() || g + 1 > first_layer.size()) return false;
+    for (size_t il = first_layer[g]; il < first_layer[g + 1]; ++il) {
+        if (il < layers.size() && layers[il].mtp_kv_bpc > 0) return true;
+    }
+    return false;
+}
+
 // Try placing n 256-cell blocks: walk layers in order — each intermediate GPU
 // takes layers greedily until the next one would exceed its budget; the LAST
 // GPU has no choice, it must take all remaining layers, so it only fits if
 // their total cost stays inside its budget. The last GPU also carries the
 // model's global tensors (norm, output — they are not per-layer).
+//
+// mask_bpc_main / mask_bpc_mtp: compute-buffer bytes per pool cell per
+// context type (the kq_mask graph input, one shared per device+context).
+// main_ctx_dev/mtp_ctx_dev mark the devices where those contexts compute
+// (from the provisional measurement placement; see the concept note on this
+// approximation). MTP-context buffers are additionally charged only to GPUs
+// that hold nextn layers in THIS candidate's placement.
 static bool kvfit_try_place(uint32_t n_blocks,
                             const std::vector<kvfit_layer_cost> & layers,
                             const std::vector<uint64_t> & budgets,
                             const std::vector<std::string> & names,
-                            uint64_t last_gpu_extra) {
+                            uint64_t last_gpu_extra,
+                            uint64_t mask_bpc_main,
+                            uint64_t mask_bpc_mtp,
+                            const std::vector<bool> & main_ctx_dev,
+                            const std::vector<bool> & mtp_ctx_dev) {
     const uint64_t cells = (uint64_t)n_blocks * 256;
     LLAMA_LOG_PLANNING("\n        testing with n = %-5u blocks (%llu cells)\n",
                        n_blocks, (unsigned long long)cells);
@@ -289,6 +361,10 @@ static bool kvfit_try_place(uint32_t n_blocks,
         p_wts[i + 1] = p_wts[i] + layers[i].weights;
         p_ssm[i + 1] = p_ssm[i] + layers[i].ssm_state;
     }
+
+    // candidate placement for this n: same greedy walk as the solver body, so
+    // the MTP mask charge can test "does GPU g hold any nextn layer here"
+    const std::vector<size_t> walk_first = kvfit_greedy_walk(n_blocks, layers, budgets);
 
     size_t il = 0;
     for (size_t g = 0; g < budgets.size() && il < nl; ++g) {
@@ -329,30 +405,43 @@ static bool kvfit_try_place(uint32_t n_blocks,
         const uint64_t ssm = has_layers ? (p_ssm[shown_last + 1] - p_ssm[first_layer]) : 0;
         const uint64_t bpc = has_layers ? (p_bpc[shown_last + 1] - p_bpc[first_layer]) : 0;
         const uint64_t cache = cells * bpc;
-        const bool fits = (used <= budgets[g]);   // always true for intermediate GPUs (greedy)
+
+        // pool-dependent compute buffers (kq_mask graph input): one shared mask
+        // per context on the device, sized by the FULL pool (not this device's
+        // share) — llama-context sched_reserve builds it at pool width.
+        const uint64_t mbpc = (g < main_ctx_dev.size() && main_ctx_dev[g]) ? mask_bpc_main : 0;
+        const bool mtp_mask = (kvfit_mtp_here(g, walk_first, layers))
+                           && (g < mtp_ctx_dev.size()) && mtp_ctx_dev[g];
+        const uint64_t buffers = cells * (mbpc + (mtp_mask ? mask_bpc_mtp : 0));
+
+        const bool fits = (used + buffers <= budgets[g]);   // always true for intermediate GPUs (greedy)
 
         LLAMA_LOG_PLANNING("          %s: layers = %s\n"
                            "            tensors   = %llu\n"
                            "            swa/ssm   = %llu\n"
-                           "            cache     = cells(%llu) × bpc(%llu) = %llu\n",
+                           "            cache     = cells(%llu) × bpc(%llu) = %llu\n"
+                           "            buffers   = cells(%llu) × bpc(%llu) = %llu\n",
                            names[g].c_str(), range.c_str(),
                            (unsigned long long)wts, (unsigned long long)ssm,
                            (unsigned long long)cells, (unsigned long long)bpc,
-                           (unsigned long long)cache);
+                           (unsigned long long)cache,
+                           (unsigned long long)cells,
+                           (unsigned long long)(buffers / cells),
+                           (unsigned long long)buffers);
         if (!is_last || fits) {
-            LLAMA_LOG_PLANNING("            used      = tensors(%llu) + swa/ssm(%llu) + cache(%llu) = %llu\n"
+            LLAMA_LOG_PLANNING("            used      = tensors(%llu) + swa/ssm(%llu) + cache(%llu) + buffers(%llu) = %llu\n"
                                "            not used  = budget(%llu) - used(%llu) = %llu\n",
                                (unsigned long long)wts, (unsigned long long)ssm,
-                               (unsigned long long)cache, (unsigned long long)used,
-                               (unsigned long long)budgets[g], (unsigned long long)used,
-                               (unsigned long long)(budgets[g] - used));
+                               (unsigned long long)cache, (unsigned long long)buffers, (unsigned long long)(used + buffers),
+                               (unsigned long long)budgets[g], (unsigned long long)(used + buffers),
+                               (unsigned long long)(budgets[g] - used - buffers));
         } else {
-            LLAMA_LOG_PLANNING("            used      = tensors(%llu) + swa/ssm(%llu) + cache(%llu) = %llu\n"
+            LLAMA_LOG_PLANNING("            used      = tensors(%llu) + swa/ssm(%llu) + cache(%llu) + buffers(%llu) = %llu\n"
                                "            over limit = used(%llu) - budget(%llu) = %llu\n",
                                (unsigned long long)wts, (unsigned long long)ssm,
-                               (unsigned long long)cache, (unsigned long long)used,
-                               (unsigned long long)used, (unsigned long long)budgets[g],
-                               (unsigned long long)(used - budgets[g]));
+                               (unsigned long long)cache, (unsigned long long)buffers, (unsigned long long)(used + buffers),
+                               (unsigned long long)(used + buffers), (unsigned long long)budgets[g],
+                               (unsigned long long)(used + buffers - budgets[g]));
         }
 
         if (is_last) return fits;
@@ -366,7 +455,11 @@ static uint32_t kvfit_solve(uint32_t n_max,
                             const std::vector<kvfit_layer_cost> & layers,
                             const std::vector<uint64_t> & budgets,
                             const std::vector<std::string> & names,
-                            uint64_t last_gpu_extra) {
+                            uint64_t last_gpu_extra,
+                            uint64_t mask_bpc_main,
+                            uint64_t mask_bpc_mtp,
+                            const std::vector<bool> & main_ctx_dev,
+                            const std::vector<bool> & mtp_ctx_dev) {
     LLAMA_LOG_PLANNING("\n        kv pool solver: bisect n of 256-cell blocks (integer arithmetic)\n");
     if (n_max == 0 || layers.empty() || budgets.empty()) {
         LLAMA_LOG_PLANNING("          n_max = 0 — nothing to solve\n");
@@ -387,7 +480,8 @@ static uint32_t kvfit_solve(uint32_t n_max,
     uint32_t low = 0, high = n_max;   // bisection over the whole range
     while (low < high) {
         const uint32_t mid = low + (high - low + 1) / 2;   // rounds UP -> monotonic progress
-        if (kvfit_try_place(mid, layers, budgets, names, last_gpu_extra)) {
+        if (kvfit_try_place(mid, layers, budgets, names, last_gpu_extra,
+                            mask_bpc_main, mask_bpc_mtp, main_ctx_dev, mtp_ctx_dev)) {
             low = mid;
         } else {
             high = mid - 1;
@@ -680,22 +774,25 @@ static bool kvfit_measure(const char * path,
         ctx_mtp = llama_init_from_model(model, cp_mtp);
         if (ctx_mtp) {
             // one single-token MTP graph run at the first position after the
-            // prompt: uploads every kernel an MTP deployment will launch
-            int seq_id = 0;
-            llama_batch mb;
-            mb.n_tokens = 1;
-            mb.token    = (llama_token *)  malloc(sizeof(llama_token));
-            mb.pos      = (llama_pos *)     malloc(sizeof(llama_pos));
-            mb.n_seq_id = (int32_t *)       malloc(sizeof(int32_t));
-            mb.seq_id   = (llama_seq_id **) malloc(sizeof(llama_seq_id *));
-            mb.logits   = (int8_t *)        malloc(1);
-            mb.token[0]    = prompt_tokens.back();
-            mb.pos[0]      = (llama_pos)prompt_tokens.size();
-            mb.n_seq_id[0] = 1;
-            mb.seq_id[0]   = &seq_id;
-            mb.logits[0]   = 1;
-            const int rc = llama_decode(ctx_mtp, mb);
-            free(mb.token); free(mb.pos); free(mb.n_seq_id); free(mb.seq_id); free(mb.logits);
+            // prompt: uploads every kernel an MTP deployment will launch.
+            // The nextn graph requires a hidden-state embedding on every
+            // ubatch entry (llama-graph.cpp llm_graph_input_embd_h::set_input):
+            // ext-batch path with a zeroed state row at model n_embd width —
+            // allocation behavior is what the measurement validates, not numerics.
+            const int32_t n_embd = llama_model_n_embd(model);
+            float * state = (float *)calloc((size_t)n_embd, sizeof(float));
+
+            struct llama_batch_ext * mb = llama_batch_ext_init(ctx_mtp);
+            const int32_t idx = llama_batch_ext_add_token(mb, 0, prompt_tokens.back());
+            const llama_pos pos = (llama_pos)prompt_tokens.size();
+            llama_batch_ext_set_pos(mb, idx, &pos);
+            struct llama_embd embd_state = { state, 1, (size_t)n_embd };
+            llama_batch_ext_set_embd_state(mb, idx, embd_state);
+            llama_batch_ext_set_output_logits(mb, idx, true);
+
+            const int rc = llama_process(ctx_mtp, LLAMA_PROCESS_TYPE_DECODE, mb);
+            llama_batch_ext_free(mb);
+            free(state);
             if (rc != 0) {
                 LLAMA_LOG_ERROR("kvfit: MTP draft decode failed (%d)\n", rc);
             } else {
@@ -1042,10 +1139,35 @@ static kvfit_plan kvfit_plan_compute(const char * path,
                                                  (ggml_type)cparams->type_k, (ggml_type)cparams->type_v,
                                                  cparams->flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED, state_rows);
     plan.n_layer_all = model_peek->hparams.n_layer_all;
+    const uint32_t n_ctx_eff = (cparams->n_ctx > 0) ? (uint32_t)cparams->n_ctx
+                                                    : (uint32_t)model_peek->hparams.n_ctx_train;
     llama_model_free(model_peek);
 
+    // ---- compute buffers: pool-sized kq_mask graph inputs ------------------------
+    // Measured at probe width (16384 cells) inside kernels, but the production
+    // context reserves them at the PLANNED pool width — charge the difference
+    // per candidate. Device membership comes from the measurement placement.
+    const uint64_t mask_bpc_main = kvfit_mask_bpc_per_ctx(cparams, n_ctx_eff);
+    const uint64_t mask_bpc_mtp  = kvfit_mask_bpc_per_ctx(cparams, n_ctx_eff);
+    std::vector<bool> main_ctx_dev(nd_gpus, false), mtp_ctx_dev(nd_gpus, false);
+    {
+        size_t gi = 0;
+        for (size_t i = 0; i < scan_raw.size() && gi < nd_gpus; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (!dev || !scan_raw[i].ok) continue;
+            const auto t = ggml_backend_dev_type(dev);
+            if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
+            if (i < meas.rates.size()) {
+                main_ctx_dev[gi] = meas.rates[i].main_ctx;
+                mtp_ctx_dev[gi]  = meas.rates[i].mtp_ctx;
+            }
+            ++gi;
+        }
+    }
+
     const uint64_t last_gpu_extra = (uint64_t)gguf.norm_bytes + (uint64_t)gguf.output_bytes;
-    const uint32_t n_blocks = kvfit_solve(n_max, layer_costs, budgets, names, last_gpu_extra);
+    const uint32_t n_blocks = kvfit_solve(n_max, layer_costs, budgets, names, last_gpu_extra,
+                                          mask_bpc_main, mask_bpc_mtp, main_ctx_dev, mtp_ctx_dev);
     if (n_blocks == 0) {
         LLAMA_LOG_ERROR("kvfit: solver found no placement — even the perfect split cannot "
                         "hold all layers on the GPUs\n");
@@ -1069,19 +1191,9 @@ static kvfit_plan kvfit_plan_compute(const char * path,
     const uint32_t N = plan.n_layer_all;
     std::vector<int> first_layer(budgets.size(), 0);
     {
-        size_t il = 0;
-        for (size_t g = 0; g < budgets.size() && il < layer_costs.size(); ++g) {
-            first_layer[g] = (int)il;
-            if (g + 1 == budgets.size()) break;   // last GPU takes everything remaining
-            uint64_t used = 0;
-            while (il < layer_costs.size()) {
-                const uint64_t cost = layer_costs[il].weights
-                    + (uint64_t)n_blocks * 256u * (layer_costs[il].kv_bpc + layer_costs[il].mtp_kv_bpc)
-                    + layer_costs[il].ssm_state;
-                if (used + cost > budgets[g]) break;   // hand over at il
-                used += cost;
-                ++il;
-            }
+        const std::vector<size_t> walk = kvfit_greedy_walk(n_blocks, layer_costs, budgets);
+        for (size_t g = 0; g < walk.size() && g < first_layer.size(); ++g) {
+            first_layer[g] = (int)walk[g];
         }
     }
 
