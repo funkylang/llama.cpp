@@ -5,12 +5,17 @@
 //   2. llama_kv_fit_auto_split()    — planned placement (tensor_layer_bounds)
 //   3. llama_kv_fit_max_pool()      — pool size (reuses step 2's measurement)
 //   4. real model load with the planned params; per-layer placement verified
-//      against the plan (proves the loader applies the boundaries verbatim)
+//      against the plan (proves the loader applies the boundaries verbatim);
+//      then llama_kv_fit_explain() prints what the solver CHARGES for exactly
+//      this placement + pool — the terms the measured deltas are compared to
 //   5. unified context at the planned pool — proves the plan fits on VRAM;
 //      plus the MTP draft context when the model has a nextn block (fllama shape)
 //   6. Shakespeare warmup decode on that context — forces every lazy
 //      allocation a decode pays (init alone can pass while decoding OOMs),
 //      including one single-token MTP draft decode when measured in planning
+//
+// Every stage prints per-device used (over the clean start baseline) and delta
+// (what this stage alone added), so measured vs computed terms line up.
 //
 // Planning traces flow through the standard log callback at the PLANNING level.
 // Run next to tools/gpu-split with the same options on the same machine: the
@@ -25,19 +30,40 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define ND_MAX 16   // llama_max_devices()
+
 static const char * g_path = NULL;
 
-// Device memory snapshot at one stage of the test — raw bytes, nothing
-// subtracted. Printed before the context (weights only) AND after it, so the
-// planned pool's actual landing in VRAM is visible instead of assumed.
-static void print_free_vram(const struct llama_model * model, int ndev, const char * header) {
+// Raw free/total snapshot of every backend device (no model needed).
+static void read_all_devices(size_t * free_out, size_t * total_out) {
+    const int ndev = (int)ggml_backend_dev_count();
+    for (int i = 0; i < ndev && i < ND_MAX; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev) { free_out[i] = 0; total_out[i] = 0; continue; }
+        ggml_backend_dev_memory(dev, &free_out[i], &total_out[i]);
+    }
+}
+
+// Device memory snapshot at one stage of the test. Prints used (over the clean
+// process-start baseline) and delta (what THIS stage alone added), so each
+// allocation step is directly comparable to the terms the solver computed.
+static void print_free_vram(const struct llama_model * model, int ndev, const char * header,
+                            const size_t * base_free, const size_t * prev_free) {
     fprintf(stderr, "\n%s:\n", header);
     for (int i = 0; i < ndev; ++i) {
         ggml_backend_dev_t dev = llama_model_get_device(model, i);
+        // backend index of this model device (baseline/prev are in backend order)
+        int bi = -1;
+        const int ndev_all = (int)ggml_backend_dev_count();
+        for (int j = 0; j < ndev_all; ++j) {
+            if (ggml_backend_dev_get(j) == dev) { bi = j; break; }
+        }
         size_t free_mem = 0, total_mem = 0;
         ggml_backend_dev_memory(dev, &free_mem, &total_mem);
-        fprintf(stderr, "  %d    %-12s total=%14zu free=%14zu\n", i,
-                ggml_backend_dev_name(dev), total_mem, free_mem);
+        const size_t used  = (bi >= 0 && base_free[bi] >= free_mem) ? base_free[bi] - free_mem : 0;
+        const size_t delta = (bi >= 0 && prev_free[bi]  >= free_mem) ? prev_free[bi]  - free_mem : 0;
+        fprintf(stderr, "  %d    %-12s total=%14zu free=%14zu used=%14zu delta=%14zu\n",
+                i, ggml_backend_dev_name(dev), total_mem, free_mem, used, delta);
     }
 }
 
@@ -220,6 +246,12 @@ int main(int argc, char ** argv) {
     int32_t layer_bounds[16];   // llama_max_devices(); auto_split fills the used entries
     memset(layer_bounds, 0, sizeof(layer_bounds));
 
+    // clean baseline BEFORE any load: the process-start free VRAM every stage
+    // delta is measured against (the planning measurement frees everything it
+    // allocates before returning, so this stays valid for the whole run)
+    size_t base_free[ND_MAX] = {0}, base_tot[ND_MAX] = {0};
+    read_all_devices(base_free, base_tot);
+
     // ---- 1+2: plan the placement ---------------------------------------------
     fprintf(stderr, "\n== kv-fit clone: planning %s ==\n", g_path);
     if (!llama_kv_fit_auto_split(g_path, &mparams, &cparams, layer_bounds, params, 0)) {
@@ -273,8 +305,15 @@ int main(int argc, char ** argv) {
     }
     fprintf(stderr, "  all layers on their planned devices\n");
 
+    // ---- 4a: what the solver CHARGES for this exact plan + pool --------------
+    // the terms the measured stage deltas below are compared against
+    llama_kv_fit_explain(g_path, &cparams, params, layer_bounds, ndev, (uint32_t)n_cells);
+
+    size_t snap[ND_MAX] = {0};
+
     // ---- 4b: where the pool will come from --------------------------------------
-    print_free_vram(model, ndev, "free VRAM after planned load (weights only)");
+    print_free_vram(model, ndev, "free VRAM after planned load (weights only)", base_free, base_free);
+    read_all_devices(snap, base_tot);
 
     // ---- 5: the real proof — context at the planned pool -----------------------
     fprintf(stderr, "\n== context init at n_kv_cache = %d cells ==\n", n_cells);
@@ -302,7 +341,8 @@ int main(int argc, char ** argv) {
     }
 
     // headroom AFTER the full deployment exists: pool + compute buffers in place
-    print_free_vram(model, ndev, "free VRAM after context init at the planned pool");
+    print_free_vram(model, ndev, "free VRAM after context init at the planned pool", base_free, snap);
+    read_all_devices(snap, base_tot);
 
     // ---- 6: run Shakespeare — force every lazy allocation a decode pays -------
     // exactly what planning measured: main prefill + generate steps, and (with
@@ -349,7 +389,7 @@ int main(int argc, char ** argv) {
             }
         }
         free(p_tokens);
-        print_free_vram(model, ndev, "free VRAM after warmup decode");
+        print_free_vram(model, ndev, "free VRAM after warmup decode", base_free, snap);
     }
 
     llama_free(ctx_mtp);

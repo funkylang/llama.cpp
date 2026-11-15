@@ -4,4 +4,4 @@
 // updated on every fork commit with the ACTUAL current time at update (strict ordering);
 // printed as the first startup message of llama-server so the running build can be identified
 
-static const char * FORK_VERSION = "2026-11-15 22:24:30 kv-fit-deviation: cache-size x split memory measurement tool";
+static const char * FORK_VERSION = "2026-11-15 23:18:15 kv-fit explain API + stage deltas in kv tools";

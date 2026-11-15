@@ -267,6 +267,20 @@ LLAMA_API int32_t llama_kv_fit_max_pool(
         struct llama_context_params * cparams,
         const struct llama_kv_fit_params * params);
 
+// Explain what the solver charges each device for an EXPLICIT placement
+// (layer_bounds[g] = first layer on GPU g, backend device order) at a unified
+// pool size: tensors / swa/ssm / cache / mtp-cache / buffers — the exact terms
+// of the fit calculation. Pure GGUF metadata + hparams math; no measurement
+// load. Prints through the standard log callback (PLANNING level). The
+// deviation tools compare the measured stage deltas against these numbers.
+LLAMA_API void llama_kv_fit_explain(
+        const char * path_model,
+        const struct llama_context_params * cparams,
+        const struct llama_kv_fit_params * params,
+        const int32_t * layer_bounds,
+        int32_t n_devices,
+        uint32_t pool_cells);
+
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);

@@ -1,28 +1,30 @@
 // [FORK] kv-fit-deviation — measure how REAL memory usage deviates from our
 // COMPUTED values, as a function of cache size and layer distribution.
 //
-// Controlled experiment (research mode, not the production planner): 4 loads,
+// Controlled experiment (research mode, not the production planner): 8 loads,
 // each fully isolated (everything unloaded before each run) so every run starts
 // from a clean VRAM baseline:
 //
-//   Run 1: split 0..37 / 38..64  pool 16384   "provisional" (the native auto
-//   Run 2: split 0..37 / 38..64  pool 81920    split's result, pinned so both
-//                                                provisional runs share EXACTLY
-//                                                the same placement)
-//   Run 3: split 0..42 / 43..64  pool 16384
-//   Run 4: split 0..42 / 43..64  pool 81920
+//   splits {0..37 / 38..64} and {0..42 / 43..64} x pools 16384, 49152,
+//   81920, 114688 (+32768 steps). 4 points per split = 3 consecutive deltas:
+//   equal deltas/cell -> linear scaling of the overhead; growing deltas expose
+//   pool-dependent (e.g. quadratic) terms the planner must charge.
 //
-// Both "provisional" runs hardcode the SAME boundary on purpose — the native
-// auto-split depends on free VRAM at load time and would drift between calls;
+// Both runs per split pin the SAME boundary on purpose — the native auto-
+// split depends on free VRAM at load time and would drift between calls;
 // pinning the boundary removes that variable so only the pool size changes.
 // (The native auto-split path is untouched and remains for production use.)
 //
-// Each run reports per-device USED memory (baseline_free - free) at every
-// allocation stage: weights / +KV pool / +MTP KV / +compute. Compare those to
-// the solver's computed terms (tensors, cache, buffers) to see where and how
-// much they deviate as cache size and distribution vary.
+// Each run prints, per device: USED memory (baseline_free - free) and DELTA
+// (what this stage alone added over the previous one) at every allocation
+// stage: weights / +KV pool / +MTP KV / +compute — and what the SOLVER
+// charges for exactly this placement + pool (tensors / swa/ssm / cache /
+// mtp-cache / buffers via llama_kv_fit_explain). Measured deltas vs computed
+// terms show where and how much they deviate as cache size and distribution
+// vary.
 
 #include "llama.h"
+#include "../../src/llama-ext.h"
 #include "../../src/warmup-text.h"
 
 #include <stdint.h>
@@ -53,16 +55,44 @@ static void read_all_devices(size_t * free_out, size_t * total_out) {
 }
 
 // Print one stage: per-device used = baseline_free - current_free (VRAM this
-// stage consumed over the clean state), so each row is comparable. Takes the
-// already-sampled free arrays (no extra backend query here).
+// stage consumed over the clean state), plus delta = prev_free - current_free
+// (what THIS allocation step alone added). Takes the already-sampled free
+// arrays (no extra backend query here).
 static void print_used(const char * header, int ndev,
-                       const size_t * base_free, const size_t * now_free) {
+                       const size_t * base_free, const size_t * now_free,
+                       const size_t * prev_free) {
     fprintf(stderr, "\n  %s:\n", header);
     for (int i = 0; i < ndev; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (!dev) continue;
-        fprintf(stderr, "    %2d  %-14s used=%14zu  free=%14zu\n",
-                i, ggml_backend_dev_name(dev), base_free[i] - now_free[i], now_free[i]);
+        const size_t used  = base_free[i] - now_free[i];
+        const size_t delta = prev_free[i] - now_free[i];
+        fprintf(stderr, "    %2d  %-14s used=%14zu  free=%14zu  delta=%14zu\n",
+                i, ggml_backend_dev_name(dev), used, now_free[i], delta);
+    }
+}
+
+// Read back where the loader ACTUALLY placed the layers (ground truth from
+// the loaded model's device map), so the pinned split is verified instead of
+// assumed. Model device list = GPUs only (the same list the loader used).
+static void print_actual_split(const struct llama_model * model) {
+    const uint32_t nl = llama_model_n_layer_all(model);
+    const int ndev = (int)llama_model_n_devices(model);
+    fprintf(stderr, "\n  actual placement (read back from loaded model):\n");
+    fprintf(stderr, "    %-4s %-10s  %s\n", "idx", "layers", "name");
+    for (int i = 0; i < ndev; ++i) {
+        ggml_backend_dev_t dev = llama_model_get_device(model, (int32_t)i);
+        if (!dev) continue;
+        int first = -1, last = -1;
+        for (uint32_t il = 0; il < nl; ++il) {
+            if ((int)llama_model_layer_device_index(model, il) == i) {
+                if (first < 0) first = (int)il;
+                last = (int)il;
+            }
+        }
+        char range[24];
+        snprintf(range, sizeof(range), first >= 0 ? "%d-%d" : "-", first, last);
+        fprintf(stderr, "    %-4d %-10s  %s\n", i, range, ggml_backend_dev_name(dev));
     }
 }
 
@@ -117,15 +147,25 @@ static int warmup_decode(struct llama_context * ctx, const llama_token * tok, in
 }
 
 // One isolated scenario: clean baseline -> load (explicit split) -> main ctx at
-// pool -> MTP ctx (when nextn) -> warmup decode -> per-stage used-memory table.
-// Frees everything before returning. Returns 0 ok, nonzero on a hard failure
-// (the log shows which stage).
+// pool -> MTP ctx (when nextn) -> warmup decode -> per-stage used/delta tables.
+// The solver's own computed terms for this placement + pool are printed via
+// llama_kv_fit_explain, so measured and computed numbers sit next to each
+// other in the log. Frees everything before returning. Returns 0 ok, nonzero
+// on a hard failure (the log shows which stage).
 static int run_single_test(const char * path,
                            const struct llama_model_params * mp_base,
                            const struct llama_context_params * cp_base,
+                           const struct llama_kv_fit_params * fit_params,
                            const struct run_cfg * cfg) {
     fprintf(stderr, "\n\n================ RUN %s  (pool=%u cells) ================\n",
             cfg->label, cfg->pool_cells);
+
+    // the placement we are about to request: bounds[g] = first layer on dev g
+    fprintf(stderr, "  requested split: bounds=[");
+    for (int g = 0; g < cfg->n_bounds; ++g) {
+        fprintf(stderr, "%s%d", g ? ", " : "", (int)cfg->bounds[g]);
+    }
+    fprintf(stderr, "]\n");
 
     // baseline: nothing loaded
     size_t bf[ND_MAX], tot[ND_MAX];
@@ -137,20 +177,29 @@ static int run_single_test(const char * path,
                 i, ggml_backend_dev_name(dev), tot[i], bf[i]);
     }
 
-    // model load with the pinned split (bounds[g] = first layer on dev g)
+    // model load with the pinned split
     struct llama_model_params mp = *mp_base;
-    if ((int)ggml_backend_dev_count() != cfg->n_bounds) {
-        fprintf(stderr, "    WARN: %d backend devices but run specifies %d boundaries\n",
-                (int)ggml_backend_dev_count(), cfg->n_bounds);
-    }
     mp.tensor_layer_bounds = cfg->bounds;
 
     struct llama_model * model = llama_model_load_from_file(path, mp);
     if (!model) { fprintf(stderr, "    LOAD FAILED\n"); return 1; }
 
-    size_t f[ND_MAX];
+    // verify the loader honored the requested split: read back reality from
+    // the model's device map (GPUs only — the list the loader used for bounds)
+    print_actual_split(model);
+    if ((int)llama_model_n_devices(model) != cfg->n_bounds) {
+        fprintf(stderr, "    WARN: model has %d GPU devices but run specifies %d boundaries\n",
+                (int)llama_model_n_devices(model), cfg->n_bounds);
+    }
+
+    // what the solver CHARGES for exactly this placement + pool — the numbers
+    // the measured stage deltas below are compared against
+    llama_kv_fit_explain(path, cp_base, fit_params, cfg->bounds, cfg->n_bounds, cfg->pool_cells);
+
+    size_t f[ND_MAX], prev[ND_MAX];
     read_all_devices(f, tot);
-    print_used("after load (weights only)", (int)ggml_backend_dev_count(), bf, f);
+    print_used("after load (weights only)", (int)ggml_backend_dev_count(), bf, f, bf);
+    memcpy(prev, f, sizeof(f));
 
     // main context at the run's pool size
     struct llama_context_params cp = *cp_base;
@@ -159,7 +208,8 @@ static int run_single_test(const char * path,
     if (!ctx) { fprintf(stderr, "    MAIN CTX INIT FAILED (pool too big)\n"); llama_model_free(model); return 1; }
 
     read_all_devices(f, tot);
-    print_used("after main ctx (+KV pool +SSM state)", (int)ggml_backend_dev_count(), bf, f);
+    print_used("after main ctx (+KV pool +SSM state)", (int)ggml_backend_dev_count(), bf, f, prev);
+    memcpy(prev, f, sizeof(f));
 
     // MTP draft context when the model has a nextn block (fllama shape)
     struct llama_context * ctx_mtp = NULL;
@@ -172,7 +222,8 @@ static int run_single_test(const char * path,
         if (!ctx_mtp) fprintf(stderr, "    MTP CTX INIT FAILED\n");
         else {
             read_all_devices(f, tot);
-            print_used("after MTP ctx (+nextn KV pool)", (int)ggml_backend_dev_count(), bf, f);
+            print_used("after MTP ctx (+nextn KV pool)", (int)ggml_backend_dev_count(), bf, f, prev);
+            memcpy(prev, f, sizeof(f));
         }
     }
 
@@ -199,7 +250,7 @@ static int run_single_test(const char * path,
             free(st);
         }
         read_all_devices(f, tot);
-        print_used("after warmup decode (+compute buffers) = DEPLOYMENT", (int)ggml_backend_dev_count(), bf, f);
+        print_used("after warmup decode (+compute buffers) = DEPLOYMENT", (int)ggml_backend_dev_count(), bf, f, prev);
     }
     free(p_tok);
 
@@ -226,7 +277,7 @@ int main(int argc, char ** argv) {
         const char * a = argv[i];
         if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
             fprintf(stderr, "usage: %s MODEL [options]\n\n"
-                "Deviation analysis: 4 controlled loads across cache size x split.\n"
+                "Deviation analysis: 8 controlled loads across cache size x split.\n"
                 "\n"
                 "options (mirror tools/gpu-split):\n"
                 "  --parallel P            parallel streams (plans 9 SSM rows each)\n"
@@ -270,21 +321,29 @@ int main(int argc, char ** argv) {
     if (parallel_arg >= 0) { cp.n_seq_max = (uint32_t)parallel_arg; cp.n_rs_seq = 8; }
     else                   { cp.n_seq_max = 1; cp.n_rs_seq = (checkpoints_arg >= 0) ? (uint32_t)checkpoints_arg - 1 : 0; }
 
-    // The 4 scenarios. bounds[g] = first layer on device g (loader rule: layer
-    // il -> last dev whose bound <= il). Both provisional runs pin 0..37/38..64.
-    const struct run_cfg runs[4] = {
-        { "1 provisional (native split 0..37/38..64) @ small pool",
-          {0, 38}, 2, 16384 },
-        { "2 provisional (SAME split) @ large pool",
-          {0, 38}, 2, 81920 },
-        { "3 explicit 0..42/43..64 @ small pool",
-          {0, 43}, 2, 16384 },
-        { "4 explicit 0..42/43..64 @ large pool",
-          {0, 43}, 2, 81920 },
+    // The 8 scenarios: 2 pinned splits x 4 pools (+32768 steps). bounds[g] =
+    // first layer on device g (loader rule: layer il -> last dev whose bound
+    // <= il). Each run prints its bounds + the actual placement it produced,
+    // so the real numbers are in the log.
+    const struct run_cfg runs[8] = {
+        { "1", {0, 38}, 2, 16384  },
+        { "2", {0, 38}, 2, 49152  },
+        { "3", {0, 38}, 2, 81920  },
+        { "4", {0, 38}, 2, 114688 },
+        { "5", {0, 43}, 2, 16384  },
+        { "6", {0, 43}, 2, 49152  },
+        { "7", {0, 43}, 2, 81920  },
+        { "8", {0, 43}, 2, 114688 },
     };
 
+    // planning options for llama_kv_fit_explain: the app knows its own SSM
+    // checkpoint policy (state rows per recurrent layer), passes it explicitly
+    struct llama_kv_fit_params * fit = llama_kv_fit_params_new(LLAMA_KV_FIT_PARAMS_VERSION);
+    fit->n_checkpoints = cp.n_seq_max * (1u + cp.n_rs_seq);
+
     int failures = 0;
-    for (int r = 0; r < 4; ++r) failures += run_single_test(g_path, &mp, &cp, &runs[r]);
+    for (int r = 0; r < 8; ++r) failures += run_single_test(g_path, &mp, &cp, fit, &runs[r]);
+    llama_kv_fit_params_free(fit);
 
     llama_backend_free();
     fprintf(stderr, "\n\nkv-fit-deviation: done (%d failed run(s))\n", failures);
