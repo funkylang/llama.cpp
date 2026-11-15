@@ -1,12 +1,13 @@
 // [FORK] kv-fit-deviation — measure how REAL memory usage deviates from our
 // COMPUTED values, as a function of cache size and layer distribution.
 //
-// Controlled experiment (research mode, not the production planner): 8 loads,
+// Controlled experiment (research mode, not the production planner): 12 loads,
 // each fully isolated (everything unloaded before each run) so every run starts
 // from a clean VRAM baseline:
 //
-//   splits {0..37 / 38..64} and {0..42 / 43..64} x pools 16384, 49152,
-//   81920, 114688 (+32768 steps). 4 points per split = 3 consecutive deltas:
+//   splits {0..37 / 38..64}, {0..41 / 42..64} and {0..42 / 43..64} x pools
+//   16384, 49152, 81920, 114688 (+32768 steps). 4 points per split =
+//   3 consecutive deltas:
 //   equal deltas/cell -> linear scaling of the overhead; growing deltas expose
 //   pool-dependent (e.g. quadratic) terms the planner must charge.
 //
@@ -115,11 +116,17 @@ static void print_summary(const struct run_cfg * runs, int n_runs,
         }
         if (!group_start) continue;
 
-        fprintf(stderr, "\n  split [");
+        // print the split as per-device layer ranges ("0..37 / 38..64"),
+        // not the raw bounds array
+        fprintf(stderr, "\n  split ");
         for (int g = 0; g < runs[s].n_bounds; ++g) {
-            fprintf(stderr, "%s%d", g ? "," : "", (int)runs[s].bounds[g]);
+            if (g) fputs(" / ", stderr);
+            const int first = runs[s].bounds[g];
+            const int last  = (g + 1 < runs[s].n_bounds) ? runs[s].bounds[g + 1] - 1
+                                                         : (int)g_n_layer_all - 1;
+            fprintf(stderr, "%d..%d", first, last);
         }
-        fprintf(stderr, "]:\n");
+        fprintf(stderr, ":\n");
 
         for (int g = 0; g < runs[s].n_bounds; ++g) {
             int bidx = -1;
@@ -393,7 +400,7 @@ int main(int argc, char ** argv) {
         const char * a = argv[i];
         if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
             fprintf(stderr, "usage: %s MODEL [options]\n\n"
-                "Deviation analysis: 8 controlled loads across cache size x split.\n"
+                "Deviation analysis: 12 controlled loads across cache size x split.\n"
                 "\n"
                 "options (mirror tools/gpu-split):\n"
                 "  --parallel P            parallel streams (plans 9 SSM rows each)\n"
@@ -441,15 +448,19 @@ int main(int argc, char ** argv) {
     // first layer on device g (loader rule: layer il -> last dev whose bound
     // <= il). Each run prints its bounds + the actual placement it produced,
     // so the real numbers are in the log.
-    const struct run_cfg runs[8] = {
-        { "1", {0, 38}, 2, 16384  },
-        { "2", {0, 38}, 2, 49152  },
-        { "3", {0, 38}, 2, 81920  },
-        { "4", {0, 38}, 2, 114688 },
-        { "5", {0, 43}, 2, 16384  },
-        { "6", {0, 43}, 2, 49152  },
-        { "7", {0, 43}, 2, 81920  },
-        { "8", {0, 43}, 2, 114688 },
+    const struct run_cfg runs[12] = {
+        { "1",  {0, 38}, 2, 16384  },   // split A: 0..37 / 38..64
+        { "2",  {0, 38}, 2, 49152  },
+        { "3",  {0, 38}, 2, 81920  },
+        { "4",  {0, 38}, 2, 114688 },
+        { "5",  {0, 42}, 2, 16384  },   // split B: 0..41 / 42..64
+        { "6",  {0, 42}, 2, 49152  },
+        { "7",  {0, 42}, 2, 81920  },
+        { "8",  {0, 42}, 2, 114688 },
+        { "9",  {0, 43}, 2, 16384  },   // split C: 0..42 / 43..64
+        { "10", {0, 43}, 2, 49152  },
+        { "11", {0, 43}, 2, 81920  },
+        { "12", {0, 43}, 2, 114688 },
     };
 
     // planning options for llama_kv_fit_explain: the app knows its own SSM
@@ -458,16 +469,16 @@ int main(int argc, char ** argv) {
     fit->n_checkpoints = cp.n_seq_max * (1u + cp.n_rs_seq);
 
     int failures = 0;
-    struct run_result results[8];
+    struct run_result results[12];
     memset(results, 0, sizeof(results));
-    for (int r = 0; r < 8; ++r) {
+    for (int r = 0; r < 12; ++r) {
         failures += run_single_test(g_path, &mp, &cp, fit, &runs[r], &results[r]);
     }
     llama_kv_fit_params_free(fit);
 
     // final comparison tables: measured free VRAM + scaling figures per
     // split x device — what the spreadsheet view wanted in one place
-    print_summary(runs, 8, results);
+    print_summary(runs, 12, results);
 
     llama_backend_free();
     fprintf(stderr, "\n\nkv-fit-deviation: done (%d failed run(s))\n", failures);
