@@ -155,6 +155,34 @@ static std::vector<kvfit_dev_usage> kvfit_compute_dev_usage(const llama_model * 
     return usage;
 }
 
+// Provisional split readback table (gpu-split parity): where a measurement
+// load ACTUALLY placed the weights. GPU rows only while any GPU is present —
+// this is a GPU planning tool, CPU placement is noise for planning.
+static void kvfit_print_provisional_split(const llama_model * model) {
+    if (!kvfit_gpus_present()) return;
+
+    const auto usage = kvfit_compute_dev_usage(model);
+    LLAMA_LOG_PLANNING("\n      provisional split (as placed by the measurement load):\n\n");
+    LLAMA_LOG_PLANNING("        %-4s %-6s %-10s %-14s  %s\n", "idx", "type", "layers", "weights", "name");
+    for (size_t i = 0; i < usage.size(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev) continue;
+        const enum ggml_backend_dev_type t = ggml_backend_dev_type(dev);
+        if (t == GGML_BACKEND_DEVICE_TYPE_CPU || t == GGML_BACKEND_DEVICE_TYPE_META) continue;
+
+        char range[24];
+        snprintf(range, sizeof(range),
+                 usage[i].first_layer >= 0 ? "%d-%d" : "-",
+                 usage[i].first_layer, usage[i].last_layer);
+        char gib[32];
+        snprintf(gib, sizeof(gib), "%.2f GiB",
+                 (double)usage[i].bytes / (1024.0 * 1024.0 * 1024.0));
+        LLAMA_LOG_PLANNING("        %-4zu %-6s %-10s %-14s  %s\n",
+                           i, kvfit_dev_type_str(t), range, gib,
+                           ggml_backend_dev_name(dev));
+    }
+}
+
 // ============================================================================
 // Architecture-derived per-device memory rates
 // ============================================================================
@@ -730,6 +758,7 @@ static bool kvfit_measure(const char * path,
         return false;
     }
     const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load0).count();
+    kvfit_print_provisional_split(model);
 
     // measurement context at a common deployment size. n_kv_cache stays 0 with
     // kv_unified: the pool is then PAD(n_ctx) cells — its size is subtracted in
