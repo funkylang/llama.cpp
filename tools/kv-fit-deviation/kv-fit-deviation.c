@@ -36,13 +36,25 @@
 
 static const char * g_path = NULL;
 
-// ---- one controlled scenario ------------------------------------------------
+// ---- one controlled scenario -------------------------------------------------
 struct run_cfg {
     const char * label;                        // short human description
     int32_t      bounds[ND_MAX];               // explicit placement: first layer on dev g
     int          n_bounds;                     // number of valid boundaries (= device count)
     uint32_t     pool_cells;                   // n_kv_cache for this run
 };
+
+// Free VRAM per backend device at the two stages the summary table reports:
+// after the weights load and after the full deployment (warmup decode done).
+struct run_result {
+    size_t free_load[ND_MAX];
+    size_t free_deploy[ND_MAX];
+    bool   ok;
+};
+
+// Total transformer layers (trunk + nextn), captured from the first
+// successful load — the summary's layer ranges use it. 0 = never loaded.
+static uint32_t g_n_layer_all = 0;
 
 // Raw per-backend-device free/total snapshot at one stage. No model needed.
 static void read_all_devices(size_t * free_out, size_t * total_out) {
@@ -54,17 +66,116 @@ static void read_all_devices(size_t * free_out, size_t * total_out) {
     }
 }
 
+// This is a GPU measurement tool — CPU devices are never shown.
+static bool is_gpu_device(ggml_backend_dev_t dev) {
+    if (!dev) return false;
+    const enum ggml_backend_dev_type t = ggml_backend_dev_type(dev);
+    return (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU);
+}
+
+// GPU at position g in the backend scan (placement bounds are indexed this
+// way). Returns the device, its backend index via out_idx; NULL if absent.
+static ggml_backend_dev_t gpu_device_at(int g, int * out_idx) {
+    int seen = -1;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!is_gpu_device(dev)) continue;
+        ++seen;
+        if (seen == g) { *out_idx = (int)i; return dev; }
+    }
+    return NULL;
+}
+
+// Do two runs pin the same placement? (Their bounds arrays are identical.)
+static bool same_split(const struct run_cfg * a, const struct run_cfg * b) {
+    if (a->n_bounds != b->n_bounds) return false;
+    for (int g = 0; g < a->n_bounds; ++g) {
+        if (a->bounds[g] != b->bounds[g]) return false;
+    }
+    return true;
+}
+
+// Final comparison tables: per split, per GPU device — the measured free VRAM
+// at load and at deployment for each pool size, plus the scaling figures:
+//   delta        = what the post-load stages consumed (load -> deployment)
+//   consec-delta = growth of that consumption between consecutive pools
+//   d/cell(m)    = marginal bytes per cell, measured
+//   max-cells    = pool + free(deploy) / d/cell(m): headroom extrapolated at
+//                  the measured marginal rate (needs a predecessor row)
+static void print_summary(const struct run_cfg * runs, int n_runs,
+                          const struct run_result * results) {
+    if (g_n_layer_all == 0) return;   // nothing ever loaded
+
+    fprintf(stderr, "\n\n================ SUMMARY: measured free VRAM per split x device ================\n");
+
+    for (int s = 0; s < n_runs; ++s) {
+        bool group_start = true;
+        for (int k = 0; k < s; ++k) {
+            if (same_split(&runs[k], &runs[s])) { group_start = false; break; }
+        }
+        if (!group_start) continue;
+
+        fprintf(stderr, "\n  split [");
+        for (int g = 0; g < runs[s].n_bounds; ++g) {
+            fprintf(stderr, "%s%d", g ? "," : "", (int)runs[s].bounds[g]);
+        }
+        fprintf(stderr, "]:\n");
+
+        for (int g = 0; g < runs[s].n_bounds; ++g) {
+            int bidx = -1;
+            ggml_backend_dev_t dev = gpu_device_at(g, &bidx);
+            if (!dev) continue;
+
+            const int32_t first_layer = runs[s].bounds[g];
+            const int32_t last_layer  = (g + 1 < runs[s].n_bounds)
+                                      ? runs[s].bounds[g + 1] - 1
+                                      : (int32_t)g_n_layer_all - 1;
+            fprintf(stderr, "\n    %-14s  layers %d..%d\n", ggml_backend_dev_name(dev), first_layer, last_layer);
+            fprintf(stderr, "      %14s  %14s  %14s  %14s  %14s  %14s  %14s\n",
+                    "pool", "free(load)", "free(deploy)", "delta", "consec-delta", "d/cell(m)", "max-cells");
+
+            size_t prev_delta = 0, prev_pool = 0;
+            bool have_prev = false;
+            for (int r = 0; r < n_runs; ++r) {
+                if (!same_split(&runs[r], &runs[s])) continue;
+                const struct run_result * res = &results[r];
+                if (!res->ok || bidx < 0 || (size_t)bidx >= ND_MAX) continue;
+
+                const size_t fl = res->free_load[bidx];
+                const size_t fd = res->free_deploy[bidx];
+                const size_t delta = fl > fd ? fl - fd : 0;   // free only shrinks inside a run
+
+                if (!have_prev) {
+                    fprintf(stderr, "      %14u  %14zu  %14zu  %14zu\n",
+                            (unsigned)runs[r].pool_cells, fl, fd, delta);
+                } else {
+                    const size_t consec = delta > prev_delta ? delta - prev_delta : 0;
+                    const uint32_t step = runs[r].pool_cells > prev_pool
+                                        ? runs[r].pool_cells - (uint32_t)prev_pool : 0;
+                    const size_t dcell  = step ? consec / step : 0;
+                    const size_t maxc   = dcell ? (size_t)runs[r].pool_cells + fd / dcell : 0;
+                    fprintf(stderr, "      %14u  %14zu  %14zu  %14zu  %14zu  %14zu  %14zu\n",
+                            (unsigned)runs[r].pool_cells, fl, fd, delta, consec, dcell, maxc);
+                }
+                prev_delta = delta;
+                prev_pool  = runs[r].pool_cells;
+                have_prev  = true;
+            }
+        }
+    }
+}
+
 // Print one stage: per-device used = baseline_free - current_free (VRAM this
 // stage consumed over the clean state), plus delta = prev_free - current_free
 // (what THIS allocation step alone added). Takes the already-sampled free
-// arrays (no extra backend query here).
+// arrays (no extra backend query here). GPU devices only.
 static void print_used(const char * header, int ndev,
                        const size_t * base_free, const size_t * now_free,
                        const size_t * prev_free) {
     fprintf(stderr, "\n  %s:\n", header);
     for (int i = 0; i < ndev; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (!dev) continue;
+        if (!is_gpu_device(dev)) continue;
         const size_t used  = base_free[i] - now_free[i];
         const size_t delta = prev_free[i] - now_free[i];
         fprintf(stderr, "    %2d  %-14s used=%14zu  free=%14zu  delta=%14zu\n",
@@ -156,7 +267,8 @@ static int run_single_test(const char * path,
                            const struct llama_model_params * mp_base,
                            const struct llama_context_params * cp_base,
                            const struct llama_kv_fit_params * fit_params,
-                           const struct run_cfg * cfg) {
+                           const struct run_cfg * cfg,
+                           struct run_result * res) {
     fprintf(stderr, "\n\n================ RUN %s  (pool=%u cells) ================\n",
             cfg->label, cfg->pool_cells);
 
@@ -167,12 +279,12 @@ static int run_single_test(const char * path,
     }
     fprintf(stderr, "]\n");
 
-    // baseline: nothing loaded
+    // baseline: nothing loaded (GPUs only — this is a GPU measurement tool)
     size_t bf[ND_MAX], tot[ND_MAX];
     read_all_devices(bf, tot);
     for (int i = 0; i < (int)ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (!dev) continue;
+        if (!is_gpu_device(dev)) continue;
         fprintf(stderr, "  %2d  %-14s total=%14zu  free(baseline)=%14zu\n",
                 i, ggml_backend_dev_name(dev), tot[i], bf[i]);
     }
@@ -183,6 +295,7 @@ static int run_single_test(const char * path,
 
     struct llama_model * model = llama_model_load_from_file(path, mp);
     if (!model) { fprintf(stderr, "    LOAD FAILED\n"); return 1; }
+    if (g_n_layer_all == 0) g_n_layer_all = llama_model_n_layer_all(model);
 
     // verify the loader honored the requested split: read back reality from
     // the model's device map (GPUs only — the list the loader used for bounds)
@@ -199,6 +312,7 @@ static int run_single_test(const char * path,
     size_t f[ND_MAX], prev[ND_MAX];
     read_all_devices(f, tot);
     print_used("after load (weights only)", (int)ggml_backend_dev_count(), bf, f, bf);
+    memcpy(res->free_load, f, sizeof(f));
     memcpy(prev, f, sizeof(f));
 
     // main context at the run's pool size
@@ -251,6 +365,8 @@ static int run_single_test(const char * path,
         }
         read_all_devices(f, tot);
         print_used("after warmup decode (+compute buffers) = DEPLOYMENT", (int)ggml_backend_dev_count(), bf, f, prev);
+        memcpy(res->free_deploy, f, sizeof(f));
+        res->ok = true;   // full stage sequence complete — usable in the summary
     }
     free(p_tok);
 
@@ -267,7 +383,7 @@ static void log_cb(enum ggml_log_level level, const char * text, void * ud) {
 
 int main(int argc, char ** argv) {
     // deployment shape — mirror the production params so the measurement is
-    // realistic; these apply identically to all 4 runs.
+    // realistic; these apply identically to all 8 runs.
     enum ggml_type type_k = GGML_TYPE_F16, type_v = GGML_TYPE_F16;
     bool flash_attn = true;
     uint32_t ubatch_size = 512;
@@ -342,8 +458,16 @@ int main(int argc, char ** argv) {
     fit->n_checkpoints = cp.n_seq_max * (1u + cp.n_rs_seq);
 
     int failures = 0;
-    for (int r = 0; r < 8; ++r) failures += run_single_test(g_path, &mp, &cp, fit, &runs[r]);
+    struct run_result results[8];
+    memset(results, 0, sizeof(results));
+    for (int r = 0; r < 8; ++r) {
+        failures += run_single_test(g_path, &mp, &cp, fit, &runs[r], &results[r]);
+    }
     llama_kv_fit_params_free(fit);
+
+    // final comparison tables: measured free VRAM + scaling figures per
+    // split x device — what the spreadsheet view wanted in one place
+    print_summary(runs, 8, results);
 
     llama_backend_free();
     fprintf(stderr, "\n\nkv-fit-deviation: done (%d failed run(s))\n", failures);
