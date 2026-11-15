@@ -285,13 +285,33 @@ static std::vector<kvfit_layer_cost> kvfit_compute_layer_costs(const llama_model
     return out;
 }
 
+// Per-device compute-buffer charge upper bound (bytes per pool cell): masks
+// for BOTH context types that device hosts per the provisional placement.
+// The greedy walk gates on this so every GPU respects its worst case — using
+// it everywhere overcharges at most, never undercharges; the final check in
+// kvfit_try_place refines it against the candidate's actual layer ranges.
+static std::vector<uint64_t> kvfit_gmax_bpc(const std::vector<bool> & main_ctx_dev,
+                                            const std::vector<bool> & mtp_ctx_dev,
+                                            uint64_t mask_bpc_main, uint64_t mask_bpc_mtp) {
+    std::vector<uint64_t> out(main_ctx_dev.size(), 0);
+    for (size_t i = 0; i < main_ctx_dev.size(); ++i) {
+        if (main_ctx_dev[i]) out[i] += mask_bpc_main;
+        if (mtp_ctx_dev[i])  out[i] += mask_bpc_mtp;
+    }
+    return out;
+}
+
 // Greedy walk shared by the solver, the placement check and the final layout:
 // each GPU g takes layers [first_layer[g], first_layer[g+1)) while they fit;
-// the last GPU gets everything remaining. Returns per-GPU start indices
-// (size = budgets.size() + 1 sentinel so range queries are one subtraction).
+// the last GPU gets everything remaining. Takes are gated on the FULL charge
+// (layer weights + cell costs + this device's conservative compute-buffer
+// charge) so an intermediate GPU never ends up over budget with buffers
+// included. Returns per-GPU start indices (size = budgets.size() + 1 sentinel
+// so range queries are one subtraction).
 static std::vector<size_t> kvfit_greedy_walk(uint32_t n_blocks,
                                              const std::vector<kvfit_layer_cost> & layers,
-                                             const std::vector<uint64_t> & budgets) {
+                                             const std::vector<uint64_t> & budgets,
+                                             const std::vector<uint64_t> & gmax_bpc) {
     const uint64_t cells = (uint64_t)n_blocks * 256;
     const size_t nl = layers.size();
     std::vector<size_t> first(budgets.size() + 1, nl);
@@ -300,12 +320,15 @@ static std::vector<size_t> kvfit_greedy_walk(uint32_t n_blocks,
     for (size_t g = 0; g < budgets.size(); ++g) {
         first[g] = il;
         if (g + 1 == budgets.size()) break;   // last GPU takes everything remaining
+        const uint64_t buffers_g = gmax_bpc[g] * cells;
+        if (buffers_g > budgets[g]) break;   // cannot afford its buffers: takes no layers
+        const uint64_t capacity = budgets[g] - buffers_g;   // layer budget after buffers
         uint64_t used = 0;
         while (il < nl) {
             const uint64_t cost = layers[il].weights + cells * (layers[il].kv_bpc
                                                                + layers[il].mtp_kv_bpc)
                                 + layers[il].ssm_state;
-            if (used + cost > budgets[g]) break;   // hand over at il
+            if (used + cost > capacity) break;   // hand over at il
             used += cost;
             ++il;
         }
@@ -325,11 +348,11 @@ static bool kvfit_mtp_here(size_t g,
     return false;
 }
 
-// Try placing n 256-cell blocks: walk layers in order — each intermediate GPU
-// takes layers greedily until the next one would exceed its budget; the LAST
-// GPU has no choice, it must take all remaining layers, so it only fits if
-// their total cost stays inside its budget. The last GPU also carries the
-// model's global tensors (norm, output — they are not per-layer).
+// Try placing n 256-cell blocks with the candidate placement from the shared
+// greedy walk (buffers-gated), then check every GPU's FULL charge against its
+// budget: layer weights + pool cells + compute buffers (+ global tensors on
+// the last GPU). The last GPU has no choice — all remaining layers are its —
+// so its range total decides the candidate outright.
 //
 // mask_bpc_main / mask_bpc_mtp: compute-buffer bytes per pool cell per
 // context type (the kq_mask graph input, one shared per device+context).
@@ -362,27 +385,24 @@ static bool kvfit_try_place(uint32_t n_blocks,
         p_ssm[i + 1] = p_ssm[i] + layers[i].ssm_state;
     }
 
-    // candidate placement for this n: same greedy walk as the solver body, so
-    // the MTP mask charge can test "does GPU g hold any nextn layer here"
-    const std::vector<size_t> walk_first = kvfit_greedy_walk(n_blocks, layers, budgets);
+    // candidate placement for this n: the shared greedy walk, gated on every
+    // device's compute-buffer charge — the MTP mask refinement below tests
+    // "does GPU g hold any nextn layer" against exactly these boundaries.
+    const std::vector<uint64_t> gmax = kvfit_gmax_bpc(main_ctx_dev, mtp_ctx_dev,
+                                                      mask_bpc_main, mask_bpc_mtp);
+    const std::vector<size_t> walk_first = kvfit_greedy_walk(n_blocks, layers, budgets, gmax);
 
-    size_t il = 0;
-    for (size_t g = 0; g < budgets.size() && il < nl; ++g) {
+    for (size_t g = 0; g < budgets.size(); ++g) {
         const bool is_last = (g + 1 == budgets.size());
-        const size_t first_layer = il;
-        uint64_t used = 0;
+        const size_t first_layer = walk_first[g];
+        const size_t last_layer  = is_last ? nl : walk_first[g + 1];   // exclusive; last owns the rest
 
-        if (!is_last) {
-            // intermediate GPU: take layers while they fit, hand over the rest
-            while (il < nl) {
-                const uint64_t cost = layers[il].weights + cells * (layers[il].kv_bpc
-                                                                   + layers[il].mtp_kv_bpc)
-                                    + layers[il].ssm_state;
-                if (used + cost > budgets[g]) break;   // next GPU continues at il
-                used += cost;
-                ++il;
-            }
-        } else {
+        uint64_t used = 0;
+        if (last_layer > first_layer) {
+            used = (p_wss[last_layer] - p_wss[first_layer])
+                 + cells * (p_bpc[last_layer] - p_bpc[first_layer]);
+        }
+        if (is_last) {
             // last GPU: no choice — all remaining layers are its, plus the global
             // tensors (norm, output); the range total against its budget decides
             // the candidate outright
@@ -391,8 +411,8 @@ static bool kvfit_try_place(uint32_t n_blocks,
                  + last_gpu_extra;
         }
 
-        const bool has_layers = is_last || (il > first_layer);   // last GPU always "owns" the rest
-        const size_t shown_last = has_layers ? (is_last ? nl - 1 : il - 1) : 0;
+        const bool has_layers = is_last || (last_layer > first_layer);
+        const size_t shown_last = has_layers ? (is_last ? nl - 1 : last_layer - 1) : 0;
         std::string range = has_layers ? "" : "(none)";
         if (has_layers) {
             char rb[64];
@@ -408,13 +428,15 @@ static bool kvfit_try_place(uint32_t n_blocks,
 
         // pool-dependent compute buffers (kq_mask graph input): one shared mask
         // per context on the device, sized by the FULL pool (not this device's
-        // share) — llama-context sched_reserve builds it at pool width.
+        // share). Refined against THIS candidate's placement: a main mask only
+        // where trunk attention layers actually landed, an MTP mask only where
+        // nextn layers did.
         const uint64_t mbpc = (g < main_ctx_dev.size() && main_ctx_dev[g]) ? mask_bpc_main : 0;
         const bool mtp_mask = (kvfit_mtp_here(g, walk_first, layers))
                            && (g < mtp_ctx_dev.size()) && mtp_ctx_dev[g];
         const uint64_t buffers = cells * (mbpc + (mtp_mask ? mask_bpc_mtp : 0));
 
-        const bool fits = (used + buffers <= budgets[g]);   // always true for intermediate GPUs (greedy)
+        const bool fits = (used <= budgets[g]) && (buffers <= budgets[g] - used);   // overflow-safe
 
         LLAMA_LOG_PLANNING("          %s: layers = %s\n"
                            "            tensors   = %llu\n"
@@ -428,7 +450,7 @@ static bool kvfit_try_place(uint32_t n_blocks,
                            (unsigned long long)cells,
                            (unsigned long long)(buffers / cells),
                            (unsigned long long)buffers);
-        if (!is_last || fits) {
+        if (fits) {
             LLAMA_LOG_PLANNING("            used      = tensors(%llu) + swa/ssm(%llu) + cache(%llu) + buffers(%llu) = %llu\n"
                                "            not used  = budget(%llu) - used(%llu) = %llu\n",
                                (unsigned long long)wts, (unsigned long long)ssm,
@@ -1202,7 +1224,11 @@ static kvfit_plan kvfit_plan_compute(const char * path,
     const uint32_t N = plan.n_layer_all;
     std::vector<int> first_layer(budgets.size(), 0);
     {
-        const std::vector<size_t> walk = kvfit_greedy_walk(n_blocks, layer_costs, budgets);
+        // same walk as the solver: buffers-gated, so the final layout matches
+        // the placement the candidate that won was checked with
+        const std::vector<uint64_t> gmax = kvfit_gmax_bpc(main_ctx_dev, mtp_ctx_dev,
+                                                          mask_bpc_main, mask_bpc_mtp);
+        const std::vector<size_t> walk = kvfit_greedy_walk(n_blocks, layer_costs, budgets, gmax);
         for (size_t g = 0; g < walk.size() && g < first_layer.size(); ++g) {
             first_layer[g] = (int)walk[g];
         }
