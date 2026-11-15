@@ -454,6 +454,7 @@ static bool kvfit_try_place(uint32_t n_blocks,
 static uint32_t kvfit_solve(uint32_t n_max,
                             const std::vector<kvfit_layer_cost> & layers,
                             const std::vector<uint64_t> & budgets,
+                            const std::vector<uint64_t> & reserves,
                             const std::vector<std::string> & names,
                             uint64_t last_gpu_extra,
                             uint64_t mask_bpc_main,
@@ -467,15 +468,23 @@ static uint32_t kvfit_solve(uint32_t n_max,
     }
     {
         // same layout as gpu-split's solver header: "%s = <value>" per device,
-        // comma+space separated, 14-wide right-aligned values (up to 99 TB)
-        std::string blines = "          budgets:";
-        for (size_t g = 0; g < budgets.size(); ++g) {
-            char b[64];
-            snprintf(b, sizeof b, "%s%s = %14llu",
-                     (g ? ", " : " "), names[g].c_str(), (unsigned long long)budgets[g]);
-            blines += b;
-        }
-        LLAMA_LOG_PLANNING("%s\n", blines.c_str());
+        // comma+space separated, 14-wide right-aligned values (up to 99 TB).
+        // Two rows: the budgets each candidate is checked against, and the
+        // reserves kept back from each device (total x keep_free [+ margin]).
+        auto row = [&](const char * label, const std::vector<uint64_t> & vals) {
+            char prefix[24];
+            snprintf(prefix, sizeof prefix, "          %-8s", label);
+            std::string line = prefix;
+            for (size_t g = 0; g < vals.size(); ++g) {
+                char b[64];
+                snprintf(b, sizeof b, "%s%s = %14llu",
+                         (g ? ", " : " "), names[g].c_str(), (unsigned long long)vals[g]);
+                line += b;
+            }
+            LLAMA_LOG_PLANNING("%s\n", line.c_str());
+        };
+        row("budget:", budgets);
+        row("reserve:", reserves);
     }
     uint32_t low = 0, high = n_max;   // bisection over the whole range
     while (low < high) {
@@ -1070,6 +1079,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
                        "budget = free - kernels - reserve\n",
                        keep_free, (params->margins ? " + margin" : ""));
     std::vector<uint64_t> budgets(nd_gpus);
+    std::vector<uint64_t> reserves(nd_gpus);   // solver header: per-GPU reserve kept back
     std::vector<std::string> names;
     int64_t total_budget = 0, total_weights = 0;
     uint64_t ssm_per_row_total = 0, cell_size_total = 0;
@@ -1089,6 +1099,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
             int64_t budget = free - kernels - reserve;
 
             budgets[gi] = budget > 0 ? (uint64_t)budget : 0;  // negative = overcommitted GPU
+            reserves[gi] = (uint64_t)reserve;   // what was kept back from this device's total
             names.push_back(ggml_backend_dev_name(dev));
             total_budget  += budget;
             total_weights += (int64_t)d_weights[gi];
@@ -1166,7 +1177,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
     }
 
     const uint64_t last_gpu_extra = (uint64_t)gguf.norm_bytes + (uint64_t)gguf.output_bytes;
-    const uint32_t n_blocks = kvfit_solve(n_max, layer_costs, budgets, names, last_gpu_extra,
+    const uint32_t n_blocks = kvfit_solve(n_max, layer_costs, budgets, reserves, names, last_gpu_extra,
                                           mask_bpc_main, mask_bpc_mtp, main_ctx_dev, mtp_ctx_dev);
     if (n_blocks == 0) {
         LLAMA_LOG_ERROR("kvfit: solver found no placement — even the perfect split cannot "

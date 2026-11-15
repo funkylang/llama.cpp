@@ -4,4 +4,4 @@
 // updated on every fork commit with the ACTUAL current time at update (strict ordering);
 // printed as the first startup message of llama-server so the running build can be identified
 
-static const char * FORK_VERSION = "2026-11-15 18:45:11 kvfit: fix measurement MTP decode + pool-dependent compute buffers in solver";
+static const char * FORK_VERSION = "2026-11-15 19:00:15 kvfit: reserve row in solver header (gpu-split parity)";
