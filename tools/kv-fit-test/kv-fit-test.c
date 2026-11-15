@@ -36,7 +36,7 @@ static void print_free_vram(const struct llama_model * model, int ndev, const ch
         ggml_backend_dev_t dev = llama_model_get_device(model, i);
         size_t free_mem = 0, total_mem = 0;
         ggml_backend_dev_memory(dev, &free_mem, &total_mem);
-        fprintf(stderr, "  %d    %-12s total=%zu     free=%zu\n", i,
+        fprintf(stderr, "  %d    %-12s total=%14zu free=%14zu\n", i,
                 ggml_backend_dev_name(dev), total_mem, free_mem);
     }
 }

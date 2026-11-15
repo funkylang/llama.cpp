@@ -989,7 +989,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
         if (!dev || !scan_raw[i].ok) continue;
         const auto t = ggml_backend_dev_type(dev);
         if (t == GGML_BACKEND_DEVICE_TYPE_CPU) continue;   // GPU tool: never show CPU
-        LLAMA_LOG_PLANNING("        %-4zu %-6s total=%-15llu free=%-15llu %s\n",
+        LLAMA_LOG_PLANNING("        %-4zu %-6s total=%14llu free=%14llu  %s\n",
                            i, kvfit_dev_type_str(t),
                            (unsigned long long)scan_raw[i].total_bytes,
                            (unsigned long long)scan_raw[i].free_bytes,
