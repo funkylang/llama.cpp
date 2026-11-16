@@ -138,6 +138,8 @@ static void llama_kv_leak_trace_graph(
     int n_fa = 0;
     uint64_t max_kv_dim = 0;
     uint64_t max_mask   = 0;
+    uint64_t mask_bytes_total = 0;
+    int      n_masks   = 0;
 
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
         const ggml_tensor * node = ggml_graph_node(gf, i);
@@ -149,6 +151,8 @@ static void llama_kv_leak_trace_graph(
 
         if (strcmp(node->name, "attn_inp_kq_mask") == 0) {
             max_mask = std::max<uint64_t>(max_mask, (uint64_t) node->ne[0]);
+            mask_bytes_total += (uint64_t) ggml_nbytes(node);
+            n_masks++;
         }
     }
 
@@ -161,8 +165,10 @@ static void llama_kv_leak_trace_graph(
     }
 
     fprintf(stderr,
-            "[KV-LEAK] %s: n_tokens=%u n_ctx_train=%u fa_nodes=%d max_kv_dim=%" PRIu64 " mask_n_kv=%" PRIu64 "\n",
-            tag, n_tokens, n_ctx_train, n_fa, max_kv_dim, max_mask);
+            "[KV-LEAK] %s: n_tokens=%u n_ctx_train=%u fa_nodes=%d max_kv_dim=%" PRIu64 " mask_n_kv=%" PRIu64
+            " kq_masks=%d kq_mask_bytes=%" PRIu64 "\n",
+            tag, n_tokens, n_ctx_train, n_fa, max_kv_dim, max_mask,
+            n_masks, mask_bytes_total);
 
     if (max_kv_dim > n_ctx_train || max_mask > n_ctx_train) {
         fprintf(stderr,
@@ -2938,7 +2944,9 @@ ggml_cgraph * llama_context::graph_reserve(
     auto * gf = model.build_graph(gparams);
 
     // [KV-LEAK] trace the KV dimensions of the reservation graph (see llama_kv_leak_trace_graph)
-    llama_kv_leak_trace_graph("RESERVE", gf, ubatch.n_tokens, model.hparams.n_ctx_train, nullptr);
+    llama_kv_leak_trace_graph(
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "RESERVE-MTP" : "RESERVE",
+            gf, ubatch.n_tokens, model.hparams.n_ctx_train, nullptr);
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
