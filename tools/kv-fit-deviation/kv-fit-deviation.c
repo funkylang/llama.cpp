@@ -332,9 +332,9 @@ static int run_single_test(const char * path,
     print_used("after main ctx (+KV pool +SSM state)", (int)ggml_backend_dev_count(), bf, f, prev);
     memcpy(prev, f, sizeof(f));
 
-    // MTP draft context when the model has a nextn block (fllama shape)
+    // MTP draft context when the model has a nextn block AND MTP is enabled
     struct llama_context * ctx_mtp = NULL;
-    if (llama_model_n_layer_nextn(model) > 0) {
+    if (llama_model_n_layer_nextn(model) > 0 && mp_base->load_mtp) {
         struct llama_context_params cm = cp;
         cm.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
         cm.n_rs_seq  = 0;
@@ -393,6 +393,7 @@ int main(int argc, char ** argv) {
     // realistic; these apply identically to all 8 runs.
     enum ggml_type type_k = GGML_TYPE_F16, type_v = GGML_TYPE_F16;
     bool flash_attn = true;
+    bool use_mtp = true;
     uint32_t ubatch_size = 512;
     int parallel_arg = -1, checkpoints_arg = -1;
 
@@ -406,6 +407,7 @@ int main(int argc, char ** argv) {
                 "  --parallel P            parallel streams (plans 9 SSM rows each)\n"
                 "  --checkpoints N         SSM state rows, single stream           [1]\n"
                 "  --flash-attn / --no-flash-attn\n"
+                "  --no-mtp                don't load nextn weights / MTP context\n"
                 "  --cache-type-k T        KV cache type for K    [f16]\n"
                 "  --cache-type-v T        KV cache type for V    [f16]\n"
                 "  --ubatch-size N         physical ubatch size     [512]\n", argv[0]);
@@ -419,6 +421,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(a, "--checkpoints"))  checkpoints_arg = atoi(argv[i]);
         else if (!strcmp(a, "--flash-attn"))   flash_attn      = true;
         else if (!strcmp(a, "--no-flash-attn"))flash_attn      = false;
+        else if (!strcmp(a, "--no-mtp"))       use_mtp         = false;
         else if (!strcmp(a, "--cache-type-k")) { type_k = !strcmp(argv[i],"f16")?GGML_TYPE_F16: !strcmp(argv[i],"q8_0")?GGML_TYPE_Q8_0:GGML_TYPE_F16; }
         else if (!strcmp(a, "--cache-type-v")) { type_v = !strcmp(argv[i],"f16")?GGML_TYPE_F16: !strcmp(argv[i],"q8_0")?GGML_TYPE_Q8_0:GGML_TYPE_F16; }
         else if (!strcmp(a, "--ubatch-size"))  ubatch_size     = (uint32_t)atoi(argv[i]);
@@ -431,7 +434,7 @@ int main(int argc, char ** argv) {
     llama_backend_init();
 
     struct llama_model_params mp = llama_model_default_params();
-    mp.load_mtp = true;   // load nextn weights so the MTP context can exist
+    mp.load_mtp = use_mtp;   // load nextn weights so the MTP context can exist
 
     struct llama_context_params cp = llama_context_default_params();
     cp.kv_unified  = true;
