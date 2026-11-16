@@ -36,12 +36,48 @@ const char * ggml_backend_buft_name(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name(buft);
 }
 
+// Env-gated allocation tracer (SILENT by default; zero overhead unless enabled).
+// Purpose: surface pool-proportional GPU buffer allocations to debug the kv-fit
+// cost model undercharge on rocky2. Set GGML_BUF_TRACE=1 to enable, optionally
+// GGML_BUF_TRACE_MIN_MB=<n> (default 16) to skip small allocations. Every
+// allocation through this dispatcher is indexed in order; only those >= min are
+// printed (raw bytes, verbatim — analysis happens outside the library).
+static bool      ggml_buf_trace_ready    = false;
+static bool      ggml_buf_trace_enabled  = false;
+static size_t    ggml_buf_trace_min_bytes = 0;
+static uint64_t  ggml_buf_trace_count    = 0;
+
+static void ggml_backend_buft_alloc_trace(const char * buft_name, size_t size) {
+    if (!ggml_buf_trace_ready) {
+        const char * on = getenv("GGML_BUF_TRACE");
+        ggml_buf_trace_enabled = (on != NULL && on[0] != '\0' && strcmp(on, "0") != 0);
+        double min_mb = 16.0;
+        const char * min_str = getenv("GGML_BUF_TRACE_MIN_MB");
+        if (min_str != NULL) {
+            min_mb = atof(min_str);
+        }
+        ggml_buf_trace_min_bytes = (size_t)(min_mb * 1024.0 * 1024.0);
+        ggml_buf_trace_ready = true;
+    }
+    if (!ggml_buf_trace_enabled) {
+        return;  // fast path when disabled
+    }
+    ++ggml_buf_trace_count;
+    if (size < ggml_buf_trace_min_bytes) {
+        return;
+    }
+    fprintf(stderr, "[BUF-TRACE] %s: alloc #%llu  %zu bytes (%.2f MiB)\n",
+            buft_name, (unsigned long long)ggml_buf_trace_count, size, size / 1024.0 / 1024.0);
+    fflush(stderr);
+}
+
 ggml_backend_buffer_t ggml_backend_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     GGML_ASSERT(buft);
     if (size == 0) {
         // return a dummy buffer for zero-sized allocations
         return ggml_backend_buffer_init(buft, {}, NULL, 0);
     }
+    ggml_backend_buft_alloc_trace(ggml_backend_buft_name(buft), size);
     return buft->iface.alloc_buffer(buft, size);
 }
 

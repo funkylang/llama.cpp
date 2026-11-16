@@ -4,4 +4,4 @@
 // updated on every fork commit with the ACTUAL current time at update (strict ordering);
 // printed as the first startup message of llama-server so the running build can be identified
 
-static const char * FORK_VERSION = "2026-11-16 09:36:21 KV-LEAK tracer: per-context kq_mask byte sizes (FA workspace hunt)";
+static const char * FORK_VERSION = "2026-11-16 11:59:24 BUF-TRACE: env-gated backend buffer allocation tracer (kv-fit cost-model debug)";
