@@ -439,13 +439,24 @@ int main(int argc, char ** argv) {
     struct llama_context_params cp = llama_context_default_params();
     cp.kv_unified  = true;
     cp.n_ctx       = 0;    // natural context; pool extends the cache, never n_ctx
-    cp.n_batch     = 2048;
+    cp.n_batch     = ubatch_size > 2048 ? ubatch_size : 2048;   // only needs to cover n_ubatch
     cp.n_ubatch    = ubatch_size;
     cp.type_k      = type_k;
     cp.type_v      = type_v;
     cp.flash_attn_type = flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
     if (parallel_arg >= 0) { cp.n_seq_max = (uint32_t)parallel_arg; cp.n_rs_seq = 8; }
     else                   { cp.n_seq_max = 1; cp.n_rs_seq = (checkpoints_arg >= 0) ? (uint32_t)checkpoints_arg - 1 : 0; }
+
+    // Print the EFFECTIVE parameters every run uses, so the log is
+    // self-describing instead of requiring the reader to trust the defaults.
+    {
+        const char * fa = cp.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED   ? "on" :
+                          cp.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED  ? "off" : "auto";
+        fprintf(stderr, "\nkv-fit-deviation: model=%s\n", g_path);
+        fprintf(stderr, "  effective params (all 12 runs): kv_unified=on n_ctx=natural n_batch=%u n_ubatch=%u seq_max=%u rs_seq=%u flash_attn=%s cache_k=%s cache_v=%s mtp=%s\n",
+                cp.n_batch, cp.n_ubatch, cp.n_seq_max, cp.n_rs_seq, fa,
+                ggml_type_name(type_k), ggml_type_name(type_v), use_mtp ? "on" : "off");
+    }
 
     // The 8 scenarios: 2 pinned splits x 4 pools (+32768 steps). bounds[g] =
     // first layer on device g (loader rule: layer il -> last dev whose bound
