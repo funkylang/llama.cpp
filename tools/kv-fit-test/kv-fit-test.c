@@ -265,7 +265,12 @@ int main(int argc, char ** argv) {
     // Logging is suppressed for that load so loader chatter stays out of the
     // info block.
     {
+        // metadata-only: the layer table reads GGUF tensor info + hparams, never
+        // tensor data. no_alloc keeps VRAM untouched (a full load would burn it).
         struct llama_model_params mp_info = llama_model_default_params();
+        mp_info.no_alloc  = true;
+        mp_info.load_mode = LLAMA_LOAD_MODE_NONE;
+        mp_info.load_mtp  = mparams.load_mtp;   // deployment shape; avoids "unused tensor" noise
         llama_log_set(log_quiet, NULL);
         struct llama_model * m_info = llama_model_load_from_file(g_path, mp_info);
         llama_log_set(log_callback, NULL);   // restore for the real run below
