@@ -723,6 +723,26 @@ static int kvfit_warmup_decode(llama_context * ctx, const std::vector<int32_t> &
 // Results come back through the out parameters; all model/contexts are freed
 // before returning (the measurement is self-contained).
 
+// Read llama_get_memory_breakdown(ctx) and return its .compute (temporary
+// compute-buffer bytes) per device, indexed by backend device order. This is
+// the graph-simulator's own account of the pool-sized compute buffers — the
+// ground truth our old kq_mask formula had to guess at.
+static std::vector<uint64_t> kvfit_compute_by_device(const llama_context * ctx) {
+    const size_t ndevs = ggml_backend_dev_count();
+    std::vector<uint64_t> compute(ndevs, 0);
+    for (auto & [buft, data] : llama_get_memory_breakdown(ctx)) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (!dev) continue;
+        for (size_t i = 0; i < ndevs; ++i) {
+            if (ggml_backend_dev_get(i) == dev) {
+                compute[i] += data.compute;
+                break;
+            }
+        }
+    }
+    return compute;
+}
+
 struct kvfit_measure_result {
     bool ok = false;
     std::vector<kvfit_dev_snapshot> scan_measure;  // after load + warmup (+ MTP)
@@ -730,6 +750,11 @@ struct kvfit_measure_result {
     std::vector<kvfit_rate_info> rates;             // KV/SSM/MTP rates per device
     bool mtp_measured = false;                      // nextn KV pool is in the measured delta
     uint32_t n_ctx_measure = 0;                     // measurement pool size (decomposition input)
+    // Measured compute-buffer bytes-per-pool-cell rate per device, from
+    // llama_get_memory_breakdown() at two pool sizes. Replaces the old kq_mask
+    // guess — the rate is context-size-independent, so it holds for any pool.
+    std::vector<uint64_t> compute_rate_main;        // main-context rate (per device)
+    std::vector<uint64_t> compute_rate_mtp;         // MTP-context rate (per device)
 };
 
 static bool kvfit_measure(const char * path,
@@ -817,6 +842,53 @@ static bool kvfit_measure(const char * path,
         LLAMA_LOG_ERROR("kvfit: measurement context init failed\n");
         llama_model_free(model);
         return false;
+    }
+
+    // ---- measure the pool-dependent compute-buffer RATE (per device) -----------
+    // The compute buffers grow linearly with the pool (verified on rocky2); the
+    // rate is context-size-independent. Read .compute at this pool and at 2x via
+    // llama_get_memory_breakdown, free the second, store the rate for the solver.
+    {
+        const size_t ndevs = ggml_backend_dev_count();
+        const uint32_t lo_cells  = n_ctx_measure;
+        const uint32_t hi_cells  = 2u * lo_cells;
+        std::vector<uint64_t> compute_lo = kvfit_compute_by_device(ctx0);   // main ctx at lo
+        std::vector<uint64_t> compute_hi(ndevs, 0);
+
+        llama_context_params cp_hi = cp;
+        cp_hi.n_ctx = hi_cells;
+        if (llama_context * ctx_hi = llama_init_from_model(model, cp_hi)) {
+            compute_hi = kvfit_compute_by_device(ctx_hi);   // main ctx at hi
+            llama_free(ctx_hi);
+        } else {
+            LLAMA_LOG_WARN("kvfit: hi-pool context for compute-rate init failed — falling back to 0 rate\n");
+        }
+
+        r.compute_rate_main.assign(ndevs, 0);
+        for (size_t i = 0; i < ndevs && i < compute_lo.size(); ++i) {
+            const uint64_t d_bytes = (compute_hi[i] > compute_lo[i]) ? compute_hi[i] - compute_lo[i] : 0;
+            r.compute_rate_main[i] = (hi_cells > lo_cells) ? d_bytes / (hi_cells - lo_cells) : 0;
+        }
+        // The MTP draft context runs the nextn layers only, so its compute buffers
+        // are <= the main context's. Charging the main rate to it is conservative
+        // (never undercharges VRAM — the safe direction for a fit).
+        r.compute_rate_mtp = r.compute_rate_main;
+
+        LLAMA_LOG_PLANNING("      compute-buffer rate (from llama_get_memory_breakdown, pools %u -> %u):\n",
+                           lo_cells, hi_cells);
+        {
+            size_t gi = 0;
+            for (size_t i = 0; i < ndevs && gi < r.compute_rate_main.size(); ++gi) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (!dev) continue;
+                const auto t = ggml_backend_dev_type(dev);
+                if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
+                LLAMA_LOG_PLANNING("        %s: main=%llu B/cell  mtp=%llu B/cell\n",
+                                   ggml_backend_dev_name(dev),
+                                   (unsigned long long)r.compute_rate_main[gi],
+                                   (unsigned long long)r.compute_rate_mtp[gi]);
+            }
+        }
     }
 
     kvfit_warmup_decode(ctx0, prompt_tokens);
@@ -1201,16 +1273,22 @@ static kvfit_plan kvfit_plan_compute(const char * path,
                                                  (ggml_type)cparams->type_k, (ggml_type)cparams->type_v,
                                                  cparams->flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED, state_rows);
     plan.n_layer_all = model_peek->hparams.n_layer_all;
-    const uint32_t n_ctx_eff = (cparams->n_ctx > 0) ? (uint32_t)cparams->n_ctx
-                                                    : (uint32_t)model_peek->hparams.n_ctx_train;
     llama_model_free(model_peek);
 
-    // ---- compute buffers: pool-sized kq_mask graph inputs ------------------------
-    // Measured at probe width (16384 cells) inside kernels, but the production
-    // context reserves them at the PLANNED pool width — charge the difference
-    // per candidate. Device membership comes from the measurement placement.
-    const uint64_t mask_bpc_main = kvfit_mask_bpc_per_ctx(cparams, n_ctx_eff);
-    const uint64_t mask_bpc_mtp  = kvfit_mask_bpc_per_ctx(cparams, n_ctx_eff);
+    // ---- compute buffers: pool-sized graph intermediates (FA workspace) ---------
+    // The production context reserves them at the PLANNED pool width, so charge the
+    // per-candidate growth here. The rate is the graph-simulator's own .compute
+    // slope (llama_get_memory_breakdown); uniform by architecture, so take the
+    // worst GPU as the scalar. Device membership comes from the measurement.
+    uint64_t mask_bpc_main = 0, mask_bpc_mtp = 0;
+    for (size_t i = 0; i < meas.compute_rate_main.size(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev) continue;
+        const auto t = ggml_backend_dev_type(dev);
+        if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
+        mask_bpc_main = std::max(mask_bpc_main, meas.compute_rate_main[i]);
+        mask_bpc_mtp  = std::max(mask_bpc_mtp,  meas.compute_rate_mtp[i]);
+    }
     std::vector<bool> main_ctx_dev(nd_gpus, false), mtp_ctx_dev(nd_gpus, false);
     {
         size_t gi = 0;
