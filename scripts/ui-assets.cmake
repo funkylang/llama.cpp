@@ -134,10 +134,14 @@ function(ui_validate_assets files in_dir)
         foreach(m ${missing})
             string(APPEND missing_list "    ${m}\n")
         endforeach()
-        message(FATAL_ERROR
+        # Web UI assets are best-effort: an incomplete or stale asset bundle from
+        # the HF bucket (or a local build) must never block compilation of the
+        # core library and tools. Degrade to a warning so the build proceeds with
+        # whatever assets are present; llama-server then serves a partial/empty UI.
+        message(WARNING
             "UI: current asset files:\n${listing}"
             "UI: missing required asset(s):\n${missing_list}"
-            "UI: hint: try cleaning your build directory: ${in_dir}")
+            "UI: continuing anyway - embedded UI may be incomplete.")
     endif()
 endfunction()
 
