@@ -22,6 +22,7 @@
 // planning numbers must match (that tool is the verified reference).
 
 #include "llama.h"
+#include "model-info.h"
 #include "../../src/llama-ext.h"
 #include "../../src/warmup-text.h"
 
@@ -143,6 +144,10 @@ static void log_callback(enum ggml_log_level level, const char * text, void * us
     }
 }
 
+static void log_quiet(enum ggml_log_level level, const char * text, void * ud) {
+    (void)level; (void)text; (void)ud;
+}
+
 static int kv_type_from_str(const char * s) {
     if (!strcmp(s, "f16"))  return GGML_TYPE_F16;
     if (!strcmp(s, "bf16")) return GGML_TYPE_BF16;
@@ -254,6 +259,36 @@ int main(int argc, char ** argv) {
 
     // ---- 1+2: plan the placement ---------------------------------------------
     fprintf(stderr, "\n== kv-fit clone: planning %s ==\n", g_path);
+
+    // model info (printed ONCE): header block + layer table. The load is
+    // temporary — it exists only to hand the hparams to the shared printer.
+    // Logging is suppressed for that load so loader chatter stays out of the
+    // info block.
+    {
+        struct llama_model_params mp_info = llama_model_default_params();
+        llama_log_set(log_quiet, NULL);
+        struct llama_model * m_info = llama_model_load_from_file(g_path, mp_info);
+        llama_log_set(log_callback, NULL);   // restore for the real run below
+
+        if (!m_info) {
+            fprintf(stderr, "error: model load for info failed\n");
+            return 1;
+        }
+        mi_model_info_t info = mi_model_info_new(g_path, m_info);
+        if (info) {
+            char kf[16];
+            snprintf(kf, sizeof(kf), "%.2f", keep_free);
+            mi_print_header(stderr, info, type_k, type_v, kf);
+            mi_print_layer_table(stderr, info, type_k, type_v, flash_attn);
+            mi_model_info_free(info);
+        } else {
+            fprintf(stderr, "error: could not open %s for the info table\n", g_path);
+            llama_model_free(m_info);
+            return 1;
+        }
+        llama_model_free(m_info);
+    }
+
     if (!llama_kv_fit_auto_split(g_path, &mparams, &cparams, layer_bounds, params, 0)) {
         fprintf(stderr, "error: no viable plan — aborting (see reports above)\n");
         return 1;

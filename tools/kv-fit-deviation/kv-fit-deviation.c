@@ -25,6 +25,7 @@
 // vary.
 
 #include "llama.h"
+#include "model-info.h"
 #include "../../src/llama-ext.h"
 #include "../../src/warmup-text.h"
 
@@ -388,6 +389,10 @@ static void log_cb(enum ggml_log_level level, const char * text, void * ud) {
     if (level >= GGML_LOG_LEVEL_WARN) fputs(text, stderr);
 }
 
+static void log_quiet(enum ggml_log_level level, const char * text, void * ud) {
+    (void)level; (void)text; (void)ud;
+}
+
 int main(int argc, char ** argv) {
     // deployment shape — mirror the production params so the measurement is
     // realistic; these apply identically to all 8 runs.
@@ -453,9 +458,44 @@ int main(int argc, char ** argv) {
         const char * fa = cp.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED   ? "on" :
                           cp.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED  ? "off" : "auto";
         fprintf(stderr, "\nkv-fit-deviation: model=%s\n", g_path);
-        fprintf(stderr, "  effective params (all 12 runs): kv_unified=on n_ctx=natural n_batch=%u n_ubatch=%u seq_max=%u rs_seq=%u flash_attn=%s cache_k=%s cache_v=%s mtp=%s\n",
-                cp.n_batch, cp.n_ubatch, cp.n_seq_max, cp.n_rs_seq, fa,
-                ggml_type_name(type_k), ggml_type_name(type_v), use_mtp ? "on" : "off");
+        fprintf(stderr, "  effective params (all 12 runs):\n");
+        fprintf(stderr, "    kv_unified = on\n");
+        fprintf(stderr, "    n_ctx      = natural\n");
+        fprintf(stderr, "    n_batch    = %u\n", cp.n_batch);
+        fprintf(stderr, "    n_ubatch   = %u\n", cp.n_ubatch);
+        fprintf(stderr, "    seq_max    = %u\n", cp.n_seq_max);
+        fprintf(stderr, "    rs_seq     = %u\n", cp.n_rs_seq);
+        fprintf(stderr, "    flash_attn = %s\n", fa);
+        fprintf(stderr, "    cache_k    = %s\n", ggml_type_name(type_k));
+        fprintf(stderr, "    cache_v    = %s\n", ggml_type_name(type_v));
+        fprintf(stderr, "    mtp        = %s\n", use_mtp ? "on" : "off");
+    }
+
+    // model info (printed ONCE): header block + layer table. The load is
+    // temporary — it exists only to hand the hparams to the shared printer.
+    // Logging is suppressed for that load so loader chatter stays out of the
+    // info block.
+    {
+        struct llama_model_params mp_info = llama_model_default_params();
+        llama_log_set(log_quiet, NULL);
+        struct llama_model * m_info = llama_model_load_from_file(g_path, mp_info);
+        llama_log_set(log_cb, NULL);         // restore for the 12 runs below
+
+        if (!m_info) {
+            fprintf(stderr, "error: model load for info failed\n");
+            return 1;
+        }
+        mi_model_info_t info = mi_model_info_new(g_path, m_info);
+        if (info) {
+            mi_print_header(stderr, info, type_k, type_v, NULL);
+            mi_print_layer_table(stderr, info, type_k, type_v, flash_attn);
+            mi_model_info_free(info);
+        } else {
+            fprintf(stderr, "error: could not open %s for the info table\n", g_path);
+            llama_model_free(m_info);
+            return 1;
+        }
+        llama_model_free(m_info);
     }
 
     // The 8 scenarios: 2 pinned splits x 4 pools (+32768 steps). bounds[g] =
