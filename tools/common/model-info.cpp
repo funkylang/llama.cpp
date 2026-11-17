@@ -162,7 +162,7 @@ extern "C" mi_model_info_t mi_model_info_new(const char * path, const struct lla
 
 extern "C" int mi_print_header(FILE * out, mi_model_info_t info,
                                enum ggml_type type_k, enum ggml_type type_v,
-                               const char * keep_free) {
+                               const struct mi_header_opts * opts) {
     if (!info || !out) return 0;
     const auto & hp = info->model->hparams;
     const uint32_t n_layer_all   = info->n_layer_all;
@@ -216,10 +216,15 @@ extern "C" int mi_print_header(FILE * out, mi_model_info_t info,
     fprintf(out, "  SWA:        %s\n", has_swa ? "yes" : "no");
     fprintf(out, "  SSM:        %s\n", has_ssm ? "yes" : "no");
     fprintf(out, "  MTP:        %s\n", has_mtp ? "yes" : "no");
+    // deployment params (whatever the tool provides; NULL = omit the line):
     fprintf(out, "  kv_type_k:  %s\n", ggml_type_name(type_k));
     fprintf(out, "  kv_type_v:  %s\n", ggml_type_name(type_v));
-    if (keep_free) {
-        fprintf(out, "  keep_free:  %s\n", keep_free);
+    if (opts) {
+        if (opts->keep_free) fprintf(out, "  keep_free:  %s\n", opts->keep_free);
+        if (opts->n_batch)   fprintf(out, "  n_batch:    %s\n", opts->n_batch);
+        if (opts->n_ubatch)  fprintf(out, "  n_ubatch:   %s\n", opts->n_ubatch);
+        if (opts->seq_max)   fprintf(out, "  seq_max:    %s\n", opts->seq_max);
+        if (opts->rs_seq)    fprintf(out, "  rs_seq:     %s\n", opts->rs_seq);
     }
 
     // the token embedding ALWAYS stays on the CPU (llama-model.cpp: "there is

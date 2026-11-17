@@ -1330,7 +1330,8 @@ int main(int argc, char ** argv) {
     {
         char kf[16];
         snprintf(kf, sizeof(kf), "%.2f", keep_free);
-        mi_print_header(stderr, info, type_k, type_v, kf);
+        struct mi_header_opts opts = { kf, NULL, NULL, NULL, NULL };
+        mi_print_header(stderr, info, type_k, type_v, &opts);
     }
 
     // device scan prints AFTER the model header block (Michael, 2026-11-12);

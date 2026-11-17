@@ -452,29 +452,11 @@ int main(int argc, char ** argv) {
     if (parallel_arg >= 0) { cp.n_seq_max = (uint32_t)parallel_arg; cp.n_rs_seq = 8; }
     else                   { cp.n_seq_max = 1; cp.n_rs_seq = (checkpoints_arg >= 0) ? (uint32_t)checkpoints_arg - 1 : 0; }
 
-    // Print the EFFECTIVE parameters every run uses, so the log is
-    // self-describing instead of requiring the reader to trust the defaults.
-    {
-        const char * fa = cp.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED   ? "on" :
-                          cp.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED  ? "off" : "auto";
-        fprintf(stderr, "\nkv-fit-deviation: model=%s\n", g_path);
-        fprintf(stderr, "  effective params (all 12 runs):\n");
-        fprintf(stderr, "    kv_unified = on\n");
-        fprintf(stderr, "    n_ctx      = natural\n");
-        fprintf(stderr, "    n_batch    = %u\n", cp.n_batch);
-        fprintf(stderr, "    n_ubatch   = %u\n", cp.n_ubatch);
-        fprintf(stderr, "    seq_max    = %u\n", cp.n_seq_max);
-        fprintf(stderr, "    rs_seq     = %u\n", cp.n_rs_seq);
-        fprintf(stderr, "    flash_attn = %s\n", fa);
-        fprintf(stderr, "    cache_k    = %s\n", ggml_type_name(type_k));
-        fprintf(stderr, "    cache_v    = %s\n", ggml_type_name(type_v));
-        fprintf(stderr, "    mtp        = %s\n", use_mtp ? "on" : "off");
-    }
-
-    // model info (printed ONCE): header block + layer table. The load is
-    // temporary — it exists only to hand the hparams to the shared printer.
-    // Logging is suppressed for that load so loader chatter stays out of the
-    // info block.
+    // model info (printed ONCE): the unified header + layer table. The header
+    // carries the effective params every run uses, so the log is self-
+    // describing instead of requiring the reader to trust the defaults. The
+    // load is temporary — it exists only to hand the hparams to the shared
+    // printer; logging is suppressed for it so loader chatter stays out.
     {
         struct llama_model_params mp_info = llama_model_default_params();
         llama_log_set(log_quiet, NULL);
@@ -487,7 +469,13 @@ int main(int argc, char ** argv) {
         }
         mi_model_info_t info = mi_model_info_new(g_path, m_info);
         if (info) {
-            mi_print_header(stderr, info, type_k, type_v, NULL);
+            char nb[24], nu[24], sm[24], rs[24];
+            snprintf(nb, sizeof(nb), "%u", cp.n_batch);
+            snprintf(nu, sizeof(nu), "%u", cp.n_ubatch);
+            snprintf(sm, sizeof(sm), "%u", cp.n_seq_max);
+            snprintf(rs, sizeof(rs), "%u", cp.n_rs_seq);
+            struct mi_header_opts opts = { NULL, nb, nu, sm, rs };
+            mi_print_header(stderr, info, type_k, type_v, &opts);
             mi_print_layer_table(stderr, info, type_k, type_v, flash_attn);
             mi_model_info_free(info);
         } else {

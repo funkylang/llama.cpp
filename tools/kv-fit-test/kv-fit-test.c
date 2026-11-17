@@ -276,9 +276,14 @@ int main(int argc, char ** argv) {
         }
         mi_model_info_t info = mi_model_info_new(g_path, m_info);
         if (info) {
-            char kf[16];
+            char kf[24], nb[24], nu[24], sm[24], rs[24];
             snprintf(kf, sizeof(kf), "%.2f", keep_free);
-            mi_print_header(stderr, info, type_k, type_v, kf);
+            snprintf(nb, sizeof(nb), "%u", cparams.n_batch);
+            snprintf(nu, sizeof(nu), "%u", cparams.n_ubatch);
+            snprintf(sm, sizeof(sm), "%u", cparams.n_seq_max);
+            snprintf(rs, sizeof(rs), "%u", cparams.n_rs_seq);
+            struct mi_header_opts opts = { kf, nb, nu, sm, rs };
+            mi_print_header(stderr, info, type_k, type_v, &opts);
             mi_print_layer_table(stderr, info, type_k, type_v, flash_attn);
             mi_model_info_free(info);
         } else {
