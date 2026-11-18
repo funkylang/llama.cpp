@@ -677,6 +677,146 @@ static int kvfit_warmup_decode(llama_context * ctx, const std::vector<int32_t> &
 }
 
 // ============================================================================
+// Verification run: prove the plan works at runtime
+// ============================================================================
+// Load the model with the COMPUTED split and measure free VRAM at two pool
+// sizes: 16384 (probe) and the planned pool. This proves the placement fits
+// and shows the actual memory state. Both tests share ONE model load — only
+// n_ctx differs between them, so no second load is needed.
+
+static void kvfit_verify_plan(const char * path,
+                              const llama_model_params * mparams_base,
+                              const llama_context_params * cparams_base,
+                              bool measure_mtp,
+                              const std::vector<int> & first_layer,
+                              uint32_t n_cells_planned) {
+    // Build tensor_layer_bounds array from the plan's placement
+    const size_t nd = first_layer.size();
+    int32_t * bounds = new int32_t[nd];
+    for (size_t g = 0; g < nd; ++g) {
+        bounds[g] = first_layer[g];
+    }
+
+    // Model load with the COMPUTED split
+    llama_model_params mp = *mparams_base;
+    mp.n_gpu_layers  = -1;              // all layers on GPUs
+    mp.tensor_split  = nullptr;         // superseded by layer bounds
+    mp.tensor_layer_bounds = bounds;    // the plan's placement
+    mp.load_mtp      = measure_mtp;
+
+    LLAMA_LOG_PLANNING("\n      verification: loading with computed split (first_layer per GPU):\n");
+    for (size_t g = 0; g < nd; ++g) {
+        const int a = first_layer[g];
+        LLAMA_LOG_PLANNING("        GPU %zu: starts at layer %d\n", g, a);
+    }
+
+    llama_model * model = llama_model_load_from_file(path, mp);
+    if (!model) {
+        LLAMA_LOG_ERROR("kvfit_verify_plan: failed to load model with computed split\n");
+        delete[] bounds;
+        return;
+    }
+
+    // Hamlet warmup text (reuse the same prompt as the measurement)
+    std::vector<int32_t> prompt_tokens(strlen(WARMUP_TEXT) + 8);
+    const int n_tok = llama_tokenize(
+            llama_model_get_vocab(model), WARMUP_TEXT, strlen(WARMUP_TEXT),
+            prompt_tokens.data(), (int)prompt_tokens.size(), true, false);
+    if (n_tok <= 0) {
+        LLAMA_LOG_ERROR("kvfit_verify_plan: warmup tokenization failed\n");
+        llama_model_free(model);
+        delete[] bounds;
+        return;
+    }
+    prompt_tokens.resize(n_tok);
+
+    // Helper lambda to run one verification test at a given context size
+    auto run_verification_test = [&](const char * test_name, uint32_t n_ctx) {
+        LLAMA_LOG_PLANNING("\n      verification %s: context size = %u\n", test_name, n_ctx);
+
+        llama_context_params cp = *cparams_base;
+        cp.kv_unified = true;
+        cp.n_ctx      = n_ctx;
+        cp.n_kv_cache = 0;   // unified mode: pool follows n_ctx
+
+        llama_context * ctx = llama_init_from_model(model, cp);
+        if (!ctx) {
+            LLAMA_LOG_ERROR("kvfit_verify_plan: context init failed for %s\n", test_name);
+            return;
+        }
+
+        // MTP draft context when measuring it (same pattern as kvfit_measure)
+        llama_context * ctx_mtp = nullptr;
+        if (measure_mtp && llama_model_n_layer_nextn(model) > 0) {
+            llama_context_params cp_mtp = cp;
+            cp_mtp.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+            cp_mtp.n_rs_seq  = 0;
+            cp_mtp.ctx_other = ctx;
+            ctx_mtp = llama_init_from_model(model, cp_mtp);
+            if (!ctx_mtp) {
+                LLAMA_LOG_WARN("kvfit_verify_plan: MTP context init failed\n");
+            }
+        }
+
+        // Warmup decode to trigger all kernel allocations
+        const int decoded = kvfit_warmup_decode(ctx, prompt_tokens);
+        if (decoded == 0) {
+            LLAMA_LOG_ERROR("kvfit_verify_plan: warmup decode failed for %s\n", test_name);
+        }
+
+        // MTP draft decode when present
+        if (ctx_mtp && decoded > 0) {
+            const int32_t n_embd = llama_model_n_embd(model);
+            float * state = (float *)calloc((size_t)n_embd, sizeof(float));
+
+            struct llama_batch_ext * mb = llama_batch_ext_init(ctx_mtp);
+            const int32_t idx = llama_batch_ext_add_token(mb, 0, prompt_tokens.back());
+            const llama_pos pos = (llama_pos)prompt_tokens.size();
+            llama_batch_ext_set_pos(mb, idx, &pos);
+            struct llama_embd embd_state = { state, 1, (size_t)n_embd };
+            llama_batch_ext_set_embd_state(mb, idx, embd_state);
+            llama_batch_ext_set_output_logits(mb, idx, true);
+
+            const int rc = llama_process(ctx_mtp, LLAMA_PROCESS_TYPE_DECODE, mb);
+            llama_batch_ext_free(mb);
+            free(state);
+            if (rc != 0) {
+                LLAMA_LOG_ERROR("kvfit_verify_plan: MTP draft decode failed (%d)\n", rc);
+            }
+        }
+
+        // Show per-GPU free VRAM after everything is loaded + warmed up
+        std::vector<kvfit_dev_snapshot> snaps;
+        kvfit_read_all_devices(snaps);
+        LLAMA_LOG_PLANNING("        free VRAM after %s (post-warmup):\n", test_name);
+        for (size_t i = 0; i < snaps.size(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (!dev || !snaps[i].ok) continue;
+            const auto t = ggml_backend_dev_type(dev);
+            if (t == GGML_BACKEND_DEVICE_TYPE_CPU) continue;   // GPU tool: never show CPU
+            LLAMA_LOG_PLANNING("          %-4zu %-6s free=%14llu  %s\n",
+                               i, kvfit_dev_type_str(t),
+                               (unsigned long long)snaps[i].free_bytes,
+                               ggml_backend_dev_name(dev));
+        }
+
+        // Cleanup this test's contexts
+        if (ctx_mtp) llama_free(ctx_mtp);
+        llama_free(ctx);
+    };
+
+    // Test 1: at probe context size (16384) — matches the measurement baseline
+    run_verification_test("probe", 16384);
+
+    // Test 2: at the planned pool size — this is what will actually deploy
+    run_verification_test("planned", n_cells_planned);
+
+    // Cleanup
+    llama_model_free(model);
+    delete[] bounds;
+}
+
+// ============================================================================
 // Measurement run
 // ============================================================================
 // One REAL model load (llama_model's native free-VRAM auto-split — the exact
@@ -1327,6 +1467,11 @@ static kvfit_plan kvfit_plan_compute(const char * path,
         LLAMA_LOG_PLANNING("        %s: layers %d..%d%s\n", plan.names[g].c_str(), a, b - 1,
                            (a >= b) ? " (empty)" : "");
     }
+
+    // ---- Verification run: prove the plan works at runtime ---------------------
+    kvfit_verify_plan(path, mparams, cparams, measure_mtp, 
+                      plan.first_layer, n_cells);
+
     return plan;
 }
 
