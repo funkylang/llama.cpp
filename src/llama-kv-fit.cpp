@@ -1114,6 +1114,19 @@ static kvfit_plan kvfit_plan_compute(const char * path,
                               ? params->n_checkpoints
                               : n_seq_max * (1u + n_rs_seq);
 
+    // ---- per-device free VRAM after measurement ----------------------------------
+    LLAMA_LOG_PLANNING("\n      device free VRAM after measurement (post-Hamlet decode):\n");
+    for (size_t i = 0; i < scan_raw.size(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev || !scan_raw[i].ok) continue;
+        const auto t = ggml_backend_dev_type(dev);
+        if (t == GGML_BACKEND_DEVICE_TYPE_CPU) continue;   // GPU tool: never show CPU
+        LLAMA_LOG_PLANNING("        %-4zu %-6s free=%14llu  %s\n",
+                           i, kvfit_dev_type_str(t),
+                           (unsigned long long)meas.scan_measure[i].free_bytes,
+                           ggml_backend_dev_name(dev));
+    }
+
     // ---- per-device decomposition of the measured delta -------------------------
     LLAMA_LOG_PLANNING("\n      overhead decomposition: "
                        "kernels = delta - weights - probe-KV - SSM(state rows x bytes/row)\n");
@@ -1170,6 +1183,24 @@ static kvfit_plan kvfit_plan_compute(const char * path,
 
     // ---- budgets: what each GPU leaves for weights + KV -------------------------
     const double keep_free = 1.0 - params->vram_fraction;
+    
+    // Compute buf_bpc (compute-buffer bytes per cell) early so it's available
+    // for the upper limit calculation
+    std::vector<uint64_t> buf_bpc(nd_gpus, 0);
+    uint64_t buffers_total = 0;
+    {
+        size_t gi = 0;
+        for (size_t i = 0; i < scan_raw.size() && gi < nd_gpus; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (!dev || !scan_raw[i].ok) continue;
+            const auto t = ggml_backend_dev_type(dev);
+            if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
+            buf_bpc[gi] = (i < meas.compute_rate_main.size()) ? meas.compute_rate_main[i] : 0;
+            buffers_total += buf_bpc[gi];
+            ++gi;
+        }
+    }
+    
     LLAMA_LOG_PLANNING("\n      split budget: reserve = total x keep_free(%.2f)%s; "
                        "budget = free - kernels - reserve\n",
                        keep_free, (params->margins ? " + margin" : ""));
@@ -1199,7 +1230,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
             total_budget  += budget;
             total_weights += (int64_t)d_weights[gi];
             ssm_per_row_total += d_ssm_bpr[gi];
-            cell_size_total   += d_kv_bpc[gi] + d_mtp_bpc[gi];
+            cell_size_total   += d_kv_bpc[gi] + d_mtp_bpc[gi] + buf_bpc[gi];
 
             LLAMA_LOG_PLANNING("        %s: budget = free(%lld) - kernels(%lld) - "
                                "reserve(total(%lld) x keep_free(%.2f)%s) = %lld\n",
@@ -1247,24 +1278,8 @@ static kvfit_plan kvfit_plan_compute(const char * path,
     plan.n_layer_all = model_peek->hparams.n_layer_all;
     llama_model_free(model_peek);
 
-    // ---- compute buffers: per-GPU charge from the measurement ------------------
-    // The production context reserves them at the PLANNED pool width, so charge
-    // the per-candidate growth here. The rate is measured PER GPU from the
-    // hi-lo difference of llama_get_memory_breakdown (host bytes excluded);
-    // it is charged to EVERY GPU regardless of layer distribution — and the
-    // MTP draft context reuses these, adding no charge of its own.
-    std::vector<uint64_t> buf_bpc(nd_gpus, 0);
-    {
-        size_t gi = 0;
-        for (size_t i = 0; i < scan_raw.size() && gi < nd_gpus; ++i) {
-            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            if (!dev || !scan_raw[i].ok) continue;
-            const auto t = ggml_backend_dev_type(dev);
-            if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
-            buf_bpc[gi] = (i < meas.compute_rate_main.size()) ? meas.compute_rate_main[i] : 0;
-            ++gi;
-        }
-    }
+    // (buf_bpc computed earlier in the budgets section above)
+
 
     const uint64_t last_gpu_extra = (uint64_t)gguf.norm_bytes + (uint64_t)gguf.output_bytes;
     const uint32_t n_blocks = kvfit_solve(n_max, layer_costs, budgets, reserves, names, last_gpu_extra,
