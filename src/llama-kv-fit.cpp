@@ -727,14 +727,19 @@ static int kvfit_warmup_decode(llama_context * ctx, const std::vector<int32_t> &
 // compute-buffer bytes) per device, indexed by backend device order. This is
 // the graph-simulator's own account of the pool-sized compute buffers — the
 // ground truth our old kq_mask formula had to guess at.
-static std::vector<uint64_t> kvfit_compute_by_device(const llama_context * ctx) {
+static std::vector<uint64_t> kvfit_compute_by_device(const llama_context * ctx, const char * label) {
     const size_t ndevs = ggml_backend_dev_count();
     std::vector<uint64_t> compute(ndevs, 0);
+    fprintf(stderr, "  breakdown [%s] (from llama_get_memory_breakdown):\n", label);
     for (auto & [buft, data] : llama_get_memory_breakdown(ctx)) {
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
         if (!dev) continue;
         for (size_t i = 0; i < ndevs; ++i) {
             if (ggml_backend_dev_get(i) == dev) {
+                fprintf(stderr, "    buft_name='%s' dev=%s(idx=%zu)\n",
+                        ggml_backend_buft_name(buft), ggml_backend_dev_name(dev), i);
+                fprintf(stderr, "      compute=%llu B  context=%llu B\n",
+                        (unsigned long long)data.compute, (unsigned long long)data.context);
                 compute[i] += data.compute;
                 break;
             }
@@ -852,13 +857,13 @@ static bool kvfit_measure(const char * path,
         const size_t ndevs = ggml_backend_dev_count();
         const uint32_t lo_cells  = n_ctx_measure;
         const uint32_t hi_cells  = 2u * lo_cells;
-        std::vector<uint64_t> compute_lo = kvfit_compute_by_device(ctx0);   // main ctx at lo
+        std::vector<uint64_t> compute_lo = kvfit_compute_by_device(ctx0, "main ctx, lo pool");   // main ctx at lo
         std::vector<uint64_t> compute_hi(ndevs, 0);
 
         llama_context_params cp_hi = cp;
         cp_hi.n_ctx = hi_cells;
         if (llama_context * ctx_hi = llama_init_from_model(model, cp_hi)) {
-            compute_hi = kvfit_compute_by_device(ctx_hi);   // main ctx at hi
+            compute_hi = kvfit_compute_by_device(ctx_hi, "main ctx, hi pool");   // main ctx at hi
             llama_free(ctx_hi);
         } else {
             LLAMA_LOG_WARN("kvfit: hi-pool context for compute-rate init failed — falling back to 0 rate\n");
@@ -929,6 +934,7 @@ static bool kvfit_measure(const char * path,
                 LLAMA_LOG_ERROR("kvfit: MTP draft decode failed (%d)\n", rc);
             } else {
                 r.mtp_measured = true;
+                kvfit_compute_by_device(ctx_mtp, "mtp ctx");   // MTP draft context breakdown
             }
         } else {
             LLAMA_LOG_WARN("kvfit: MTP draft context init failed — nextn KV pool NOT in the measured delta\n");
