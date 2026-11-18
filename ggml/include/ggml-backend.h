@@ -37,6 +37,13 @@ extern "C" {
     GGML_API const char *          ggml_backend_buft_name            (ggml_backend_buffer_type_t buft);
     GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer    (ggml_backend_buffer_type_t buft, size_t size);
     GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer_n  (ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
+
+    // [FORK] allocation callback for memory planning tools: when set, called with
+    // the buffer type name (e.g. "ROCm0") and size for every buffer allocation;
+    // the callback matches names against ggml_backend_dev_name and owns its
+    // bookkeeping. NULL = off.
+    typedef void (*ggml_backend_allocation_callback_t)(const char * buft_name, size_t bytes);
+    GGML_API void ggml_backend_set_allocation_callback(ggml_backend_allocation_callback_t callback);
     GGML_API size_t                ggml_backend_buft_get_alignment   (ggml_backend_buffer_type_t buft);
     GGML_API size_t                ggml_backend_buft_get_max_size    (ggml_backend_buffer_type_t buft);
     GGML_API size_t                ggml_backend_buft_get_alloc_size  (ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);

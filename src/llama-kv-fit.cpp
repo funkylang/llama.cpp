@@ -184,6 +184,67 @@ static void kvfit_print_provisional_split(const llama_model * model) {
 }
 
 // ============================================================================
+// Pool-cost measurement hook
+// ============================================================================
+// Registered via ggml_backend_set_allocation_callback around each measurement
+// window: sums every buffer allocation per device. Encountered device names are
+// appended to static arrays (linear search — a full measurement pass performs
+// only a few dozen buffer allocations). Owned by kvfit_measure, reset between
+// windows (window 1 = measurement context + warmup at lo pool, window 2 = hi-pool
+// context). Not re-entrancy-safe — one run at a time.
+
+static const size_t KVFIT_MAX_DEVICES = 64;
+
+static char     * kvfit_alloc_names[KVFIT_MAX_DEVICES]; // device names, added as encountered (stable across windows)
+static uint64_t  kvfit_alloc_bytes[KVFIT_MAX_DEVICES];  // accumulated bytes per name entry
+static size_t    kvfit_alloc_ndevs = 0;                 // entries populated in the arrays above
+
+// reset the byte counters between measurement windows; the name tags stay put,
+// so index i always refers to the same device in every window
+static void kvfit_reset_alloc(void) {
+    memset(kvfit_alloc_bytes, 0, sizeof(kvfit_alloc_bytes));
+}
+
+static void kvfit_alloc_hook(const char * buft_name, size_t bytes) {
+    for (size_t i = 0; i < kvfit_alloc_ndevs; ++i) {
+        if (strcmp(kvfit_alloc_names[i], buft_name) == 0) {
+            kvfit_alloc_bytes[i] += bytes;
+            return;
+        }
+    }
+    // unknown device name: add a new entry. The name may be dynamic — malloc a
+    // copy as the entry tag (once, on first use; kept for the whole run).
+    if (kvfit_alloc_ndevs < KVFIT_MAX_DEVICES) {
+        char * name_copy = strdup(buft_name);
+        if (name_copy != NULL) {
+            kvfit_alloc_names[kvfit_alloc_ndevs] = name_copy;
+            kvfit_alloc_bytes[kvfit_alloc_ndevs] = bytes;
+            ++kvfit_alloc_ndevs;
+        }
+    }
+}
+
+// accumulated bytes for the device with the given name (0 if not seen)
+static uint64_t kvfit_alloc_find(const char * dev_name) {
+    for (size_t i = 0; i < kvfit_alloc_ndevs; ++i) {
+        if (strcmp(kvfit_alloc_names[i], dev_name) == 0) {
+            return kvfit_alloc_bytes[i];
+        }
+    }
+    return 0;
+}
+
+// snapshot of the accumulated bytes in backend device order
+static std::vector<uint64_t> kvfit_alloc_snapshot(void) {
+    const size_t ndevs = ggml_backend_dev_count();
+    std::vector<uint64_t> bytes(ndevs, 0);
+    for (size_t i = 0; i < ndevs; ++i) {
+        bytes[i] = kvfit_alloc_find(ggml_backend_dev_name(ggml_backend_dev_get(i)));
+    }
+    return bytes;
+}
+
+// ============================================================================
 // Architecture-derived per-device memory rates
 // ============================================================================
 // Per-device probe-memory rates (nextn layers counted separately — they serve
@@ -836,62 +897,80 @@ static bool kvfit_measure(const char * path,
                        cp.n_ctx, cp.n_batch, cp.n_ubatch, cp.n_seq_max, cp.n_rs_seq,
                        measure_mtp ? "yes" : "no", n_tok);
 
+    // ---- measure the pool-dependent cost per device ----------------------------
+    // Hook every allocation through the backend dispatcher and sum it per device:
+    //   window 1: measurement context + warmup decode at lo_cells
+    //   window 2: a second context at hi_cells = 2x pool (its allocations only)
+    // The difference is everything that scales with the pool size (KV cells, graph
+    // compute buffers, ...) measured for the provisional placement. Subtracting the
+    // metadata KV rate isolates the compute-buffer share; the solver charges it per
+    // device instead of guessing from graph formulas.
+    {
+        kvfit_reset_alloc();
+        ggml_backend_set_allocation_callback(&kvfit_alloc_hook);
+    }
+
     const auto t_warmup0 = std::chrono::steady_clock::now();
-    llama_context * ctx0 = llama_init_from_model(model, cp);
+    llama_context * ctx0 = llama_init_from_model(model, cp);   // window 1: allocations hooked
     if (!ctx0) {
         LLAMA_LOG_ERROR("kvfit: measurement context init failed\n");
+        ggml_backend_set_allocation_callback(nullptr);
         llama_model_free(model);
         return false;
     }
 
-    // ---- measure the pool-dependent compute-buffer RATE (per device) -----------
-    // The compute buffers grow linearly with the pool (verified on rocky2); the
-    // rate is context-size-independent. Read .compute at this pool and at 2x via
-    // llama_get_memory_breakdown, free the second, store the rate for the solver.
-    {
-        const size_t ndevs = ggml_backend_dev_count();
-        const uint32_t lo_cells  = n_ctx_measure;
-        const uint32_t hi_cells  = 2u * lo_cells;
-        std::vector<uint64_t> compute_lo = kvfit_compute_by_device(ctx0);   // main ctx at lo
-        std::vector<uint64_t> compute_hi(ndevs, 0);
+    kvfit_warmup_decode(ctx0, prompt_tokens);                  // compute buffers reach steady state at lo_cells
 
-        llama_context_params cp_hi = cp;
-        cp_hi.n_ctx = hi_cells;
-        if (llama_context * ctx_hi = llama_init_from_model(model, cp_hi)) {
-            compute_hi = kvfit_compute_by_device(ctx_hi);   // main ctx at hi
-            llama_free(ctx_hi);
-        } else {
-            LLAMA_LOG_WARN("kvfit: hi-pool context for compute-rate init failed — falling back to 0 rate\n");
-        }
+    const size_t   ndevs    = ggml_backend_dev_count();
+    const uint32_t lo_cells = n_ctx_measure;
+    const uint32_t hi_cells = 2u * lo_cells;
+    std::vector<uint64_t> alloc_lo = kvfit_alloc_snapshot();   // window 1 done
 
-        r.compute_rate_main.assign(ndevs, 0);
-        for (size_t i = 0; i < ndevs && i < compute_lo.size(); ++i) {
-            const uint64_t d_bytes = (compute_hi[i] > compute_lo[i]) ? compute_hi[i] - compute_lo[i] : 0;
-            r.compute_rate_main[i] = (hi_cells > lo_cells) ? d_bytes / (hi_cells - lo_cells) : 0;
-        }
-        // The MTP draft context runs the nextn layers only, so its compute buffers
-        // are <= the main context's. Charging the main rate to it is conservative
-        // (never undercharges VRAM — the safe direction for a fit).
-        r.compute_rate_mtp = r.compute_rate_main;
+    kvfit_reset_alloc();                                       // window 2: only the hi context's allocations
+    bool hi_ok = false;
+    llama_context_params cp_hi = cp;
+    cp_hi.n_ctx = hi_cells;
+    if (llama_context * ctx_hi = llama_init_from_model(model, cp_hi)) {   // its init probes build pool-sized graphs
+        hi_ok = true;
+        llama_free(ctx_hi);
+    }
+    const std::vector<uint64_t> alloc_hi = kvfit_alloc_snapshot();        // window 2 done
+    ggml_backend_set_allocation_callback(nullptr);
 
-        LLAMA_LOG_PLANNING("      compute-buffer rate (from llama_get_memory_breakdown, pools %u -> %u):\n",
-                           lo_cells, hi_cells);
-        {
-            size_t gi = 0;
-            for (size_t i = 0; i < ndevs && gi < r.compute_rate_main.size(); ++gi) {
-                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-                if (!dev) continue;
-                const auto t = ggml_backend_dev_type(dev);
-                if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
-                LLAMA_LOG_PLANNING("        %s: main=%llu B/cell  mtp=%llu B/cell\n",
-                                   ggml_backend_dev_name(dev),
-                                   (unsigned long long)r.compute_rate_main[gi],
-                                   (unsigned long long)r.compute_rate_mtp[gi]);
-            }
-        }
+    if (!hi_ok) {
+        LLAMA_LOG_WARN("kvfit: hi-pool context for cost-rate init failed — falling back to 0 rate\n");
     }
 
-    kvfit_warmup_decode(ctx0, prompt_tokens);
+    // Total pool-proportional cost per cell, minus the KV cells known from metadata
+    // (constant w.r.t. context size): what remains is the compute-buffer share.
+    const auto prov_usage = kvfit_compute_dev_usage(model);
+    const auto prov_rates = kvfit_compute_rates(model, prov_usage, cp.type_k, cp.type_v,
+                                                cp.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED);
+    r.compute_rate_main.assign(ndevs, 0);
+    for (size_t i = 0; i < ndevs && hi_ok; ++i) {
+        const uint64_t d_bytes = (alloc_hi[i] > alloc_lo[i]) ? alloc_hi[i] - alloc_lo[i] : 0;
+        const uint64_t total_rate = d_bytes / (hi_cells - lo_cells);
+        const uint64_t kv = prov_rates[i].kv_bytes_per_cell;   // provisional placement's KV cells
+        r.compute_rate_main[i] = (total_rate >= kv) ? total_rate - kv : 0;
+    }
+    // The MTP draft context runs the nextn layers only, so its compute buffers are
+    // <= the main context's. Charging the main rate to it is conservative
+    // (never undercharges VRAM — the safe direction for a fit).
+    r.compute_rate_mtp = r.compute_rate_main;
+
+    LLAMA_LOG_PLANNING("      pool-cost rates (allocated bytes, pools %u -> %u):\n", lo_cells, hi_cells);
+    for (size_t i = 0; i < ndevs; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev) continue;
+        const auto t = ggml_backend_dev_type(dev);
+        if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
+        LLAMA_LOG_PLANNING("        %s: alloc_lo=%llu alloc_hi=%llu main_rate=%llu mtp_rate=%llu B/cell\n",
+                           ggml_backend_dev_name(dev),
+                           (unsigned long long)alloc_lo[i],
+                           (unsigned long long)alloc_hi[i],
+                           (unsigned long long)r.compute_rate_main[i],
+                           (unsigned long long)r.compute_rate_mtp[i]);
+    }
 
     // MTP draft context (speculative.cpp pattern): same n_ctx as the target, no
     // recurrent state of its own, reads h_nextn from the main context. It must
