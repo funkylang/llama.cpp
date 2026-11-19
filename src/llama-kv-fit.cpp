@@ -843,11 +843,12 @@ static std::vector<uint64_t> kvfit_compute_by_device(const llama_context * ctx, 
         if (!dev) continue;
         for (size_t i = 0; i < ndevs; ++i) {
             if (ggml_backend_dev_get(i) == dev) {
-                fprintf(stderr, "    buft_name='%s' dev=%s(idx=%zu)%s\n",
-                        ggml_backend_buft_name(buft), ggml_backend_dev_name(dev), i,
-                        ggml_backend_buft_is_host(buft) ? "  [host: not charged]" : "");
-                fprintf(stderr, "      compute=%llu B  context=%llu B\n",
-                        (unsigned long long)data.compute, (unsigned long long)data.context);
+                fprintf(stderr, "    buft_name='%s'  compute=%llu (%.2f GiB)  context=%llu (%.2f GiB)\n",
+                        ggml_backend_buft_name(buft), 
+                        (unsigned long long)data.compute, 
+                        (double)data.compute / (1024.0 * 1024.0 * 1024.0),
+                        (unsigned long long)data.context,
+                        (double)data.context / (1024.0 * 1024.0 * 1024.0));
                 if (!ggml_backend_buft_is_host(buft)) {   // host RAM never counts against GPU rates
                     compute[i] += data.compute;
                 }
@@ -976,26 +977,96 @@ static bool kvfit_measure(const char * path,
         const uint32_t lo_cells  = n_ctx_measure;
         const uint32_t hi_cells  = 2u * lo_cells;
         std::vector<uint64_t> compute_lo = kvfit_compute_by_device(ctx0, "main ctx, lo pool");   // main ctx at lo
-        std::vector<uint64_t> compute_hi(ndevs, 0);
-
+        
+        // Create hi-pool context for rate measurement (keep alive for MTP measurement too)
         llama_context_params cp_hi = cp;
         cp_hi.n_ctx = hi_cells;
-        if (llama_context * ctx_hi = llama_init_from_model(model, cp_hi)) {
-            compute_hi = kvfit_compute_by_device(ctx_hi, "main ctx, hi pool");   // main ctx at hi
-            llama_free(ctx_hi);
+        llama_context * ctx_hi_main = nullptr;
+        if (llama_context * tmp = llama_init_from_model(model, cp_hi)) {
+            ctx_hi_main = tmp;  // Keep alive!
         } else {
             LLAMA_LOG_WARN("kvfit: hi-pool context for compute-rate init failed — falling back to 0 rate\n");
         }
 
+        // Measure main context at hi pool
+        std::vector<uint64_t> compute_hi;
+        if (ctx_hi_main) {
+            compute_hi = kvfit_compute_by_device(ctx_hi_main, "main ctx, hi pool");   // main ctx at hi
+        }
+
+        // Calculate main rate from hi-lo difference
         r.compute_rate_main.assign(ndevs, 0);
         for (size_t i = 0; i < ndevs && i < compute_lo.size(); ++i) {
             const uint64_t d_bytes = (compute_hi[i] > compute_lo[i]) ? compute_hi[i] - compute_lo[i] : 0;
             r.compute_rate_main[i] = (hi_cells > lo_cells) ? d_bytes / (hi_cells - lo_cells) : 0;
         }
-        // MTP draft context gets its OWN compute buffers (measured separately below).
-        // The per-device main rate is charged on every GPU; MTP adds its own charge
-        // on devices that host the nextn layers.
-        
+
+        // MTP draft context gets its OWN compute buffers. Measure using hi-lo difference.
+        if (measure_mtp && llama_model_n_layer_nextn(model) > 0 && ctx_hi_main) {
+            LLAMA_LOG_PLANNING("      measuring MTP draft context rate (pools %u -> %u):\n", lo_cells, hi_cells);
+            
+            // Create MTP at lo pool referencing ctx0 (main at lo)
+            llama_context_params cp_mtp_lo = cp;  // same as ctx0's params
+            cp_mtp_lo.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            cp_mtp_lo.n_rs_seq = 0;
+            cp_mtp_lo.ctx_other = ctx0;
+            
+            // Create MTP at hi pool referencing ctx_hi_main (main at hi)
+            llama_context_params cp_mtp_hi = cp_hi;  // same as ctx_hi_main's params
+            cp_mtp_hi.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            cp_mtp_hi.n_rs_seq = 0;
+            cp_mtp_hi.ctx_other = ctx_hi_main;
+            
+            std::vector<uint64_t> mtp_compute_lo, mtp_compute_hi;
+            llama_context * ctx_mtp_lo = nullptr, * ctx_mtp_hi = nullptr;
+            
+            // Measure at lo pool
+            ctx_mtp_lo = llama_init_from_model(model, cp_mtp_lo);
+            if (ctx_mtp_lo) {
+                mtp_compute_lo = kvfit_compute_by_device(ctx_mtp_lo, "mtp ctx, lo pool");
+                
+                // Measure at hi pool
+                ctx_mtp_hi = llama_init_from_model(model, cp_mtp_hi);
+                if (ctx_mtp_hi) {
+                    mtp_compute_hi = kvfit_compute_by_device(ctx_mtp_hi, "mtp ctx, hi pool");
+                } else {
+                    LLAMA_LOG_WARN("kvfit: MTP context init at hi pool failed\n");
+                }
+            } else {
+                LLAMA_LOG_WARN("kvfit: MTP context init at lo pool failed — cannot measure MTP rate\n");
+            }
+            
+            // Calculate MTP rate from hi-lo difference (just like main rate)
+            r.mtp_rate.assign(ndevs, 0);
+            if (!mtp_compute_lo.empty() && !mtp_compute_hi.empty()) {
+                for (size_t i = 0; i < ndevs; ++i) {
+                    const uint64_t d_bytes = (mtp_compute_hi[i] > mtp_compute_lo[i]) ? 
+                                             mtp_compute_hi[i] - mtp_compute_lo[i] : 0;
+                    r.mtp_rate[i] = (hi_cells > lo_cells) ? d_bytes / (hi_cells - lo_cells) : 0;
+                }
+                
+                // Log MTP rates
+                {
+                    size_t gi = 0;
+                    for (size_t i = 0; i < ndevs && gi < r.mtp_rate.size(); ++gi) {
+                        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                        if (!dev) continue;
+                        const auto t = ggml_backend_dev_type(dev);
+                        if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
+                        if (r.mtp_rate[gi] > 0) {
+                            LLAMA_LOG_PLANNING("        %s: MTP rate = %llu B/cell\n",
+                                               ggml_backend_dev_name(dev),
+                                               (unsigned long long)r.mtp_rate[gi]);
+                        }
+                    }
+                }
+            }
+            
+            // Cleanup temporary MTP contexts
+            if (ctx_mtp_lo) llama_free(ctx_mtp_lo);
+            if (ctx_mtp_hi) llama_free(ctx_mtp_hi);
+        }
+
         LLAMA_LOG_PLANNING("      compute-buffer rate (from llama_get_memory_breakdown, pools %u -> %u):\n",
                            lo_cells, hi_cells);
         {
@@ -1009,6 +1080,12 @@ static bool kvfit_measure(const char * path,
                                    ggml_backend_dev_name(dev),
                                    (unsigned long long)r.compute_rate_main[gi]);
             }
+        }
+        
+        // Free hi context now that we're done measuring
+        if (ctx_hi_main) {
+            llama_free(ctx_hi_main);
+            ctx_hi_main = nullptr;
         }
     }
 
