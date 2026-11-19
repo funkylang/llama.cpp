@@ -1047,16 +1047,15 @@ static bool kvfit_measure(const char * path,
                 
                 // Log MTP rates
                 {
-                    size_t gi = 0;
-                    for (size_t i = 0; i < ndevs && gi < r.mtp_rate.size(); ++gi) {
+                    for (size_t i = 0; i < ndevs && i < r.mtp_rate.size(); ++i) {
                         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
                         if (!dev) continue;
                         const auto t = ggml_backend_dev_type(dev);
                         if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
-                        if (r.mtp_rate[gi] > 0) {
+                        if (r.mtp_rate[i] > 0) {
                             LLAMA_LOG_PLANNING("        %s: MTP rate = %llu B/cell\n",
                                                ggml_backend_dev_name(dev),
-                                               (unsigned long long)r.mtp_rate[gi]);
+                                               (unsigned long long)r.mtp_rate[i]);
                         }
                     }
                 }
@@ -1070,15 +1069,14 @@ static bool kvfit_measure(const char * path,
         LLAMA_LOG_PLANNING("      compute-buffer rate (from llama_get_memory_breakdown, pools %u -> %u):\n",
                            lo_cells, hi_cells);
         {
-            size_t gi = 0;
-            for (size_t i = 0; i < ndevs && gi < r.compute_rate_main.size(); ++gi) {
+            for (size_t i = 0; i < ndevs && i < r.compute_rate_main.size(); ++i) {
                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);
                 if (!dev) continue;
                 const auto t = ggml_backend_dev_type(dev);
                 if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
                 LLAMA_LOG_PLANNING("        %s: main rate = %llu B/cell\n",
                                    ggml_backend_dev_name(dev),
-                                   (unsigned long long)r.compute_rate_main[gi]);
+                                   (unsigned long long)r.compute_rate_main[i]);
             }
         }
         
@@ -1128,27 +1126,30 @@ static bool kvfit_measure(const char * path,
             } else {
                 r.mtp_measured = true;
                 r.compute_bytes_mtp = kvfit_compute_by_device(ctx_mtp, "mtp ctx");   // MTP draft context breakdown
-                
-                // Calculate MTP rate per cell for each device
-                size_t ndevs_mtp = ggml_backend_dev_count();
-                r.mtp_rate.assign(ndevs_mtp, 0);
-                for (size_t i = 0; i < ndevs_mtp && i < r.compute_bytes_mtp.size(); ++i) {
-                    if (r.compute_bytes_mtp[i] > 0 && n_ctx_measure > 0) {
-                        r.mtp_rate[i] = r.compute_bytes_mtp[i] / n_ctx_measure;
+
+                // The hi-lo method above already measures the pool-proportional rate correctly.
+                // Only fall back to this absolute measurement if hi-lo didn't run (e.g., context init failed).
+                if (r.mtp_rate.empty()) {
+                    size_t ndevs_mtp = ggml_backend_dev_count();
+                    r.mtp_rate.assign(ndevs_mtp, 0);
+                    for (size_t i = 0; i < ndevs_mtp && i < r.compute_bytes_mtp.size(); ++i) {
+                        if (r.compute_bytes_mtp[i] > 0 && n_ctx_measure > 0) {
+                            r.mtp_rate[i] = r.compute_bytes_mtp[i] / n_ctx_measure;
+                        }
                     }
                 }
-                
+
                 LLAMA_LOG_PLANNING("      compute-buffer rate (MTP draft context):\n");
-                size_t gi = 0;
-                for (size_t i = 0; i < ndevs_mtp && gi < r.mtp_rate.size(); ++gi) {
+                size_t ndevs_mtp = ggml_backend_dev_count();
+                for (size_t i = 0; i < ndevs_mtp && i < r.mtp_rate.size(); ++i) {
                     ggml_backend_dev_t dev = ggml_backend_dev_get(i);
                     if (!dev) continue;
                     const auto t = ggml_backend_dev_type(dev);
                     if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
-                    if (r.mtp_rate[gi] > 0) {
+                    if (r.mtp_rate[i] > 0) {
                         LLAMA_LOG_PLANNING("        %s: MTP rate = %llu B/cell\n",
                                            ggml_backend_dev_name(dev),
-                                           (unsigned long long)r.mtp_rate[gi]);
+                                           (unsigned long long)r.mtp_rate[i]);
                     }
                 }
             }

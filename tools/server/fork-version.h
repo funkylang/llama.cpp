@@ -4,4 +4,4 @@
 // updated on every fork commit with the ACTUAL current time at update (strict ordering);
 // printed as the first startup message of llama-server so the running build can be identified
 
-static const char * FORK_VERSION = "2026-11-19 16:50:28 kv-fit: MTP hi-lo rate + GiB formatting";;;
+static const char * FORK_VERSION = "2026-11-19 17:41:27 kv-fit: preserve hi-lo MTP rate; fix device-indexed print loops";
