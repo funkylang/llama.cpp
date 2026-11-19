@@ -157,11 +157,12 @@ static std::vector<kvfit_dev_usage> kvfit_compute_dev_usage(const llama_model * 
 
 // Provisional split readback table (gpu-split parity): where a measurement
 // load ACTUALLY placed the weights. GPU rows only while any GPU is present —
-// this is a GPU planning tool, CPU placement is noise for planning.
-static void kvfit_print_provisional_split(const llama_model * model) {
+// this is a GPU planning tool, CPU placement is noise for planning. Rendered
+// from the stored readback so kvfit_plan_compute places it right in front of
+// the cost breakdown table.
+static void kvfit_print_provisional_split(const std::vector<kvfit_dev_usage> & usage) {
     if (!kvfit_gpus_present()) return;
 
-    const auto usage = kvfit_compute_dev_usage(model);
     LLAMA_LOG_PLANNING("\n      provisional split (as placed by the measurement load):\n\n");
     LLAMA_LOG_PLANNING("        %-4s %-6s %-10s %-14s  %s\n", "idx", "type", "layers", "weights", "name");
     for (size_t i = 0; i < usage.size(); ++i) {
@@ -374,8 +375,8 @@ static void kvfit_print_cost_breakdown(const char * title,
     // placement-dependent fixed costs, then the per-cell rates (buffers kept
     // separate) and their sum
     static const char * hdrs[12] = { "free", "kernels", "base-buffer", "reserve", "budget",
-                                     "tensors", "ssm-state", "kv/cell", "mtp/cell",
-                                     "buf/cell", "mtp-buf/c", "total/c" };
+                                     "tensors", "ssm-state", "kv/c", "mtp/c",
+                                     "buf/c", "mbuf/c", "total/c" };
     const int n_rows = (int)names.size() + 1;   // one per GPU + TOTAL
 
     std::vector<std::string> keys;
@@ -983,7 +984,6 @@ static bool kvfit_measure(const char * path,
         return false;
     }
     const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load0).count();
-    kvfit_print_provisional_split(model);
 
     // measurement context at a common deployment size. n_kv_cache stays 0 with
     // kv_unified: the pool is then PAD(n_ctx) cells — its size is subtracted in
@@ -1621,6 +1621,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
 
     // ---- cost breakdown of the provisional split (before the bisection) -----------
     {
+        kvfit_print_provisional_split(meas.usage);   // where the measurement load actually placed them
         std::vector<uint64_t> ssm_states(nd_gpus, 0);
         for (size_t g = 0; g < nd_gpus; ++g) {
             ssm_states[g] = d_ssm_bpr[g] * (uint64_t)state_rows;
