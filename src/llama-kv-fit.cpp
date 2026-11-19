@@ -403,7 +403,7 @@ static void kvfit_print_cost_breakdown(const char * title,
     std::vector<const char *> keys_arr(n_rows);
     for (int r = 0; r < n_rows; ++r) keys_arr[r] = keys[r].c_str();
 
-    print_table(stderr, n_rows, 8, hdrs, keys_arr.data(), "", row_ptrs.data(), nullptr, false);
+    print_table(stderr, n_rows, 8, hdrs, keys_arr.data(), "", row_ptrs.data(), nullptr, true);
 }
 
 // Try placing n 256-cell blocks with the candidate placement from the shared
@@ -1494,10 +1494,18 @@ static kvfit_plan kvfit_plan_compute(const char * path,
     }
 
     // ---- budgets: what each GPU leaves for weights + KV -------------------------
+    // Each device's measured 'kernels' is a probe-width residual that already
+    // includes its pool-proportional compute buffers (rate x probe_cells). The
+    // solver will re-charge those at the target pool width, so we strip that
+    // slice out and only charge the fixed remainder — the base-buffer column:
+    //     overhead  = kernels - (bufs_bpc x probe_cells)   (= d_base, base-buffer)
+    //     budget    = free - overhead - reserve
     const double keep_free = 1.0 - params->vram_fraction;
 
-    LLAMA_LOG_PLANNING("\n      split budget: reserve = total x keep_free(%.2f)%s; "
-                       "budget = free - kernels - reserve\n",
+    LLAMA_LOG_PLANNING("\n      split budget: reserve = total x keep_free(%.2f)%s\n"
+                       "                    budget  = free - base-buffer - reserve\n"
+                       "   (base-buffer = the fixed cost subtracted now; the solver charges the\n"
+                       "   pool-proportional compute buffers at target width, not here)\n",
                        keep_free, (params->margins ? " + margin" : ""));
     std::vector<uint64_t> budgets(nd_gpus);
     std::vector<uint64_t> reserves(nd_gpus);   // solver header: per-GPU reserve kept back
@@ -1514,37 +1522,32 @@ static kvfit_plan kvfit_plan_compute(const char * path,
 
             int64_t total   = (int64_t)scan_raw[i].total_bytes;
             int64_t free    = (int64_t)scan_raw[i].free_bytes;
-            // d_kernels is the probe-width residual: shaders + compute_buffers(16384),
-            // and compute_buffers(16384) = base + rate*16384. The solver will separately
-            // charge rate*target_cells (r_bufs), so we must strip the pool-proportional
-            // probe-width slice ((buf_bpc + mtp_buf_bpc) * probe_cells) here to avoid
-            // double-counting. What remains (shaders + base) is the true fixed overhead:
-            // it includes the BASE BUFFER (the compute-buffer intercept at pool width 0).
-            const uint64_t probe_buf_slice = (uint64_t)bufs_bpc[gi] * probe_cells;
-            int64_t overhead = (int64_t)d_kernels[gi];
-            if (overhead > (int64_t)probe_buf_slice) {
-                overhead -= (int64_t)probe_buf_slice;   // = shaders + base_buffer
-            } else {
-                overhead = 0;   // residual smaller than its rate slice: charge nothing extra
-            }
-            int64_t reserve = (int64_t)((double)total * keep_free);
+            // d_base[gi] was derived in the decomposition step as
+            // kernels - bufs_bpc*probe_cells (the probe-width rate slice is
+            // re-charged by the solver at target width). This IS the fixed
+            // overhead we subtract from free — shaders + base-buffer. Using
+            // it directly guarantees: the base-buffer column value == what's
+            // subtracted here, no divergence between display and math.
+            int64_t overhead = (int64_t)d_base[gi];
+            int64_t reserve  = (int64_t)((double)total * keep_free);
             if (params->margins) reserve += (int64_t)params->margins[i]; // indexed by backend device order
-            int64_t budget = free - overhead - reserve;
+            int64_t budget     = free - overhead - reserve;
 
-            budgets[gi] = budget > 0 ? (uint64_t)budget : 0;  // negative = overcommitted GPU
-            reserves[gi] = (uint64_t)reserve;   // what was kept back from this device's total
+            budgets[gi]  = budget > 0 ? (uint64_t)budget : 0;  // negative = overcommitted GPU
+            reserves[gi] = (uint64_t)reserve;                  // what was kept back from this device's total
             names.push_back(ggml_backend_dev_name(dev));
             total_budget  += budget;
             total_weights += (int64_t)d_weights[gi];
             ssm_per_row_total += d_ssm_bpr[gi];
             cell_size_total   += d_kv_bpc[gi] + d_mtp_bpc[gi] + bufs_bpc[gi];
 
-            LLAMA_LOG_PLANNING("        %s: budget = free(%lld) - overhead[shaders+base](%lld, "
+            LLAMA_LOG_PLANNING("        %s: budget = free(%lld) - base-buffer(%lld, "
                                "was kernels-probe(%lld), -probe-rate-slice(%lld)) - "
                                "reserve(total(%lld) x keep_free(%.2f)%s) = %lld\n",
                                names.back().c_str(),
                                (long long)free, (long long)overhead,
-                               (long long)d_kernels[gi], (long long)probe_buf_slice,
+                               (long long)d_kernels[gi],
+                               (long long)((uint64_t)bufs_bpc[gi] * probe_cells),
                                (long long)total, keep_free,
                                (params->margins ? " + margin" : ""),
                                (long long)budgets[gi]);
