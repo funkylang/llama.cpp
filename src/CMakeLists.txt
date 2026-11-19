@@ -41,6 +41,7 @@ set(LLAMA_CORE_SOURCES
     llama-quant.cpp
     llama-sampler.cpp
     llama-vocab.cpp
+    print-table.c
     unicode-data.cpp
     unicode.cpp
 )

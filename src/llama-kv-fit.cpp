@@ -348,6 +348,64 @@ static std::vector<size_t> kvfit_greedy_walk(uint32_t n_blocks,
     return first;
 }
 
+// Print the per-GPU cost breakdown through print_table: fixed base costs and
+// per-cell rates. Used for both the provisional split (before the bisection)
+// and the final plan — the caller supplies per-GPU arrays in its own placement.
+// One stream write per line, straight to stderr (same convention as the
+// measurement breakdowns above — a log call would prefix every row).
+static void kvfit_print_cost_breakdown(const char * title,
+                                       const std::vector<std::string> & names,
+                                       const std::vector<uint64_t> & wts,
+                                       const std::vector<uint64_t> & base,
+                                       const std::vector<uint64_t> & ssm_state,
+                                       const std::vector<uint64_t> & kv_bpc,
+                                       const std::vector<uint64_t> & mtp_bpc,
+                                       const std::vector<uint64_t> & buf_bpc,
+                                       const std::vector<uint64_t> & mtp_buf_bpc) {
+    fprintf(stderr, "\n      %s\n", title);
+
+    // columns: fixed base costs, then the per-cell rates (buffers kept separate),
+    // then their sum
+    static const char * hdrs[8] = { "weights", "base-buffer", "ssm-state",
+                                    "kv/cell", "mtp/cell", "buffers/cell",
+                                    "mtp-buffers/cell", "cell-total" };
+    const int n_rows = (int)names.size() + 1;   // one per GPU + TOTAL
+
+    std::vector<std::string> keys;
+    keys.reserve(n_rows);
+    for (const auto & n : names) keys.push_back(n);
+    keys.push_back("TOTAL");
+
+    std::vector<long> flat((size_t)n_rows * 8, 0);
+    const auto get = [](const std::vector<uint64_t> & v, size_t g) -> long {
+        return (g < v.size()) ? (long)v[g] : 0;
+    };
+    for (size_t g = 0; g < names.size(); ++g) {
+        const size_t o = g * 8;
+        flat[o + 0] = get(wts, g);
+        flat[o + 1] = get(base, g);
+        flat[o + 2] = get(ssm_state, g);
+        flat[o + 3] = get(kv_bpc, g);
+        flat[o + 4] = get(mtp_bpc, g);
+        flat[o + 5] = get(buf_bpc, g);
+        flat[o + 6] = get(mtp_buf_bpc, g);
+        flat[o + 7] = flat[o + 3] + flat[o + 4] + flat[o + 5] + flat[o + 6];
+    }
+    // TOTAL row: column sums (cell-total = sum of the four per-cell columns)
+    for (int c = 0; c < 8; ++c) {
+        long t = 0;
+        for (size_t g = 0; g < names.size(); ++g) t += flat[g * 8 + c];
+        flat[(size_t)(names.size()) * 8 + c] = t;
+    }
+
+    std::vector<const long *> row_ptrs(n_rows);
+    for (int r = 0; r < n_rows; ++r) row_ptrs[r] = flat.data() + (size_t)r * 8;
+    std::vector<const char *> keys_arr(n_rows);
+    for (int r = 0; r < n_rows; ++r) keys_arr[r] = keys[r].c_str();
+
+    print_table(stderr, n_rows, 8, hdrs, keys_arr.data(), "", row_ptrs.data(), nullptr, false);
+}
+
 // Try placing n 256-cell blocks with the candidate placement from the shared
 // greedy walk (buffers-gated), then check every GPU's FULL charge against its
 // budget: layer weights + pool cells + compute buffers (+ global tensors on
@@ -357,8 +415,8 @@ static std::vector<size_t> kvfit_greedy_walk(uint32_t n_blocks,
 // buf_bpc[g]: measured compute-buffer bytes per pool cell on GPU g (hi-lo
 // difference of the memory breakdown). Always charged, on every GPU,
 // independent of layer distribution — the graph reserves them per device.
-// When a device hosts the MTP draft context, it gets its OWN separate compute
-// buffers on top of the main ones; mtp_rate is added into buf_bpc above.
+// The caller passes main + MTP draft rates combined when a device hosts the
+// MTP draft context's own compute buffers.
 static bool kvfit_try_place(uint32_t n_blocks,
                             const std::vector<kvfit_layer_cost> & layers,
                             const std::vector<uint64_t> & budgets,
@@ -871,13 +929,11 @@ struct kvfit_measure_result {
     // guess — the rate is context-size-independent, so it holds for any pool.
     std::vector<uint64_t> compute_rate_main;        // main-context rate (per device)
     
-    // MTP draft context's own compute buffers per device (from its breakdown).
-    // When a device hosts the MTP draft context, it gets these as a SEPARATE
-    // allocation from the main context's compute buffers — we charge both.
-    std::vector<uint64_t> compute_bytes_mtp;        // mtp-context bytes (per device)
-    
-    // MTP draft context compute rate per cell (computed from compute_bytes_mtp / n_ctx_measure)
-    // Used in the solver to add extra charge on devices that host nextn layers.
+    // MTP draft context compute rate per cell (per device), measured with the
+    // hi-lo difference method — the same pool-proportional approach as
+    // compute_rate_main, on the MTP draft context's own buffers. When a device
+    // hosts nextn layers it allocates these SEPARATELY from the main context's
+    // compute buffers; both rates are charged in the solver.
     std::vector<uint64_t> mtp_rate;                 // mtp-context rate (per device)
 };
 
@@ -1125,33 +1181,12 @@ static bool kvfit_measure(const char * path,
                 LLAMA_LOG_ERROR("kvfit: MTP draft decode failed (%d)\n", rc);
             } else {
                 r.mtp_measured = true;
-                r.compute_bytes_mtp = kvfit_compute_by_device(ctx_mtp, "mtp ctx");   // MTP draft context breakdown
-
-                // The hi-lo method above already measures the pool-proportional rate correctly.
-                // Only fall back to this absolute measurement if hi-lo didn't run (e.g., context init failed).
-                if (r.mtp_rate.empty()) {
-                    size_t ndevs_mtp = ggml_backend_dev_count();
-                    r.mtp_rate.assign(ndevs_mtp, 0);
-                    for (size_t i = 0; i < ndevs_mtp && i < r.compute_bytes_mtp.size(); ++i) {
-                        if (r.compute_bytes_mtp[i] > 0 && n_ctx_measure > 0) {
-                            r.mtp_rate[i] = r.compute_bytes_mtp[i] / n_ctx_measure;
-                        }
-                    }
-                }
-
-                LLAMA_LOG_PLANNING("      compute-buffer rate (MTP draft context):\n");
-                size_t ndevs_mtp = ggml_backend_dev_count();
-                for (size_t i = 0; i < ndevs_mtp && i < r.mtp_rate.size(); ++i) {
-                    ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-                    if (!dev) continue;
-                    const auto t = ggml_backend_dev_type(dev);
-                    if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
-                    if (r.mtp_rate[i] > 0) {
-                        LLAMA_LOG_PLANNING("        %s: MTP rate = %llu B/cell\n",
-                                           ggml_backend_dev_name(dev),
-                                           (unsigned long long)r.mtp_rate[i]);
-                    }
-                }
+                // diagnostic breakdown only — the pool-proportional MTP rate comes
+                // exclusively from the hi-lo difference method above. Absolute
+                // division (bytes / n_ctx) wrongly folds in the fixed base, so it
+                // is never used here as a fallback: a missing hi-lo measurement
+                // leaves the rate 0 rather than reporting an inflated value.
+                kvfit_compute_by_device(ctx_mtp, "mtp ctx");
             }
         } else {
             LLAMA_LOG_WARN("kvfit: MTP draft context init failed — nextn KV pool NOT in the measured delta\n");
@@ -1391,6 +1426,25 @@ static kvfit_plan kvfit_plan_compute(const char * path,
     }
     std::vector<uint64_t> d_delta(nd_gpus), d_weights(nd_gpus), d_probe_kv(nd_gpus), d_kernels(nd_gpus);
     std::vector<uint64_t> d_ssm_bpr(nd_gpus, 0), d_kv_bpc(nd_gpus, 0), d_mtp_bpc(nd_gpus, 0);
+    std::vector<uint64_t> d_base(nd_gpus, 0);   // base cost per GPU (width-0 overhead: shaders + compute-buffer intercept)
+
+    // Compute-buffer rates per pool cell: main context + MTP draft context as
+    // separate vectors. bufs_bpc combines them — that is what the solver
+    // charges; the split exists for the cost-breakdown display only.
+    std::vector<uint64_t> buf_bpc(nd_gpus, 0), mtp_buf_bpc(nd_gpus, 0), bufs_bpc(nd_gpus, 0);
+    {
+        size_t gi = 0;
+        for (size_t i = 0; i < scan_raw.size() && gi < nd_gpus; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (!dev || !scan_raw[i].ok) continue;
+            const auto t = ggml_backend_dev_type(dev);
+            if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
+            buf_bpc[gi]     = (i < meas.compute_rate_main.size()) ? meas.compute_rate_main[i] : 0;
+            mtp_buf_bpc[gi] = (i < meas.mtp_rate.size())          ? meas.mtp_rate[i] : 0;
+            bufs_bpc[gi]    = buf_bpc[gi] + mtp_buf_bpc[gi];
+            ++gi;
+        }
+    }
     {
         size_t gi = 0;
         for (size_t i = 0; i < scan_raw.size() && gi < nd_gpus; ++i) {
@@ -1420,6 +1474,13 @@ static kvfit_plan kvfit_plan_compute(const char * path,
             d_kv_bpc[gi]  = kv_bpc;
             d_mtp_bpc[gi] = mtp_bpc;
 
+            // Base-buffer derivation for the cost breakdown: at probe width the
+            // compute buffers are base + rate*probe_cells. Subtracting the rate slice
+            // (main + MTP draft rates) isolates the width-0 intercept (shaders + base
+            // combined — llama.cpp does not report them separately).
+            const uint64_t probe_buf_slice = (uint64_t)bufs_bpc[gi] * probe_cells;
+            d_base[gi] = (d_kernels[gi] > probe_buf_slice) ? d_kernels[gi] - probe_buf_slice : 0;
+
             LLAMA_LOG_PLANNING("        %s: delta=%llu weights=%llu probe-KV=%llu "
                                "(cells(%llu) x bpc(%llu)) SSM=%llu kernels=%llu\n",
                                ggml_backend_dev_name(dev),
@@ -1434,28 +1495,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
 
     // ---- budgets: what each GPU leaves for weights + KV -------------------------
     const double keep_free = 1.0 - params->vram_fraction;
-    
-    // Compute buf_bpc (compute-buffer bytes per cell) early so it's available
-    // for the upper limit calculation
-    std::vector<uint64_t> buf_bpc(nd_gpus, 0);
-    uint64_t buffers_total = 0;
-    {
-        size_t gi = 0;
-        for (size_t i = 0; i < scan_raw.size() && gi < nd_gpus; ++i) {
-            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            if (!dev || !scan_raw[i].ok) continue;
-            const auto t = ggml_backend_dev_type(dev);
-            if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
-            buf_bpc[gi] = (i < meas.compute_rate_main.size()) ? meas.compute_rate_main[i] : 0;
-            // MTP draft context has its own compute buffers: add them when present
-            if (i < meas.mtp_rate.size() && meas.mtp_rate[i] > 0) {
-                buf_bpc[gi] += meas.mtp_rate[i];
-            }
-            buffers_total += buf_bpc[gi];
-            ++gi;
-        }
-    }
-    
+
     LLAMA_LOG_PLANNING("\n      split budget: reserve = total x keep_free(%.2f)%s; "
                        "budget = free - kernels - reserve\n",
                        keep_free, (params->margins ? " + margin" : ""));
@@ -1474,10 +1514,22 @@ static kvfit_plan kvfit_plan_compute(const char * path,
 
             int64_t total   = (int64_t)scan_raw[i].total_bytes;
             int64_t free    = (int64_t)scan_raw[i].free_bytes;
-            int64_t kernels = (int64_t)d_kernels[gi];
+            // d_kernels is the probe-width residual: shaders + compute_buffers(16384),
+            // and compute_buffers(16384) = base + rate*16384. The solver will separately
+            // charge rate*target_cells (r_bufs), so we must strip the pool-proportional
+            // probe-width slice ((buf_bpc + mtp_buf_bpc) * probe_cells) here to avoid
+            // double-counting. What remains (shaders + base) is the true fixed overhead:
+            // it includes the BASE BUFFER (the compute-buffer intercept at pool width 0).
+            const uint64_t probe_buf_slice = (uint64_t)bufs_bpc[gi] * probe_cells;
+            int64_t overhead = (int64_t)d_kernels[gi];
+            if (overhead > (int64_t)probe_buf_slice) {
+                overhead -= (int64_t)probe_buf_slice;   // = shaders + base_buffer
+            } else {
+                overhead = 0;   // residual smaller than its rate slice: charge nothing extra
+            }
             int64_t reserve = (int64_t)((double)total * keep_free);
             if (params->margins) reserve += (int64_t)params->margins[i]; // indexed by backend device order
-            int64_t budget = free - kernels - reserve;
+            int64_t budget = free - overhead - reserve;
 
             budgets[gi] = budget > 0 ? (uint64_t)budget : 0;  // negative = overcommitted GPU
             reserves[gi] = (uint64_t)reserve;   // what was kept back from this device's total
@@ -1485,16 +1537,29 @@ static kvfit_plan kvfit_plan_compute(const char * path,
             total_budget  += budget;
             total_weights += (int64_t)d_weights[gi];
             ssm_per_row_total += d_ssm_bpr[gi];
-            cell_size_total   += d_kv_bpc[gi] + d_mtp_bpc[gi] + buf_bpc[gi];
+            cell_size_total   += d_kv_bpc[gi] + d_mtp_bpc[gi] + bufs_bpc[gi];
 
-            LLAMA_LOG_PLANNING("        %s: budget = free(%lld) - kernels(%lld) - "
+            LLAMA_LOG_PLANNING("        %s: budget = free(%lld) - overhead[shaders+base](%lld, "
+                               "was kernels-probe(%lld), -probe-rate-slice(%lld)) - "
                                "reserve(total(%lld) x keep_free(%.2f)%s) = %lld\n",
                                names.back().c_str(),
-                               (long long)free, (long long)kernels, (long long)total, keep_free,
+                               (long long)free, (long long)overhead,
+                               (long long)d_kernels[gi], (long long)probe_buf_slice,
+                               (long long)total, keep_free,
                                (params->margins ? " + margin" : ""),
                                (long long)budgets[gi]);
             ++gi;
         }
+    }
+
+    // ---- cost breakdown of the provisional split (before the bisection) -----------
+    {
+        std::vector<uint64_t> ssm_states(nd_gpus, 0);
+        for (size_t g = 0; g < nd_gpus; ++g) {
+            ssm_states[g] = d_ssm_bpr[g] * (uint64_t)state_rows;
+        }
+        kvfit_print_cost_breakdown("cost breakdown [provisional split]", names, d_weights, d_base,
+                                   ssm_states, d_kv_bpc, d_mtp_bpc, buf_bpc, mtp_buf_bpc);
     }
 
     // ---- theoretical upper limit: the perfect-split ceiling ----------------------
@@ -1533,12 +1598,11 @@ static kvfit_plan kvfit_plan_compute(const char * path,
     plan.n_layer_all = model_peek->hparams.n_layer_all;
     llama_model_free(model_peek);
 
-    // (buf_bpc computed earlier in the budgets section above)
-
-
+    // (compute-buffer rates computed earlier in the budgets section above;
+    // bufs_bpc = main + MTP draft — what the solver charges per cell)
     const uint64_t last_gpu_extra = (uint64_t)gguf.norm_bytes + (uint64_t)gguf.output_bytes;
     const uint32_t n_blocks = kvfit_solve(n_max, layer_costs, budgets, reserves, names, last_gpu_extra,
-                                          buf_bpc);
+                                          bufs_bpc);
     if (n_blocks == 0) {
         LLAMA_LOG_ERROR("kvfit: solver found no placement — even the perfect split cannot "
                         "hold all layers on the GPUs\n");
@@ -1564,7 +1628,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
     {
         // same walk as the solver: gated on each GPU's compute-buffer rate so
         // the final layout matches the winning candidate's checked placement
-        const std::vector<size_t> walk = kvfit_greedy_walk(n_blocks, layer_costs, budgets, buf_bpc);
+        const std::vector<size_t> walk = kvfit_greedy_walk(n_blocks, layer_costs, budgets, bufs_bpc);
         for (size_t g = 0; g < walk.size() && g < first_layer.size(); ++g) {
             first_layer[g] = (int)walk[g];
         }
@@ -1581,6 +1645,29 @@ static kvfit_plan kvfit_plan_compute(const char * path,
         const int b = (g + 1 < plan.first_layer.size()) ? plan.first_layer[g + 1] : (int)N;
         LLAMA_LOG_PLANNING("        %s: layers %d..%d%s\n", plan.names[g].c_str(), a, b - 1,
                            (a >= b) ? " (empty)" : "");
+    }
+
+    // ---- cost breakdown of the final plan ------------------------------------
+    // Recomputed from the solver's per-layer costs over the winning ranges;
+    // the placement-independent terms (base-buffer, compute-buffer rates) are
+    // shared with the provisional table.
+    {
+        const size_t nd = plan.first_layer.size();
+        std::vector<uint64_t> p_wts(nd, 0), p_ssm(nd, 0), p_kv(nd, 0), p_mtp(nd, 0);
+        for (size_t g = 0; g < nd; ++g) {
+            const int a = plan.first_layer[g];
+            const int b = (g + 1 < nd) ? plan.first_layer[g + 1] : (int)N;
+            for (int l = a; l < b; ++l) {
+                p_wts[g] += layer_costs[l].weights;
+                p_ssm[g] += layer_costs[l].ssm_state;
+                p_kv[g]  += layer_costs[l].kv_bpc;
+                p_mtp[g] += layer_costs[l].mtp_kv_bpc;
+            }
+        }
+        // the last GPU also takes the global tensors (norm + output / lm_head)
+        if (nd > 0) p_wts[nd - 1] += last_gpu_extra;
+        kvfit_print_cost_breakdown("cost breakdown [final plan]", plan.names, p_wts, d_base,
+                                   p_ssm, p_kv, p_mtp, buf_bpc, mtp_buf_bpc);
     }
 
     // ---- Verification run: prove the plan works at runtime ---------------------

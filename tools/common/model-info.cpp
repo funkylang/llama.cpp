@@ -7,6 +7,7 @@
 #include <llama-impl.h>
 #include <llama-model.h>
 #include <gguf.h>
+#include "../src/llama-ext.h"   // print_table() shared boxed-table printer
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
@@ -16,48 +17,6 @@
 namespace {
 
 constexpr int NUM_COL_W = 13; // numeric column cell width (incl. side padding)
-
-std::string box(const char * tl, const char * mid, const char * tr,
-                const std::vector<int> & widths) {
-    std::string s(tl);
-    for (size_t i = 0; i < widths.size(); ++i) {
-        if (i > 0) s += mid;
-        for (int j = 0; j < widths[i]; ++j) s += "─";
-    }
-    return s + tr;
-}
-
-std::string data_row(const char * label, const std::vector<int64_t> & vals,
-                     const std::vector<int> & widths) {
-    std::string s("│");
-    const int l = (int)strlen(label);
-    // col 0: right-aligned (layer numbers and labels share the column)
-    s += std::string(widths[0] - 1 - l, ' ') + label + " │";
-    for (size_t i = 1; i < vals.size(); ++i) {
-        char buf[24];
-        snprintf(buf, sizeof(buf), "%lld", (long long)vals[i]);
-        const int n = (int)strlen(buf);
-        s += std::string(widths[i] - n - 1, ' ') + buf + " │";
-    }
-    return s;
-}
-
-std::string header_row(const std::vector<const char *> & hdr,
-                       const std::vector<int> & widths) {
-    std::string s("│");
-    for (size_t i = 0; i < hdr.size(); ++i) {
-        const int l = (int)strlen(hdr[i]);
-        // visually centered over the full width; " │" supplies one right
-        // padding space, so subtract it from pad_r. On uneven padding the
-        // text leans left:
-        const int pad_l = (widths[i] - l) / 2;
-        const int pad_r = widths[i] - l - pad_l - 1;
-        s += std::string(pad_l, ' ') + hdr[i] + std::string(pad_r, ' ') + " │";
-    }
-    return s;
-}
-
-
 
 } // namespace
 
@@ -270,44 +229,43 @@ extern "C" int mi_print_layer_table(FILE * out, mi_model_info_t info,
         if (l > col0_w) col0_w = l;
     }
 
+    // established layout: fixed column widths handed to print_table so the
+    // rendering never shifts between tools or runs
     std::vector<const char *> hdr;
     std::vector<int> widths;
-    hdr.push_back("layer");       widths.push_back(col0_w); // label/layer column
-    hdr.push_back("tensor size"); widths.push_back(NUM_COL_W);
-    if (has_moe) { hdr.push_back("moe"); widths.push_back(5); }
+    hdr.push_back("layer");        widths.push_back(col0_w);   // label/layer column
+    hdr.push_back("tensor size");  widths.push_back(NUM_COL_W);
+    if (has_moe) { hdr.push_back("moe");        widths.push_back(5); }
     if (has_mtp) { hdr.push_back("mtp tensor"); widths.push_back(NUM_COL_W); }
-    hdr.push_back("cell size");   widths.push_back(NUM_COL_W);
+    hdr.push_back("cell size");    widths.push_back(NUM_COL_W);
     if (has_mtp) { hdr.push_back("mtp cell");   widths.push_back(NUM_COL_W); }
     if (has_swa || has_ssm) { hdr.push_back("swa/ssm"); widths.push_back(NUM_COL_W); }
 
-    // accounting invariant (code-enforced): emit_row accumulates every weight
-    // byte it prints; the TOTAL row is built from exactly these accumulators,
+    // accounting invariant (code-enforced): add_row accumulates every weight
+    // byte it emits; the TOTAL row is built from exactly these accumulators,
     // so TOTAL always equals the sum of the visible rows — no hidden tensors.
+    std::vector<std::string> keys;
+    std::vector<std::vector<long>> data;
     int64_t printed_base = 0, printed_mtp = 0;
 
-    auto emit_row = [&](const char * label, int64_t tsize, int moe_flag,
-                        int64_t mtens, int64_t csize, int64_t mcell,
-                        int64_t state) {
-        std::vector<int64_t> vals;
-        vals.push_back(0);                              // slot 0 is the label (unused)
-        vals.push_back(tsize);                          // tensor size        (always)
-        if (has_moe) vals.push_back(moe_flag);          // moe flag           (optional)
-        if (has_mtp) vals.push_back(mtens);             // mtp tensor         (optional)
-        vals.push_back(csize);                          // cell size          (always)
-        if (has_mtp) vals.push_back(mcell);             // mtp cell           (optional)
-        if (has_swa || has_ssm) vals.push_back(state);  // swa/ssm            (optional, last)
-        fprintf(out, "%s\n", data_row(label, vals, widths).c_str());
-        printed_base += tsize;                          // accumulate what was printed
+    auto add_row = [&](const char * label, long tsize, long moe_flag,
+                       long mtens, long csize, long mcell,
+                       long state) {
+        std::vector<long> vals;   // parallel to hdr (no key column entry)
+        vals.push_back(tsize);                        // tensor size       (always)
+        if (has_moe) vals.push_back(moe_flag);        // moe flag          (optional)
+        if (has_mtp) vals.push_back(mtens);           // mtp tensor        (optional)
+        vals.push_back(csize);                        // cell size         (always)
+        if (has_mtp) vals.push_back(mcell);           // mtp cell          (optional)
+        if (has_swa || has_ssm) vals.push_back(state);// swa/ssm           (optional, last)
+        keys.push_back(label);
+        data.push_back(std::move(vals));
+        printed_base += tsize;   // accumulate what was emitted
         printed_mtp  += mtens;
     };
 
     int64_t total_rate = 0, mtp_rate = 0;
     int64_t total_state = 0, mtp_state = 0;
-
-    fprintf(out, "\n");
-    fprintf(out, "%s\n", box("┌", "┬", "┐", widths).c_str());
-    fprintf(out, "%s\n", header_row(hdr, widths).c_str());
-    fprintf(out, "%s\n", box("├", "┼", "┤", widths).c_str());
 
     for (uint32_t il = 0; il < n_layer_all; il++) {
         const int64_t weights = info->layer_weights[il];
@@ -361,45 +319,58 @@ extern "C" int mi_print_layer_table(FILE * out, mi_model_info_t info,
 
         char label[16];
         snprintf(label, sizeof(label), "%u", il);
-        emit_row(label, tsize, is_moe_layer(il) ? 1 : 0, mtens, csize, mcell, state);
+        add_row(label, (long)tsize, is_moe_layer(il) ? 1 : 0, (long)mtens,
+                (long)csize, (long)mcell, (long)state);
     }
 
     // globals after the last layer, in data flow order:
     // norm -> output (lm_head); any remaining non-blk tensors each get a row
     if (info->norm_bytes > 0) {
-        emit_row("norm", info->norm_bytes, 0, 0, 0, 0, 0);
+        add_row("norm", (long)info->norm_bytes, 0, 0, 0, 0, 0);
     }
     if (info->output_bytes > 0) {
-        emit_row("output", info->output_bytes, 0, 0, 0, 0, 0);
+        add_row("output", (long)info->output_bytes, 0, 0, 0, 0, 0);
     }
     for (const auto & [tname, tsize] : info->other_tensors) {
-        emit_row(tname.c_str(), tsize, 0, 0, 0, 0, 0);
+        add_row(tname.c_str(), (long)tsize, 0, 0, 0, 0, 0);
     }
     // tied lm_head: without a separate output tensor the loader duplicates the
     // token embedding as an OUTPUT tensor (llama-model-loader.cpp) — that GPU
     // copy is part of what must be distributed, hence this last row.
     if (info->output_bytes == 0 && info->embed_bytes > 0) {
-        emit_row("embed", info->embed_bytes, 0, 0, 0, 0, 0);
+        add_row("embed", (long)info->embed_bytes, 0, 0, 0, 0, 0);
     }
 
-    // ---- totals: exactly the sum of the rows printed above ------------------
-    fprintf(out, "%s\n", box("├", "┼", "┤", widths).c_str());
-    {
-        int64_t total_moe = 0;
-        for (uint32_t il = 0; il < n_layer_all - n_layer_nextn; ++il) {
-            if (is_moe_layer(il)) ++total_moe;
-        }
-        std::vector<int64_t> vals;
-        vals.push_back(0);                          // label slot (unused)
-        vals.push_back(printed_base);               // sum of visible rows
-        if (has_moe) vals.push_back(total_moe);     // moe layer count
-        if (has_mtp) vals.push_back(printed_mtp);
-        vals.push_back(total_rate);
-        if (has_mtp) vals.push_back(mtp_rate);
-        if (has_swa || has_ssm) vals.push_back(total_state + mtp_state);
-        fprintf(out, "%s\n", data_row("TOTAL", vals, widths).c_str());
+    // ---- totals: exactly the sum of the rows above ---------------------------
+    int64_t total_moe = 0;
+    for (uint32_t il = 0; il < n_layer_all - n_layer_nextn; ++il) {
+        if (is_moe_layer(il)) ++total_moe;
     }
-    fprintf(out, "%s\n", box("└", "┴", "┘", widths).c_str());
+    std::vector<long> total_vals;   // parallel to hdr
+    total_vals.push_back((long)printed_base);            // sum of visible rows
+    if (has_moe)  total_vals.push_back((long)total_moe); // moe layer count
+    if (has_mtp)  total_vals.push_back((long)printed_mtp);
+    total_vals.push_back((long)total_rate);
+    if (has_mtp)  total_vals.push_back((long)mtp_rate);
+    if (has_swa || has_ssm) total_vals.push_back((long)(total_state + mtp_state));
+    keys.push_back("TOTAL");
+    data.push_back(std::move(total_vals));
+
+    // ---- emit through the shared printer -------------------------------------
+    std::vector<const char *> hdr_arr = hdr;   // already const char* elements
+    std::vector<const char *> key_arr;
+    for (const auto & k : keys) key_arr.push_back(k.c_str());
+
+    // build the long** matrix expected by the C interface from our row storage
+    std::vector<const long *> data_ptrs(keys.size());
+    for (size_t r = 0; r < keys.size(); ++r) {
+        data_ptrs[r] = data[r].data();
+    }
+
+    fprintf(out, "\n");
+    // labels exclude the key column (handled by key_header); widths include it first
+    print_table(out, (int)keys.size(), (int)hdr_arr.size() - 1,
+                hdr_arr.data() + 1, key_arr.data(), "layer", data_ptrs.data(), widths.data(), true);
 
     return 1;
 }

@@ -293,6 +293,24 @@ LLAMA_API uint32_t llama_model_n_layer_all(const struct llama_model * model);
 // sits on CPU or il is out of range. Verifies a planned load's placement.
 LLAMA_API int32_t llama_model_layer_device_index(const struct llama_model * model, int il);
 
+// [FORK] generic boxed table for the sizing tools (model-info layer table,
+// kv-fit cost breakdown). Thin box-drawing characters only; key column
+// (row_labels) and data columns right-aligned, header centered.
+//   labels      : n_col column headers (may be NULL -> empty header cells)
+//   row_labels  : n_row row keys, right-aligned in the first column (may be NULL)
+//   key_header  : header cell of the key column; NULL/"" = empty
+//   data        : n_row x n_col numbers (may be NULL -> empty cells)
+//   cell_widths : one width per column (key column first); NULL = auto-measure
+LLAMA_API void print_table(FILE * out,
+        int n_row, int n_col,
+        const char ** labels,
+        const char ** row_labels,
+        const char * key_header,
+        const long ** data,
+        const int * cell_widths,
+        bool totals_separated);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
+
