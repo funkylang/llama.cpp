@@ -357,7 +357,8 @@ static std::vector<size_t> kvfit_greedy_walk(uint32_t n_blocks,
 // buf_bpc[g]: measured compute-buffer bytes per pool cell on GPU g (hi-lo
 // difference of the memory breakdown). Always charged, on every GPU,
 // independent of layer distribution — the graph reserves them per device.
-// The MTP draft context reuses these; it adds no extra compute charge.
+// When a device hosts the MTP draft context, it gets its OWN separate compute
+// buffers on top of the main ones; mtp_rate is added into buf_bpc above.
 static bool kvfit_try_place(uint32_t n_blocks,
                             const std::vector<kvfit_layer_cost> & layers,
                             const std::vector<uint64_t> & budgets,
@@ -868,6 +869,15 @@ struct kvfit_measure_result {
     // llama_get_memory_breakdown() at two pool sizes. Replaces the old kq_mask
     // guess — the rate is context-size-independent, so it holds for any pool.
     std::vector<uint64_t> compute_rate_main;        // main-context rate (per device)
+    
+    // MTP draft context's own compute buffers per device (from its breakdown).
+    // When a device hosts the MTP draft context, it gets these as a SEPARATE
+    // allocation from the main context's compute buffers — we charge both.
+    std::vector<uint64_t> compute_bytes_mtp;        // mtp-context bytes (per device)
+    
+    // MTP draft context compute rate per cell (computed from compute_bytes_mtp / n_ctx_measure)
+    // Used in the solver to add extra charge on devices that host nextn layers.
+    std::vector<uint64_t> mtp_rate;                 // mtp-context rate (per device)
 };
 
 static bool kvfit_measure(const char * path,
@@ -982,10 +992,10 @@ static bool kvfit_measure(const char * path,
             const uint64_t d_bytes = (compute_hi[i] > compute_lo[i]) ? compute_hi[i] - compute_lo[i] : 0;
             r.compute_rate_main[i] = (hi_cells > lo_cells) ? d_bytes / (hi_cells - lo_cells) : 0;
         }
-        // No separate MTP rate: the MTP draft context does not need its own
-        // compute buffers — it reuses the main context's. The per-device rate
-        // above is charged to every GPU of the deployment, full stop.
-
+        // MTP draft context gets its OWN compute buffers (measured separately below).
+        // The per-device main rate is charged on every GPU; MTP adds its own charge
+        // on devices that host the nextn layers.
+        
         LLAMA_LOG_PLANNING("      compute-buffer rate (from llama_get_memory_breakdown, pools %u -> %u):\n",
                            lo_cells, hi_cells);
         {
@@ -995,7 +1005,7 @@ static bool kvfit_measure(const char * path,
                 if (!dev) continue;
                 const auto t = ggml_backend_dev_type(dev);
                 if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
-                LLAMA_LOG_PLANNING("        %s: %llu B/cell\n",
+                LLAMA_LOG_PLANNING("        %s: main rate = %llu B/cell\n",
                                    ggml_backend_dev_name(dev),
                                    (unsigned long long)r.compute_rate_main[gi]);
             }
@@ -1040,7 +1050,30 @@ static bool kvfit_measure(const char * path,
                 LLAMA_LOG_ERROR("kvfit: MTP draft decode failed (%d)\n", rc);
             } else {
                 r.mtp_measured = true;
-                kvfit_compute_by_device(ctx_mtp, "mtp ctx");   // MTP draft context breakdown
+                r.compute_bytes_mtp = kvfit_compute_by_device(ctx_mtp, "mtp ctx");   // MTP draft context breakdown
+                
+                // Calculate MTP rate per cell for each device
+                size_t ndevs_mtp = ggml_backend_dev_count();
+                r.mtp_rate.assign(ndevs_mtp, 0);
+                for (size_t i = 0; i < ndevs_mtp && i < r.compute_bytes_mtp.size(); ++i) {
+                    if (r.compute_bytes_mtp[i] > 0 && n_ctx_measure > 0) {
+                        r.mtp_rate[i] = r.compute_bytes_mtp[i] / n_ctx_measure;
+                    }
+                }
+                
+                LLAMA_LOG_PLANNING("      compute-buffer rate (MTP draft context):\n");
+                size_t gi = 0;
+                for (size_t i = 0; i < ndevs_mtp && gi < r.mtp_rate.size(); ++gi) {
+                    ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                    if (!dev) continue;
+                    const auto t = ggml_backend_dev_type(dev);
+                    if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
+                    if (r.mtp_rate[gi] > 0) {
+                        LLAMA_LOG_PLANNING("        %s: MTP rate = %llu B/cell\n",
+                                           ggml_backend_dev_name(dev),
+                                           (unsigned long long)r.mtp_rate[gi]);
+                    }
+                }
             }
         } else {
             LLAMA_LOG_WARN("kvfit: MTP draft context init failed — nextn KV pool NOT in the measured delta\n");
@@ -1336,6 +1369,10 @@ static kvfit_plan kvfit_plan_compute(const char * path,
             const auto t = ggml_backend_dev_type(dev);
             if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
             buf_bpc[gi] = (i < meas.compute_rate_main.size()) ? meas.compute_rate_main[i] : 0;
+            // MTP draft context has its own compute buffers: add them when present
+            if (i < meas.mtp_rate.size() && meas.mtp_rate[i] > 0) {
+                buf_bpc[gi] += meas.mtp_rate[i];
+            }
             buffers_total += buf_bpc[gi];
             ++gi;
         }
