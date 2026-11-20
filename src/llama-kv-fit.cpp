@@ -739,7 +739,11 @@ static int kvfit_warmup_decode(llama_context * ctx, const std::vector<int32_t> &
 // and shows the actual memory state. Both tests share ONE model load — only
 // n_ctx differs between them, so no second load is needed.
 
-static void kvfit_verify_plan(const char * path,
+// Run the verification load: model with the COMPUTED split + context at the
+// planned pool + warmup decode (forces every lazy kernel allocation). Also
+// proves the loader honored the plan's boundaries (per-layer readback).
+// Returns true only when every stage succeeded.
+static bool kvfit_verify_plan(const char * path,
                               const llama_model_params * mparams_base,
                               const llama_context_params * cparams_base,
                               bool measure_mtp,
@@ -769,8 +773,31 @@ static void kvfit_verify_plan(const char * path,
     if (!model) {
         LLAMA_LOG_ERROR("kvfit_verify_plan: failed to load model with computed split\n");
         delete[] bounds;
-        return;
+        return false;
     }
+
+    // placement readback: prove the loader applied the plan's boundaries
+    // (expected device = last whose bound does not exceed il; the output
+    // pseudo-layer lands on the last device; -1 = CPU = a failure)
+    const uint32_t n_layer_all = llama_model_n_layer_all(model);
+    for (uint32_t il = 0; il <= n_layer_all; ++il) {
+        const int dev = llama_model_layer_device_index(model, il);
+        int expected = 0;
+        for (size_t g = nd; g > 0; --g) {
+            if ((int32_t)il >= first_layer[g - 1]) { expected = (int)(g - 1); break; }
+        }
+        if (dev != expected) {
+            char what[32];
+            if (il == n_layer_all) strcpy(what, "output");
+            else snprintf(what, sizeof what, "layer %u", il);
+            LLAMA_LOG_ERROR("kvfit_verify_plan: MISMATCH at %s: loaded on device %d, plan says %d\n",
+                            what, dev, expected);
+            llama_model_free(model);
+            delete[] bounds;
+            return false;   // the loader ignored the planned boundaries
+        }
+    }
+    LLAMA_LOG_PLANNING("      placement verified: all layers on their planned devices\n");
 
     // Hamlet warmup text (reuse the same prompt as the measurement)
     std::vector<int32_t> prompt_tokens(strlen(WARMUP_TEXT) + 8);
@@ -781,7 +808,7 @@ static void kvfit_verify_plan(const char * path,
         LLAMA_LOG_ERROR("kvfit_verify_plan: warmup tokenization failed\n");
         llama_model_free(model);
         delete[] bounds;
-        return;
+        return false;
     }
     prompt_tokens.resize(n_tok);
 
@@ -796,10 +823,10 @@ static void kvfit_verify_plan(const char * path,
 
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) {
-        LLAMA_LOG_ERROR("kvfit_verify_plan: context init failed\n");
+        LLAMA_LOG_ERROR("kvfit_verify_plan: context init failed — plan over-committed VRAM\n");
         llama_model_free(model);
         delete[] bounds;
-        return;
+        return false;
     }
 
     // MTP draft context when measuring it (same pattern as kvfit_measure)
@@ -816,9 +843,11 @@ static void kvfit_verify_plan(const char * path,
     }
 
     // Warmup decode to trigger all kernel allocations
+    bool verified = true;
     const int decoded = kvfit_warmup_decode(ctx, prompt_tokens);
     if (decoded == 0) {
         LLAMA_LOG_ERROR("kvfit_verify_plan: warmup decode failed\n");
+        verified = false;
     }
 
     // MTP draft decode when present
@@ -839,6 +868,7 @@ static void kvfit_verify_plan(const char * path,
         free(state);
         if (rc != 0) {
             LLAMA_LOG_ERROR("kvfit_verify_plan: MTP draft decode failed (%d)\n", rc);
+            verified = false;
         }
     }
 
@@ -864,6 +894,7 @@ static void kvfit_verify_plan(const char * path,
     // Cleanup
     llama_model_free(model);
     delete[] bounds;
+    return verified;
 }
 
 // ============================================================================
@@ -1721,9 +1752,12 @@ static kvfit_plan kvfit_plan_compute(const char * path,
     }
 
     // ---- Verification run: prove the plan works at runtime (opt-in) ----------
-    if (params->verify) {
-        kvfit_verify_plan(path, mparams, cparams, measure_mtp, 
-                          plan.first_layer, n_cells);
+    if (params->verify &&
+        !kvfit_verify_plan(path, mparams, cparams, measure_mtp,
+                           plan.first_layer, n_cells)) {
+        LLAMA_LOG_ERROR("kvfit: verification failed — this plan does not deploy, "
+                        "no plan reported\n");
+        plan.ok = false;
     }
 
     return plan;
