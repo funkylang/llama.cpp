@@ -1,5 +1,5 @@
 // shared model header + layer table for the fork's sizing tools
-// (llama-gpu-split, llama-kv-fit-test, llama-kv-fit-deviation).
+// (llama-gpu-split, llama-kv-fit-test).
 // ONE complete header per tool run (gpu-split label style), followed by the
 // boxed per-layer table — printed ONCE, never per load.
 #pragma once
