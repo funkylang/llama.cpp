@@ -206,7 +206,7 @@ extern "C" {
 // the version the caller requires.
 //
 
-#define LLAMA_KV_FIT_PARAMS_VERSION 3
+#define LLAMA_KV_FIT_PARAMS_VERSION 4
 
 struct llama_kv_fit_params {
     double vram_fraction;                 // hard cap on device usage (default 0.97)
@@ -223,6 +223,11 @@ struct llama_kv_fit_params {
     // size, incl. warmup decode) to prove the plan fits at runtime. Opt-in:
     // expensive and for diagnostics — production startups leave it off.
     bool verify;
+    // v4: print the planning internals (memory-breakdown readbacks,
+    // compute-buffer rate measurements, free VRAM after the measurement
+    // run, overhead-decomposition formulas). Off by default: what remains
+    // is the plan, its budgets and the cost tables.
+    bool debug;
     // FUTURE FIELDS: append here; initialize in llama_kv_fit_params_new()
 };
 

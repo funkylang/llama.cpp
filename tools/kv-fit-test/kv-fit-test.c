@@ -65,7 +65,9 @@ static void usage(const char * prog) {
         "  --cache-type-v T        KV cache type for V    [f16]\n"
         "  --ubatch-size N         physical ubatch size     [512]\n"
         "  --verify                run one verification load with the computed plan\n"
-        "                          (split + pool + warmup; proves it fits at runtime)\n",
+        "                          (split + pool + warmup; proves it fits at runtime)\n"
+        "  --debug                 print planning internals (breakdown readbacks,\n"
+        "                          rate measurements, decomposition formulas)\n",
         prog);
 }
 
@@ -75,6 +77,7 @@ int main(int argc, char ** argv) {
     enum ggml_type type_k = GGML_TYPE_F16, type_v = GGML_TYPE_F16;
     bool flash_attn = true;
     bool verify = false;
+    bool debug = false;
     uint32_t ubatch_size = 512;
 
     for (int i = 1; i < argc; ++i) {
@@ -93,6 +96,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(a, "--cache-type-v")) type_v          = kv_type_from_str(argv[i]);
         else if (!strcmp(a, "--ubatch-size"))  ubatch_size     = (uint32_t)atoi(argv[i]);
         else if (!strcmp(a, "--verify"))       verify          = true;
+        else if (!strcmp(a, "--debug"))        debug           = true;
         else if (!g_path)                      g_path          = argv[i];
         else { fprintf(stderr, "error: unexpected argument '%s'\n", a); return 1; }
     }
@@ -143,6 +147,7 @@ int main(int argc, char ** argv) {
     // the planner uses it verbatim rather than re-deriving from context params.
     params->n_checkpoints = cparams.n_seq_max * (1u + cparams.n_rs_seq);
     params->verify        = verify;   // post-solve verification load (opt-in)
+    params->debug         = debug;    // planning-internals output (opt-in)
 
     int32_t layer_bounds[16];   // llama_max_devices(); auto_split fills the used entries
     memset(layer_bounds, 0, sizeof(layer_bounds));

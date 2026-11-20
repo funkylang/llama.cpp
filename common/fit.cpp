@@ -930,6 +930,7 @@ enum common_params_fit_status common_fit_params(
         kvfit_params->vram_fraction = 0.97;   // hard cap on device usage (old VRAM_FRACTION)
         kvfit_params->margins       = margins;
         kvfit_params->extra         = lib_extra_ptr;
+        kvfit_params->debug         = log_level >= GGML_LOG_LEVEL_DEBUG;   // -v 4 reveals the planning internals
     }
 
     try {

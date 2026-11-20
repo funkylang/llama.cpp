@@ -56,6 +56,7 @@ LLAMA_API struct llama_kv_fit_params * llama_kv_fit_params_new(uint32_t min_vers
     p->min_pool_cells = 32768;  // report deployments that cannot plan at least this many cells
     p->n_checkpoints  = 0;      // legacy: derive from context params when not set
     p->verify         = false;  // v3: post-solve verification load is opt-in
+    p->debug          = false;  // v4: planning-internals output is opt-in
     return p;
 }
 
@@ -914,21 +915,23 @@ static bool kvfit_verify_plan(const char * path,
 // ground truth our old kq_mask formula had to guess at. ..._Host bufts are
 // printed as their own rows but live in system RAM — they are NEVER folded
 // into a GPU rate (that contamination doubled the ROCm0 rate on rocky2).
-static std::vector<uint64_t> kvfit_compute_by_device(const llama_context * ctx, const char * label) {
+static std::vector<uint64_t> kvfit_compute_by_device(const llama_context * ctx, const char * label, bool debug) {
     const size_t ndevs = ggml_backend_dev_count();
     std::vector<uint64_t> compute(ndevs, 0);
-    fprintf(stderr, "  breakdown [%s] (from llama_get_memory_breakdown):\n", label);
+    if (debug) fprintf(stderr, "  breakdown [%s] (from llama_get_memory_breakdown):\n", label);
     for (auto & [buft, data] : llama_get_memory_breakdown(ctx)) {
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
         if (!dev) continue;
         for (size_t i = 0; i < ndevs; ++i) {
             if (ggml_backend_dev_get(i) == dev) {
-                fprintf(stderr, "    buft_name='%s'  compute=%llu (%.2f GiB)  context=%llu (%.2f GiB)\n",
-                        ggml_backend_buft_name(buft), 
-                        (unsigned long long)data.compute, 
-                        (double)data.compute / (1024.0 * 1024.0 * 1024.0),
-                        (unsigned long long)data.context,
-                        (double)data.context / (1024.0 * 1024.0 * 1024.0));
+                if (debug) {
+                    fprintf(stderr, "    buft_name='%s'  compute=%llu (%.2f GiB)  context=%llu (%.2f GiB)\n",
+                            ggml_backend_buft_name(buft), 
+                            (unsigned long long)data.compute, 
+                            (double)data.compute / (1024.0 * 1024.0 * 1024.0),
+                            (unsigned long long)data.context,
+                            (double)data.context / (1024.0 * 1024.0 * 1024.0));
+                }
                 if (!ggml_backend_buft_is_host(buft)) {   // host RAM never counts against GPU rates
                     compute[i] += data.compute;
                 }
@@ -972,6 +975,7 @@ static bool kvfit_measure(const char * path,
                           const llama_model_params * mparams,
                           const llama_context_params * cparams,
                           bool measure_mtp,
+                          bool debug,
                           kvfit_measure_result & r) {
     // raw-device scan is the caller's job (Guard 2 + budget denominators); it
     // prints once and its snapshot feeds the delta decomposition below.
@@ -1062,7 +1066,7 @@ static bool kvfit_measure(const char * path,
         const size_t ndevs = ggml_backend_dev_count();
         const uint32_t lo_cells  = n_ctx_measure;
         const uint32_t hi_cells  = 2u * lo_cells;
-        std::vector<uint64_t> compute_lo = kvfit_compute_by_device(ctx0, "main ctx, lo pool");   // main ctx at lo
+        std::vector<uint64_t> compute_lo = kvfit_compute_by_device(ctx0, "main ctx, lo pool", debug);   // main ctx at lo
         
         // Create hi-pool context for rate measurement (keep alive for MTP measurement too)
         llama_context_params cp_hi = cp;
@@ -1077,7 +1081,7 @@ static bool kvfit_measure(const char * path,
         // Measure main context at hi pool
         std::vector<uint64_t> compute_hi;
         if (ctx_hi_main) {
-            compute_hi = kvfit_compute_by_device(ctx_hi_main, "main ctx, hi pool");   // main ctx at hi
+            compute_hi = kvfit_compute_by_device(ctx_hi_main, "main ctx, hi pool", debug);   // main ctx at hi
         }
 
         // Calculate main rate from hi-lo difference
@@ -1093,7 +1097,7 @@ static bool kvfit_measure(const char * path,
 
         // MTP draft context gets its OWN compute buffers. Measure using hi-lo difference.
         if (measure_mtp && llama_model_n_layer_nextn(model) > 0 && ctx_hi_main) {
-            LLAMA_LOG_PLANNING("      measuring MTP draft context rate (pools %u -> %u):\n", lo_cells, hi_cells);
+            if (debug) LLAMA_LOG_PLANNING("      measuring MTP draft context rate (pools %u -> %u):\n", lo_cells, hi_cells);
             
             // Create MTP at lo pool referencing ctx0 (main at lo)
             llama_context_params cp_mtp_lo = cp;  // same as ctx0's params
@@ -1113,12 +1117,12 @@ static bool kvfit_measure(const char * path,
             // Measure at lo pool
             ctx_mtp_lo = llama_init_from_model(model, cp_mtp_lo);
             if (ctx_mtp_lo) {
-                mtp_compute_lo = kvfit_compute_by_device(ctx_mtp_lo, "mtp ctx, lo pool");
+                mtp_compute_lo = kvfit_compute_by_device(ctx_mtp_lo, "mtp ctx, lo pool", debug);
                 
                 // Measure at hi pool
                 ctx_mtp_hi = llama_init_from_model(model, cp_mtp_hi);
                 if (ctx_mtp_hi) {
-                    mtp_compute_hi = kvfit_compute_by_device(ctx_mtp_hi, "mtp ctx, hi pool");
+                    mtp_compute_hi = kvfit_compute_by_device(ctx_mtp_hi, "mtp ctx, hi pool", debug);
                 } else {
                     LLAMA_LOG_WARN("kvfit: MTP context init at hi pool failed\n");
                 }
@@ -1138,8 +1142,8 @@ static bool kvfit_measure(const char * path,
                 r.compute_lo_mtp = mtp_compute_lo;
                 r.compute_hi_mtp = mtp_compute_hi;
                 
-                // Log MTP rates
-                {
+                // Log MTP rates (diagnostic only — the rate values flow into the solver regardless)
+                if (debug) {
                     for (size_t i = 0; i < ndevs && i < r.mtp_rate.size(); ++i) {
                         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
                         if (!dev) continue;
@@ -1159,9 +1163,9 @@ static bool kvfit_measure(const char * path,
             if (ctx_mtp_hi) llama_free(ctx_mtp_hi);
         }
 
-        LLAMA_LOG_PLANNING("      compute-buffer rate (from llama_get_memory_breakdown, pools %u -> %u):\n",
+        if (debug) LLAMA_LOG_PLANNING("      compute-buffer rate (from llama_get_memory_breakdown, pools %u -> %u):\n",
                            lo_cells, hi_cells);
-        {
+        if (debug) {
             for (size_t i = 0; i < ndevs && i < r.compute_rate_main.size(); ++i) {
                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);
                 if (!dev) continue;
@@ -1223,7 +1227,7 @@ static bool kvfit_measure(const char * path,
                 // division (bytes / n_ctx) wrongly folds in the fixed base, so it
                 // is never used here as a fallback: a missing hi-lo measurement
                 // leaves the rate 0 rather than reporting an inflated value.
-                kvfit_compute_by_device(ctx_mtp, "mtp ctx");
+                kvfit_compute_by_device(ctx_mtp, "mtp ctx", debug);
             }
         } else {
             LLAMA_LOG_WARN("kvfit: MTP draft context init failed — nextn KV pool NOT in the measured delta\n");
@@ -1231,7 +1235,7 @@ static bool kvfit_measure(const char * path,
     }
 
     const double warmup_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warmup0).count();
-    LLAMA_LOG_PLANNING("      measurement: done; load %.1f s + warmup %.1f s (%.0f tok/s)%s\n",
+    if (debug) LLAMA_LOG_PLANNING("      measurement: done; load %.1f s + warmup %.1f s (%.0f tok/s)%s\n",
                        load_s, warmup_s, warmup_s > 0 ? (double)n_tok / warmup_s : 0.0,
                        r.mtp_measured ? " [mtp draft context ready]" : "");
 
@@ -1421,7 +1425,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
 
     // ---- the measurement run ----------------------------------------------------
     kvfit_measure_result meas;
-    if (!kvfit_measure(path, mparams, cparams, measure_mtp, meas)) {
+    if (!kvfit_measure(path, mparams, cparams, measure_mtp, params->debug, meas)) {
         return plan;   // kvfit_measure already reported
     }
     const bool mtp_measured = meas.mtp_measured;
@@ -1438,17 +1442,19 @@ static kvfit_plan kvfit_plan_compute(const char * path,
                               ? params->n_checkpoints
                               : n_seq_max * (1u + n_rs_seq);
 
-    // ---- per-device free VRAM after measurement ----------------------------------
-    LLAMA_LOG_PLANNING("\n      device free VRAM after measurement (post-Hamlet decode):\n");
-    for (size_t i = 0; i < scan_raw.size(); ++i) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (!dev || !scan_raw[i].ok) continue;
-        const auto t = ggml_backend_dev_type(dev);
-        if (t == GGML_BACKEND_DEVICE_TYPE_CPU) continue;   // GPU tool: never show CPU
-        LLAMA_LOG_PLANNING("        %-4zu %-6s free=%14llu  %s\n",
-                           i, kvfit_dev_type_str(t),
-                           (unsigned long long)meas.scan_measure[i].free_bytes,
-                           ggml_backend_dev_name(dev));
+    // ---- per-device free VRAM after measurement (diagnostic, --debug only) -----
+    if (params->debug) {
+        LLAMA_LOG_PLANNING("\n      device free VRAM after measurement (post-Hamlet decode):\n");
+        for (size_t i = 0; i < scan_raw.size(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (!dev || !scan_raw[i].ok) continue;
+            const auto t = ggml_backend_dev_type(dev);
+            if (t == GGML_BACKEND_DEVICE_TYPE_CPU) continue;   // GPU tool: never show CPU
+            LLAMA_LOG_PLANNING("        %-4zu %-6s free=%14llu  %s\n",
+                               i, kvfit_dev_type_str(t),
+                               (unsigned long long)meas.scan_measure[i].free_bytes,
+                               ggml_backend_dev_name(dev));
+        }
     }
 
     // ---- per-device decomposition of the measured delta -------------------------
@@ -1458,7 +1464,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
     // left over is the kernels residual. The base-buffer is the width-0
     // intercept of those measured compute buffers (lo - (hi - lo)); it is a
     // separate quantity, never derived from the kernels residual.
-    LLAMA_LOG_PLANNING("\n      overhead decomposition: "
+    if (params->debug) LLAMA_LOG_PLANNING("\n      overhead decomposition: "
                        "kernels = delta - weights - probe-KV - SSM(state rows x bytes/row) - compute(lo)\n"
                        "        base-buffer = compute-lo - (compute-hi - compute-lo), per measured context\n");
     const uint64_t probe_cells = ((uint64_t)n_ctx_measure + 255u) / 256u * 256u; // GGML_PAD, as the cache does
@@ -1545,23 +1551,25 @@ static kvfit_plan kvfit_plan_compute(const char * path,
             d_kv_bpc[gi]  = kv_bpc;
             d_mtp_bpc[gi] = mtp_bpc;
 
-            LLAMA_LOG_PLANNING("        %s: delta=%llu weights=%llu probe-KV=%llu "
-                               "(cells(%llu) x bpc(%llu)) SSM=%llu compute-lo=%llu kernels=%llu\n",
-                               ggml_backend_dev_name(dev),
-                               (unsigned long long)d_delta[gi], (unsigned long long)d_weights[gi],
-                               (unsigned long long)d_probe_kv[gi],
-                               (unsigned long long)probe_cells, (unsigned long long)(kv_bpc + mtp_bpc),
-                               (unsigned long long)ssm_alloc,
-                               (unsigned long long)compute_lo_probe,
-                               (unsigned long long)d_kernels[gi]);
-            LLAMA_LOG_PLANNING("        %s: base-buffer = main[lo(%llu) - (hi(%llu)-lo(%llu))] "
-                               "+ mtp[lo(%llu) - (hi(%llu)-lo(%llu))] = %llu\n",
-                               ggml_backend_dev_name(dev),
-                               (unsigned long long)compute_lo_main, (unsigned long long)compute_hi_main,
-                               (unsigned long long)compute_lo_main,
-                               (unsigned long long)compute_lo_mtp, (unsigned long long)compute_hi_mtp,
-                               (unsigned long long)compute_lo_mtp,
-                               (unsigned long long)d_base[gi]);
+            if (params->debug) {
+                LLAMA_LOG_PLANNING("        %s: delta=%llu weights=%llu probe-KV=%llu "
+                                   "(cells(%llu) x bpc(%llu)) SSM=%llu compute-lo=%llu kernels=%llu\n",
+                                   ggml_backend_dev_name(dev),
+                                   (unsigned long long)d_delta[gi], (unsigned long long)d_weights[gi],
+                                   (unsigned long long)d_probe_kv[gi],
+                                   (unsigned long long)probe_cells, (unsigned long long)(kv_bpc + mtp_bpc),
+                                   (unsigned long long)ssm_alloc,
+                                   (unsigned long long)compute_lo_probe,
+                                   (unsigned long long)d_kernels[gi]);
+                LLAMA_LOG_PLANNING("        %s: base-buffer = main[lo(%llu) - (hi(%llu)-lo(%llu))] "
+                                   "+ mtp[lo(%llu) - (hi(%llu)-lo(%llu))] = %llu\n",
+                                   ggml_backend_dev_name(dev),
+                                   (unsigned long long)compute_lo_main, (unsigned long long)compute_hi_main,
+                                   (unsigned long long)compute_lo_main,
+                                   (unsigned long long)compute_lo_mtp, (unsigned long long)compute_hi_mtp,
+                                   (unsigned long long)compute_lo_mtp,
+                                   (unsigned long long)d_base[gi]);
+            }
             ++gi;
         }
     }
