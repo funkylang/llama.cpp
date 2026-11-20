@@ -119,67 +119,6 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
-// [KV-LEAK] diagnostics for the kv-cache-size crash investigation (2026-10-29):
-// traces the effective KV dimensions of attention graphs as built at RESERVE and RUNTIME
-// time, to determine whether the pool size leaks into compute node shapes.
-// silent unless LLAMA_KV_LEAK_TRACE is set; when active, prints to stderr directly
-// so it is visible regardless of the -lv setting, with no impact on other levels.
-static void llama_kv_leak_trace_graph(
-        const char * tag,
-        ggml_cgraph * gf,
-        uint32_t      n_tokens,
-        uint32_t      n_ctx_train,
-        uint64_t *    dedup_dim) {
-    static const bool enabled = kv_leak_trace_enabled();
-    if (!enabled || !gf) {
-        return;
-    }
-
-    int n_fa = 0;
-    uint64_t max_kv_dim = 0;
-    uint64_t max_mask   = 0;
-    uint64_t mask_bytes_total = 0;
-    int      n_masks   = 0;
-
-    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-        const ggml_tensor * node = ggml_graph_node(gf, i);
-
-        if (node->op == GGML_OP_FLASH_ATTN_EXT && node->src[1]) {
-            n_fa++;
-            max_kv_dim = std::max<uint64_t>(max_kv_dim, (uint64_t) node->src[1]->ne[1]);
-        }
-
-        if (strcmp(node->name, "attn_inp_kq_mask") == 0) {
-            max_mask = std::max<uint64_t>(max_mask, (uint64_t) node->ne[0]);
-            mask_bytes_total += (uint64_t) ggml_nbytes(node);
-            n_masks++;
-        }
-    }
-
-    // dedup: skip when the KV dimension is unchanged (runtime graphs are rebuilt on every padding step)
-    if (dedup_dim && max_kv_dim > 0 && max_kv_dim == *dedup_dim) {
-        return;
-    }
-    if (dedup_dim) {
-        *dedup_dim = max_kv_dim;
-    }
-
-    fprintf(stderr,
-            "[KV-LEAK] %s: n_tokens=%u n_ctx_train=%u fa_nodes=%d max_kv_dim=%" PRIu64 " mask_n_kv=%" PRIu64
-            " kq_masks=%d kq_mask_bytes=%" PRIu64 "\n",
-            tag, n_tokens, n_ctx_train, n_fa, max_kv_dim, max_mask,
-            n_masks, mask_bytes_total);
-
-    if (max_kv_dim > n_ctx_train || max_mask > n_ctx_train) {
-        fprintf(stderr,
-                "[KV-LEAK] %s: WARNING - graph dimension (%" PRIu64 " / %" PRIu64 ") exceeds n_ctx_train (%u)\n",
-                tag, max_kv_dim, max_mask, n_ctx_train);
-    }
-}
-
-// [KV-LEAK] per-context-type dedup state for runtime graph logs (see llama_kv_leak_trace_graph)
-static struct { uint64_t main_dim; uint64_t mtp_dim; } kv_leak_last_dims = {0, 0};
-
 struct llm_fused_op_probe {
     llm_fused_op op;
     const char * name;
@@ -1755,12 +1694,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
         gf = model.build_graph(gparams);
 
-        // [KV-LEAK] trace the KV dimensions of the runtime graph (deduped per context type)
-        llama_kv_leak_trace_graph(
-                cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "RUNTIME-MTP" : "RUNTIME",
-                gf, ubatch.n_tokens, model.hparams.n_ctx_train,
-                cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? &kv_leak_last_dims.mtp_dim : &kv_leak_last_dims.main_dim);
-
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
@@ -2942,11 +2875,6 @@ ggml_cgraph * llama_context::graph_reserve(
     res->reset();
 
     auto * gf = model.build_graph(gparams);
-
-    // [KV-LEAK] trace the KV dimensions of the reservation graph (see llama_kv_leak_trace_graph)
-    llama_kv_leak_trace_graph(
-            cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "RESERVE-MTP" : "RESERVE",
-            gf, ubatch.n_tokens, model.hparams.n_ctx_train, nullptr);
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
