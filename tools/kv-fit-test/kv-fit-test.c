@@ -5,9 +5,7 @@
 //   2. llama_kv_fit_auto_split()    — planned placement (tensor_layer_bounds)
 //   3. llama_kv_fit_max_pool()      — pool size (reuses step 2's measurement)
 //   4. real model load with the planned params; per-layer placement verified
-//      against the plan (proves the loader applies the boundaries verbatim);
-//      then llama_kv_fit_explain() prints what the solver CHARGES for exactly
-//      this placement + pool — the terms the measured deltas are compared to
+//      against the plan (proves the loader applies the boundaries verbatim)
 //   5. unified context at the planned pool — proves the plan fits on VRAM;
 //      plus the MTP draft context when the model has a nextn block (fllama shape)
 //   6. Shakespeare warmup decode on that context — forces every lazy
@@ -350,13 +348,9 @@ int main(int argc, char ** argv) {
     }
     fprintf(stderr, "  all layers on their planned devices\n");
 
-    // ---- 4a: what the solver CHARGES for this exact plan + pool --------------
-    // the terms the measured stage deltas below are compared against
-    llama_kv_fit_explain(g_path, &cparams, params, layer_bounds, ndev, (uint32_t)n_cells);
-
+    // ---- where the pool will come from --------------------------------------
     size_t snap[ND_MAX] = {0};
 
-    // ---- 4b: where the pool will come from --------------------------------------
     print_free_vram(model, ndev, "free VRAM after planned load (weights only)", base_free, base_free);
     read_all_devices(snap, base_tot);
 

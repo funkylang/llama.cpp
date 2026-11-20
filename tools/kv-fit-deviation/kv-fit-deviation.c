@@ -18,11 +18,9 @@
 //
 // Each run prints, per device: USED memory (baseline_free - free) and DELTA
 // (what this stage alone added over the previous one) at every allocation
-// stage: weights / +KV pool / +MTP KV / +compute — and what the SOLVER
-// charges for exactly this placement + pool (tensors / swa/ssm / cache /
-// mtp-cache / buffers via llama_kv_fit_explain). Measured deltas vs computed
-// terms show where and how much they deviate as cache size and distribution
-// vary.
+// stage: weights / +KV pool / +MTP KV / +compute. Consecutive pools with the
+// pinned split show where and how much usage scales as cache size and
+// distribution vary.
 
 #include "llama.h"
 #include "model-info.h"
@@ -267,14 +265,11 @@ static int warmup_decode(struct llama_context * ctx, const llama_token * tok, in
 
 // One isolated scenario: clean baseline -> load (explicit split) -> main ctx at
 // pool -> MTP ctx (when nextn) -> warmup decode -> per-stage used/delta tables.
-// The solver's own computed terms for this placement + pool are printed via
-// llama_kv_fit_explain, so measured and computed numbers sit next to each
-// other in the log. Frees everything before returning. Returns 0 ok, nonzero
-// on a hard failure (the log shows which stage).
+// Frees everything before returning. Returns 0 ok, nonzero on a hard failure
+// (the log shows which stage).
 static int run_single_test(const char * path,
                            const struct llama_model_params * mp_base,
                            const struct llama_context_params * cp_base,
-                           const struct llama_kv_fit_params * fit_params,
                            const struct run_cfg * cfg,
                            struct run_result * res) {
     fprintf(stderr, "\n\n================ RUN %s  (pool=%u cells) ================\n",
@@ -312,10 +307,6 @@ static int run_single_test(const char * path,
         fprintf(stderr, "    WARN: model has %d GPU devices but run specifies %d boundaries\n",
                 (int)llama_model_n_devices(model), cfg->n_bounds);
     }
-
-    // what the solver CHARGES for exactly this placement + pool — the numbers
-    // the measured stage deltas below are compared against
-    llama_kv_fit_explain(path, cp_base, fit_params, cfg->bounds, cfg->n_bounds, cfg->pool_cells);
 
     size_t f[ND_MAX], prev[ND_MAX];
     read_all_devices(f, tot);
@@ -505,18 +496,12 @@ int main(int argc, char ** argv) {
         { "12", {0, 43}, 2, 114688 },
     };
 
-    // planning options for llama_kv_fit_explain: the app knows its own SSM
-    // checkpoint policy (state rows per recurrent layer), passes it explicitly
-    struct llama_kv_fit_params * fit = llama_kv_fit_params_new(LLAMA_KV_FIT_PARAMS_VERSION);
-    fit->n_checkpoints = cp.n_seq_max * (1u + cp.n_rs_seq);
-
     int failures = 0;
     struct run_result results[12];
     memset(results, 0, sizeof(results));
     for (int r = 0; r < 12; ++r) {
-        failures += run_single_test(g_path, &mp, &cp, fit, &runs[r], &results[r]);
+        failures += run_single_test(g_path, &mp, &cp, &runs[r], &results[r]);
     }
-    llama_kv_fit_params_free(fit);
 
     // final comparison tables: measured free VRAM + scaling figures per
     // split x device — what the spreadsheet view wanted in one place
