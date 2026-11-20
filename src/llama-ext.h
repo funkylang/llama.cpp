@@ -206,7 +206,7 @@ extern "C" {
 // the version the caller requires.
 //
 
-#define LLAMA_KV_FIT_PARAMS_VERSION 2
+#define LLAMA_KV_FIT_PARAMS_VERSION 3
 
 struct llama_kv_fit_params {
     double vram_fraction;                 // hard cap on device usage (default 0.97)
@@ -219,6 +219,10 @@ struct llama_kv_fit_params {
     // count; the planner uses it verbatim, never re-derives it. 0 = legacy:
     // derive n_seq_max * (1 + n_rs_seq) from the context params.
     uint32_t n_checkpoints;
+    // v3: run the post-solve verification load (planned split + planned pool
+    // size, incl. warmup decode) to prove the plan fits at runtime. Opt-in:
+    // expensive and for diagnostics — production startups leave it off.
+    bool verify;
     // FUTURE FIELDS: append here; initialize in llama_kv_fit_params_new()
 };
 

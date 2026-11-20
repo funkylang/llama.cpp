@@ -55,6 +55,7 @@ LLAMA_API struct llama_kv_fit_params * llama_kv_fit_params_new(uint32_t min_vers
     p->extra          = nullptr;
     p->min_pool_cells = 32768;  // report deployments that cannot plan at least this many cells
     p->n_checkpoints  = 0;      // legacy: derive from context params when not set
+    p->verify         = false;  // v3: post-solve verification load is opt-in
     return p;
 }
 
@@ -784,86 +785,81 @@ static void kvfit_verify_plan(const char * path,
     }
     prompt_tokens.resize(n_tok);
 
-    // Helper lambda to run one verification test at a given context size
-    auto run_verification_test = [&](const char * test_name, uint32_t n_ctx) {
-        LLAMA_LOG_PLANNING("\n      verification %s: context size = %u\n", test_name, n_ctx);
+    // Single verification run at the planned pool size — what will actually
+    // deploy; the warmup decode forces every lazy kernel allocation
+    LLAMA_LOG_PLANNING("\n      verification run: context size = %u\n", (unsigned)n_cells_planned);
 
-        llama_context_params cp = *cparams_base;
-        cp.kv_unified = true;
-        cp.n_ctx      = n_ctx;
-        cp.n_kv_cache = 0;   // unified mode: pool follows n_ctx
+    llama_context_params cp = *cparams_base;
+    cp.kv_unified = true;
+    cp.n_ctx      = n_cells_planned;
+    cp.n_kv_cache = 0;   // unified mode: pool follows n_ctx
 
-        llama_context * ctx = llama_init_from_model(model, cp);
-        if (!ctx) {
-            LLAMA_LOG_ERROR("kvfit_verify_plan: context init failed for %s\n", test_name);
-            return;
+    llama_context * ctx = llama_init_from_model(model, cp);
+    if (!ctx) {
+        LLAMA_LOG_ERROR("kvfit_verify_plan: context init failed\n");
+        llama_model_free(model);
+        delete[] bounds;
+        return;
+    }
+
+    // MTP draft context when measuring it (same pattern as kvfit_measure)
+    llama_context * ctx_mtp = nullptr;
+    if (measure_mtp && llama_model_n_layer_nextn(model) > 0) {
+        llama_context_params cp_mtp = cp;
+        cp_mtp.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+        cp_mtp.n_rs_seq  = 0;
+        cp_mtp.ctx_other = ctx;
+        ctx_mtp = llama_init_from_model(model, cp_mtp);
+        if (!ctx_mtp) {
+            LLAMA_LOG_WARN("kvfit_verify_plan: MTP context init failed\n");
         }
+    }
 
-        // MTP draft context when measuring it (same pattern as kvfit_measure)
-        llama_context * ctx_mtp = nullptr;
-        if (measure_mtp && llama_model_n_layer_nextn(model) > 0) {
-            llama_context_params cp_mtp = cp;
-            cp_mtp.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
-            cp_mtp.n_rs_seq  = 0;
-            cp_mtp.ctx_other = ctx;
-            ctx_mtp = llama_init_from_model(model, cp_mtp);
-            if (!ctx_mtp) {
-                LLAMA_LOG_WARN("kvfit_verify_plan: MTP context init failed\n");
-            }
+    // Warmup decode to trigger all kernel allocations
+    const int decoded = kvfit_warmup_decode(ctx, prompt_tokens);
+    if (decoded == 0) {
+        LLAMA_LOG_ERROR("kvfit_verify_plan: warmup decode failed\n");
+    }
+
+    // MTP draft decode when present
+    if (ctx_mtp && decoded > 0) {
+        const int32_t n_embd = llama_model_n_embd(model);
+        float * state = (float *)calloc((size_t)n_embd, sizeof(float));
+
+        struct llama_batch_ext * mb = llama_batch_ext_init(ctx_mtp);
+        const int32_t idx = llama_batch_ext_add_token(mb, 0, prompt_tokens.back());
+        const llama_pos pos = (llama_pos)prompt_tokens.size();
+        llama_batch_ext_set_pos(mb, idx, &pos);
+        struct llama_embd embd_state = { state, 1, (size_t)n_embd };
+        llama_batch_ext_set_embd_state(mb, idx, embd_state);
+        llama_batch_ext_set_output_logits(mb, idx, true);
+
+        const int rc = llama_process(ctx_mtp, LLAMA_PROCESS_TYPE_DECODE, mb);
+        llama_batch_ext_free(mb);
+        free(state);
+        if (rc != 0) {
+            LLAMA_LOG_ERROR("kvfit_verify_plan: MTP draft decode failed (%d)\n", rc);
         }
+    }
 
-        // Warmup decode to trigger all kernel allocations
-        const int decoded = kvfit_warmup_decode(ctx, prompt_tokens);
-        if (decoded == 0) {
-            LLAMA_LOG_ERROR("kvfit_verify_plan: warmup decode failed for %s\n", test_name);
-        }
+    // Show per-GPU free VRAM after everything is loaded + warmed up
+    std::vector<kvfit_dev_snapshot> snaps;
+    kvfit_read_all_devices(snaps);
+    LLAMA_LOG_PLANNING("        free VRAM after planned context (post-warmup):\n");
+    for (size_t i = 0; i < snaps.size(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev || !snaps[i].ok) continue;
+        const auto t = ggml_backend_dev_type(dev);
+        if (t == GGML_BACKEND_DEVICE_TYPE_CPU) continue;   // GPU tool: never show CPU
+        LLAMA_LOG_PLANNING("          %-4zu %-6s free=%14llu  %s\n",
+                           i, kvfit_dev_type_str(t),
+                           (unsigned long long)snaps[i].free_bytes,
+                           ggml_backend_dev_name(dev));
+    }
 
-        // MTP draft decode when present
-        if (ctx_mtp && decoded > 0) {
-            const int32_t n_embd = llama_model_n_embd(model);
-            float * state = (float *)calloc((size_t)n_embd, sizeof(float));
-
-            struct llama_batch_ext * mb = llama_batch_ext_init(ctx_mtp);
-            const int32_t idx = llama_batch_ext_add_token(mb, 0, prompt_tokens.back());
-            const llama_pos pos = (llama_pos)prompt_tokens.size();
-            llama_batch_ext_set_pos(mb, idx, &pos);
-            struct llama_embd embd_state = { state, 1, (size_t)n_embd };
-            llama_batch_ext_set_embd_state(mb, idx, embd_state);
-            llama_batch_ext_set_output_logits(mb, idx, true);
-
-            const int rc = llama_process(ctx_mtp, LLAMA_PROCESS_TYPE_DECODE, mb);
-            llama_batch_ext_free(mb);
-            free(state);
-            if (rc != 0) {
-                LLAMA_LOG_ERROR("kvfit_verify_plan: MTP draft decode failed (%d)\n", rc);
-            }
-        }
-
-        // Show per-GPU free VRAM after everything is loaded + warmed up
-        std::vector<kvfit_dev_snapshot> snaps;
-        kvfit_read_all_devices(snaps);
-        LLAMA_LOG_PLANNING("        free VRAM after %s (post-warmup):\n", test_name);
-        for (size_t i = 0; i < snaps.size(); ++i) {
-            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            if (!dev || !snaps[i].ok) continue;
-            const auto t = ggml_backend_dev_type(dev);
-            if (t == GGML_BACKEND_DEVICE_TYPE_CPU) continue;   // GPU tool: never show CPU
-            LLAMA_LOG_PLANNING("          %-4zu %-6s free=%14llu  %s\n",
-                               i, kvfit_dev_type_str(t),
-                               (unsigned long long)snaps[i].free_bytes,
-                               ggml_backend_dev_name(dev));
-        }
-
-        // Cleanup this test's contexts
-        if (ctx_mtp) llama_free(ctx_mtp);
-        llama_free(ctx);
-    };
-
-    // Test 1: at probe context size (16384) — matches the measurement baseline
-    run_verification_test("probe", 16384);
-
-    // Test 2: at the planned pool size — this is what will actually deploy
-    run_verification_test("planned", n_cells_planned);
+    // Cleanup this run's contexts
+    if (ctx_mtp) llama_free(ctx_mtp);
+    llama_free(ctx);
 
     // Cleanup
     llama_model_free(model);
@@ -1724,9 +1720,11 @@ static kvfit_plan kvfit_plan_compute(const char * path,
                                    p_kv, p_mtp, buf_bpc, mtp_buf_bpc);
     }
 
-    // ---- Verification run: prove the plan works at runtime ---------------------
-    kvfit_verify_plan(path, mparams, cparams, measure_mtp, 
-                      plan.first_layer, n_cells);
+    // ---- Verification run: prove the plan works at runtime (opt-in) ----------
+    if (params->verify) {
+        kvfit_verify_plan(path, mparams, cparams, measure_mtp, 
+                          plan.first_layer, n_cells);
+    }
 
     return plan;
 }
