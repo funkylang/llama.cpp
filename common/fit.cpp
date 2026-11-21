@@ -917,10 +917,9 @@ enum common_params_fit_status common_fit_params(
     // unified KV pool requested: kv_unified with the pool size left to us (n_kv_cache == 0)
     const bool unified_pool_requested = cparams->kv_unified && cparams->n_kv_cache == 0;
 
-    // [FORK] planning options for the measurement-based fit API (§23.6/§23.8 of the
-    // gpu-split concept doc): allocated by libllama (stale-header safe), freed by RAII
-    // on every path. It must outlive BOTH fit calls below so the plan is computed once
-    // and reused — never call the kv_fit APIs with different params pointers in one run.
+    // [FORK] planning options for the unified kv-split API: allocated by libllama
+    // (stale-header safe), freed by RAII on every path. One params object per run —
+    // the plan cache keys on its address and the plan is computed once.
     struct kvfit_params_deleter {   // C++17: unique_ptr needs a functor, not &function, as deleter
         void operator()(llama_kv_fit_params * p) const { llama_kv_fit_params_free(p); }
     };
@@ -930,50 +929,49 @@ enum common_params_fit_status common_fit_params(
         kvfit_params->vram_fraction = 0.97;   // hard cap on device usage (old VRAM_FRACTION)
         kvfit_params->margins       = margins;
         kvfit_params->extra         = lib_extra_ptr;
-        kvfit_params->debug         = log_level >= GGML_LOG_LEVEL_DEBUG;   // -v 4 reveals the planning internals
+        kvfit_params->options       = (log_level >= GGML_LOG_LEVEL_DEBUG) ? LLAMA_KV_FIT_DEBUG : 0u;
     }
 
     try {
-        // [FORK] Auto-split optimization: compute optimal n_gpu_layers and tensor_split
-        // if the user hasn't explicitly set them and we're using unified KV cache
-        if (unified_pool_requested && !user_set_ngl && !user_set_split) {
-            LOG_INF("%s: attempting auto-split optimization for unified KV cache\n", __func__);
+        // [FORK] Unified KV split: ONE call decides the layer split AND the maximum pool.
+        // The planned split is applied only when the user left placement to us — with
+        // user-set n_gpu_layers / tensor_split only the pool size is taken (and the
+        // standard fit procedure below is skipped, as it would abort on those settings).
+        if (unified_pool_requested) {
+            LOG_INF("%s: computing unified KV split (placement + maximum pool)\n", __func__);
 
-            // file scope: mparams->tensor_layer_bounds must stay valid for the whole load
-            static int32_t g_kvfit_layer_bounds[16];   // llama_max_devices()
-            auto_split_done = llama_kv_fit_auto_split(
-                path_model, mparams, cparams, g_kvfit_layer_bounds, kvfit_params.get(), nullptr);
-        }
+            const struct llama_kv_fit_result * result =
+                llama_kv_split(path_model, mparams, cparams, kvfit_params.get(), 0 /* maximize */);
 
-        // [FORK] Skip the standard fit procedure when placement was resolved by auto-split, or
-        // when a unified pool is requested with user-set placement (fit_impl would abort on
-        // explicit n_gpu_layers / tensor_split). Pool maximization below sizes n_kv_cache.
-        const bool placement_user_set = user_set_ngl || user_set_split;
-        if (!auto_split_done && !(unified_pool_requested && placement_user_set)) {
-            common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
-            LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
-        } else if (auto_split_done) {
-            LOG_INF("%s: auto-split optimization completed, skipping standard fit procedure\n", __func__);
-        } else {
-            LOG_INF("%s: unified KV pool requested with user-set placement, skipping standard fit procedure\n", __func__);
-        }
-
-        // [FORK] Unified KV pool maximization: run whenever the pool size was left unset, using
-        // whatever placement is in effect (auto-split, standard fit, or user-set)
-        if (unified_pool_requested && cparams->n_kv_cache == 0) {
-            const int32_t n_max = llama_kv_fit_max_pool(path_model, mparams, cparams, kvfit_params.get());
-
-            if (n_max > 0) {
-                cparams->n_kv_cache = (uint32_t) n_max;
+            if (!result || !result->ok) {
+                LOG_WRN("%s: not even a single padding unit of the unified KV pool fits, leaving pool size to context params\n",
+                        __func__);
+            } else {
+                cparams->n_kv_cache = (uint32_t) result->n_cells;
                 if (cparams->n_ctx > cparams->n_kv_cache) {
                     LOG_WRN("%s: n_ctx (%" PRIu32 ") exceeds the maximum unified KV pool size (%" PRIu32 " cells), reducing it\n",
                             __func__, cparams->n_ctx, cparams->n_kv_cache);
                     cparams->n_ctx = cparams->n_kv_cache;
                 }
-            } else {
-                LOG_WRN("%s: not even a single padding unit of the unified KV pool fits, leaving pool size to context params\n",
-                        __func__);
+
+                if (!user_set_ngl && !user_set_split && result->layer_bounds != nullptr) {
+                    // tensor_layer_bounds points into library-owned storage, valid for the whole load
+                    mparams->tensor_layer_bounds = result->layer_bounds;
+                    mparams->n_gpu_layers        = -1;   // all layers on devices (loader idiom)
+                    mparams->tensor_split        = nullptr;
+                    auto_split_done               = true;
+                }
             }
+        }
+
+        const bool placement_user_set = user_set_ngl || user_set_split;
+        if (!auto_split_done && !(unified_pool_requested && placement_user_set)) {
+            common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
+            LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
+        } else if (auto_split_done) {
+            LOG_INF("%s: kv-split placement applied, skipping standard fit procedure\n", __func__);
+        } else if (unified_pool_requested && placement_user_set) {
+            LOG_INF("%s: unified KV pool requested with user-set placement, skipping standard fit procedure\n", __func__);
         }
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());

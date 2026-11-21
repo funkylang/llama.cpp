@@ -1,5 +1,5 @@
 set(TARGET llama-kv-fit)
-add_executable(${TARGET} kv-fit.c ../common/model-info.cpp)
+add_executable(${TARGET} kv-fit.c)
 target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tools/common)

@@ -22,6 +22,7 @@
 #include "llama-impl.h"   // LLAMA_LOG_* macros
 #include "llama-ext.h"    // public planning API declarations
 #include "llama-model.h"  // llama_internal_get_tensor_map, llama_hparams
+#include "model-info.h"   // deployment report: model header + per-layer table
 
 #include <algorithm>
 #include <chrono>
@@ -54,8 +55,7 @@ LLAMA_API struct llama_kv_fit_params * llama_kv_fit_params_new(uint32_t min_vers
     p->extra          = nullptr;
     p->min_pool_cells = 32768;  // report deployments that cannot plan at least this many cells
     p->n_checkpoints  = 0;      // legacy: derive from context params when not set
-    p->verify         = false;  // v3: post-solve verification load is opt-in
-    p->debug          = false;  // v4: planning-internals output is opt-in
+    p->options        = 0;      // v5: all behavior options off by default
     return p;
 }
 
@@ -101,6 +101,15 @@ static bool kvfit_gpus_present() {
         }
     }
     return false;
+}
+
+// Planning devices: GPU/iGPU whenever present; on a CPU-only machine the KV pool
+// is planned against system RAM through the CPU backend instead.
+static bool kvfit_is_plan_device(enum ggml_backend_dev_type t, bool cpu_only) {
+    if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+        return true;
+    }
+    return cpu_only && t == GGML_BACKEND_DEVICE_TYPE_CPU;
 }
 
 // ============================================================================
@@ -1271,11 +1280,13 @@ static bool kvfit_measure(const char * path,
 // placement becomes the plan the caller applies to its real load.
 
 struct kvfit_plan {
-    bool ok = false;
-    uint32_t n_cells = 0;            // pool size (blocks x 256), the solver's result
-    uint32_t n_layer_all = 0;        // trunk + nextn layer count (hparams)
+    bool ok = false;                // a viable deployment exists
+    uint32_t n_cells = 0;           // maximum viable pool (cells, 256-aligned)
+    uint32_t n_layer_all = 0;       // trunk + nextn layer count (hparams)
+    uint32_t n_ctx_train = 0;       // context size the model was trained on
     std::vector<int> first_layer;    // per GPU: first layer index of its range
     std::vector<std::string> names;  // per GPU, solver row order
+    bool cpu_only = false;           // placement is trivial (all on CPU); no GPU split to apply
 };
 
 // One metadata-only model load for hparams (router/nextn flags, n_layer_all):
@@ -1350,14 +1361,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
         return plan;
     }
 
-    // ---- Guard 1: GPU deployments only (no CPU-only mode) -------------------
-    if (!kvfit_gpus_present()) {
-        LLAMA_LOG_ERROR("kvfit: no GPU devices found — planning requires at least one "
-                        "GPU (there is no CPU-only mode)\n");
-        return plan;
-    }
-
-    // ---- GGUF metadata: Guard 2 + the solver's per-layer weights -------------
+    // ---- GGUF metadata: the model-too-large guard + the solver's per-layer weights --
     kvfit_gguf_info gguf;
     if (!kvfit_read_gguf(path, gguf)) {
         return plan;   // kvfit_read_gguf already reported
@@ -1379,16 +1383,19 @@ static kvfit_plan kvfit_plan_compute(const char * path,
     const bool extra_wants_mtp = params->extra && params->extra->shares_model;
     const bool measure_mtp = (extra_wants_mtp || !params->extra) && has_nextn && !is_router;
 
-    // device scan with nothing loaded: Guard 2 and the budget denominators
+    // device scan with nothing loaded: guard and budget denominators.
+    // Planning devices: GPU/iGPU whenever present; on a CPU-only machine the
+    // pool is planned against system RAM through the CPU backend instead.
     std::vector<kvfit_dev_snapshot> scan_raw;
     kvfit_read_all_devices(scan_raw);
-    // This is a GPU planning tool — CPU devices are never shown or planned.
+    const bool cpu_only = !kvfit_gpus_present();
+
     LLAMA_LOG_PLANNING("\n      device scan (raw, nothing loaded):\n");
     for (size_t i = 0; i < scan_raw.size(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (!dev || !scan_raw[i].ok) continue;
         const auto t = ggml_backend_dev_type(dev);
-        if (t == GGML_BACKEND_DEVICE_TYPE_CPU) continue;   // GPU tool: never show CPU
+        if (!kvfit_is_plan_device(t, cpu_only)) continue;
         LLAMA_LOG_PLANNING("        %-4zu %-6s total=%14llu free=%14llu  %s\n",
                            i, kvfit_dev_type_str(t),
                            (unsigned long long)scan_raw[i].total_bytes,
@@ -1396,35 +1403,35 @@ static kvfit_plan kvfit_plan_compute(const char * path,
                            ggml_backend_dev_name(dev));
     }
 
-    // Guard 2: weights alone exceeding total free GPU VRAM is a definite no —
-    // report it instead of paying for a load that cannot work.
-    uint64_t gpu_free_total = 0, gpu_count = 0;
+    // Guard: weights alone exceeding total free planning-device memory is a
+    // definite no — report it instead of paying for a load that cannot work.
+    uint64_t dev_free_total = 0, dev_count = 0;
     for (size_t i = 0; i < scan_raw.size(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (!dev || !scan_raw[i].ok) continue;
         const auto t = ggml_backend_dev_type(dev);
-        if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
-        gpu_free_total += scan_raw[i].free_bytes;
-        ++gpu_count;
+        if (!kvfit_is_plan_device(t, cpu_only)) continue;
+        dev_free_total += scan_raw[i].free_bytes;
+        ++dev_count;
     }
 
-    // Guard 1: no GPUs — this tool plans GPU deployments, there is nothing to do.
-    if (gpu_count == 0) {
-        LLAMA_LOG_ERROR("kvfit: no GPU devices found — kv-fit requires at least one GPU\n");
+    if (dev_count == 0) {
+        LLAMA_LOG_ERROR("kvfit: no usable planning device found — cannot plan a deployment\n");
         return plan;
     }
 
-    if ((uint64_t)gguf.model_bytes > gpu_free_total) {
-        LLAMA_LOG_ERROR("kvfit: model too large — weights (%llu B) exceed total free GPU "
-                        "VRAM (%llu B on %zu GPUs)\n",
+    if ((uint64_t)gguf.model_bytes > dev_free_total) {
+        LLAMA_LOG_ERROR("kvfit: model too large — weights (%llu B) exceed total free "
+                        "%s memory (%llu B on %zu devices)\n",
                         (unsigned long long)gguf.model_bytes,
-                        (unsigned long long)gpu_free_total, gpu_count);
+                        cpu_only ? "RAM" : "VRAM",
+                        (unsigned long long)dev_free_total, dev_count);
         return plan;
     }
 
     // ---- the measurement run ----------------------------------------------------
     kvfit_measure_result meas;
-    if (!kvfit_measure(path, mparams, cparams, measure_mtp, params->debug, meas)) {
+    if (!kvfit_measure(path, mparams, cparams, measure_mtp, params->options & LLAMA_KV_FIT_DEBUG, meas)) {
         return plan;   // kvfit_measure already reported
     }
     const bool mtp_measured = meas.mtp_measured;
@@ -1441,14 +1448,15 @@ static kvfit_plan kvfit_plan_compute(const char * path,
                               ? params->n_checkpoints
                               : n_seq_max * (1u + n_rs_seq);
 
-    // ---- per-device free VRAM after measurement (diagnostic, --debug only) -----
-    if (params->debug) {
-        LLAMA_LOG_PLANNING("\n      device free VRAM after measurement (post-Hamlet decode):\n");
+    // ---- per-device free memory after measurement (diagnostic, DEBUG only) -----
+    if (params->options & LLAMA_KV_FIT_DEBUG) {
+        LLAMA_LOG_PLANNING("\n      device free %s after measurement (post-Hamlet decode):\n",
+                           cpu_only ? "RAM" : "VRAM");
         for (size_t i = 0; i < scan_raw.size(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             if (!dev || !scan_raw[i].ok) continue;
             const auto t = ggml_backend_dev_type(dev);
-            if (t == GGML_BACKEND_DEVICE_TYPE_CPU) continue;   // GPU tool: never show CPU
+            if (!kvfit_is_plan_device(t, cpu_only)) continue;
             LLAMA_LOG_PLANNING("        %-4zu %-6s free=%14llu  %s\n",
                                i, kvfit_dev_type_str(t),
                                (unsigned long long)meas.scan_measure[i].free_bytes,
@@ -1463,16 +1471,16 @@ static kvfit_plan kvfit_plan_compute(const char * path,
     // left over is the kernels residual. The base-buffer is the width-0
     // intercept of those measured compute buffers (lo - (hi - lo)); it is a
     // separate quantity, never derived from the kernels residual.
-    if (params->debug) LLAMA_LOG_PLANNING("\n      overhead decomposition: "
-                       "kernels = delta - weights - probe-KV - SSM(state rows x bytes/row) - compute(lo)\n"
-                       "        base-buffer = compute-lo - (compute-hi - compute-lo), per measured context\n");
+    if (params->options & LLAMA_KV_FIT_DEBUG) LLAMA_LOG_PLANNING("\n      overhead decomposition: "
+                        "kernels = delta - weights - probe-KV - SSM(state rows x bytes/row) - compute(lo)\n"
+                        "        base-buffer = compute-lo - (compute-hi - compute-lo), per measured context\n");
     const uint64_t probe_cells = ((uint64_t)n_ctx_measure + 255u) / 256u * 256u; // GGML_PAD, as the cache does
     size_t nd_gpus = 0;
     for (size_t i = 0; i < scan_raw.size(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (!dev || !scan_raw[i].ok || i >= meas.scan_measure.size() || !meas.scan_measure[i].ok) continue;
         const auto t = ggml_backend_dev_type(dev);
-        if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) ++nd_gpus;
+        if (kvfit_is_plan_device(t, cpu_only)) ++nd_gpus;
     }
     std::vector<uint64_t> d_delta(nd_gpus), d_weights(nd_gpus), d_probe_kv(nd_gpus), d_kernels(nd_gpus);
     std::vector<uint64_t> d_ssm_bpr(nd_gpus, 0), d_kv_bpc(nd_gpus, 0), d_mtp_bpc(nd_gpus, 0);
@@ -1488,7 +1496,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             if (!dev || !scan_raw[i].ok) continue;
             const auto t = ggml_backend_dev_type(dev);
-            if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
+            if (!kvfit_is_plan_device(t, cpu_only)) continue;
             buf_bpc[gi]     = (i < meas.compute_rate_main.size()) ? meas.compute_rate_main[i] : 0;
             mtp_buf_bpc[gi] = (i < meas.mtp_rate.size())          ? meas.mtp_rate[i] : 0;
             bufs_bpc[gi]    = buf_bpc[gi] + mtp_buf_bpc[gi];
@@ -1501,7 +1509,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             if (!dev || !scan_raw[i].ok || i >= meas.scan_measure.size() || !meas.scan_measure[i].ok) continue;
             const auto t = ggml_backend_dev_type(dev);
-            if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
+            if (!kvfit_is_plan_device(t, cpu_only)) continue;
 
             const uint64_t delta   = scan_raw[i].free_bytes > meas.scan_measure[i].free_bytes
                                    ? scan_raw[i].free_bytes - meas.scan_measure[i].free_bytes : 0;
@@ -1550,7 +1558,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
             d_kv_bpc[gi]  = kv_bpc;
             d_mtp_bpc[gi] = mtp_bpc;
 
-            if (params->debug) {
+            if (params->options & LLAMA_KV_FIT_DEBUG) {
                 LLAMA_LOG_PLANNING("        %s: delta=%llu weights=%llu probe-KV=%llu "
                                    "(cells(%llu) x bpc(%llu)) SSM=%llu compute-lo=%llu kernels=%llu\n",
                                    ggml_backend_dev_name(dev),
@@ -1597,7 +1605,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             if (!dev || !scan_raw[i].ok) continue;
             const auto t = ggml_backend_dev_type(dev);
-            if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
+            if (!kvfit_is_plan_device(t, cpu_only)) continue;
 
             int64_t total   = (int64_t)scan_raw[i].total_bytes;
             int64_t free    = (int64_t)scan_raw[i].free_bytes;
@@ -1667,8 +1675,8 @@ static kvfit_plan kvfit_plan_compute(const char * path,
     LLAMA_LOG_PLANNING("        kv upper limit = %llu cells -> n_max = %7llu / 256 = %3u blocks\n",
                        (unsigned long long)kv_upper, (unsigned long long)kv_upper, (unsigned)n_max);
     if (n_max == 0) {
-        LLAMA_LOG_ERROR("kvfit: even the perfect split fits fewer than 256 KV cells — "
-                        "not a viable GPU deployment\n");
+        LLAMA_LOG_ERROR("kvfit: even a perfect split fits fewer than 256 KV cells — "
+                        "not a viable deployment\n");
         return plan;
     }
 
@@ -1682,17 +1690,42 @@ static kvfit_plan kvfit_plan_compute(const char * path,
                                                  (ggml_type)cparams->type_k, (ggml_type)cparams->type_v,
                                                  cparams->flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED, state_rows);
     plan.n_layer_all = model_peek->hparams.n_layer_all;
+    plan.n_ctx_train = model_peek->hparams.n_ctx_train;   // native context: the pool usage cap
     llama_model_free(model_peek);
 
+    // ---- solve for the pool size and layout -------------------------------------
+    uint32_t n_blocks = 0;
+    std::vector<int> first_layer(budgets.size(), 0);
     // (compute-buffer rates computed earlier in the budgets section above;
     // bufs_bpc = main + MTP draft — what the solver charges per cell)
     const uint64_t last_gpu_extra = (uint64_t)gguf.norm_bytes + (uint64_t)gguf.output_bytes;
-    const uint32_t n_blocks = kvfit_solve(n_max, layer_costs, budgets, reserves, names, last_gpu_extra,
-                                          bufs_bpc);
-    if (n_blocks == 0) {
-        LLAMA_LOG_ERROR("kvfit: solver found no placement — even the perfect split cannot "
-                        "hold all layers on the GPUs\n");
-        return plan;
+    if (nd_gpus <= 1) {
+        // Single planning device (one GPU or CPU-only): there is no partition to
+        // find — every layer sits on it. The perfect-split ceiling above is then
+        // the exact answer: budget minus tensors minus SSM state, divided by the
+        // per-cell cost. The bisection solver exists to search for a placement
+        // that fits the per-device budgets and has nothing left to do here.
+        n_blocks = n_max;
+    } else {
+        n_blocks = kvfit_solve(n_max, layer_costs, budgets, reserves, names, last_gpu_extra,
+                               bufs_bpc);
+        if (n_blocks == 0) {
+            LLAMA_LOG_ERROR("kvfit: solver found no placement — even the perfect split cannot "
+                            "hold all layers on the GPUs\n");
+            return plan;
+        }
+
+        // ---- winning layout: re-run the greedy walk at n_blocks -----------------
+        // llama's loader assigns layer il to the first GPU whose CUMULATIVE split
+        // fraction exceeds il/(N+1) (llama-model.cpp get_layer_buft_list, with
+        // n_gpu_layers = -1). To make it reproduce the solver's ranges exactly,
+        // each boundary a_g (first layer on GPU g) becomes cum[g-1] = a_g / (N+1);
+        // llama normalizes splits, so tensor_split holds those cumulative values
+        // directly. The output pseudo-layer N lands on the last GPU with any share.
+        const std::vector<size_t> walk = kvfit_greedy_walk(n_blocks, layer_costs, budgets, bufs_bpc);
+        for (size_t g = 0; g < walk.size() && g < first_layer.size(); ++g) {
+            first_layer[g] = (int)walk[g];
+        }
     }
 
     const uint32_t n_cells = n_blocks * 256u;
@@ -1702,33 +1735,16 @@ static kvfit_plan kvfit_plan_compute(const char * path,
                        (unsigned)n_cells, (unsigned)params->min_pool_cells);
     }
 
-    // ---- winning layout: re-run the greedy walk at n_blocks ---------------------
-    // llama's loader assigns layer il to the first GPU whose CUMULATIVE split
-    // fraction exceeds il/(N+1) (llama-model.cpp get_layer_buft_list, with
-    // n_gpu_layers = -1). To make it reproduce the solver's ranges exactly,
-    // each boundary a_g (first layer on GPU g) becomes cum[g-1] = a_g / (N+1);
-    // llama normalizes splits, so tensor_split holds those cumulative values
-    // directly. The output pseudo-layer N lands on the last GPU with any share.
-    const uint32_t N = plan.n_layer_all;
-    std::vector<int> first_layer(budgets.size(), 0);
-    {
-        // same walk as the solver: gated on each GPU's compute-buffer rate so
-        // the final layout matches the winning candidate's checked placement
-        const std::vector<size_t> walk = kvfit_greedy_walk(n_blocks, layer_costs, budgets, bufs_bpc);
-        for (size_t g = 0; g < walk.size() && g < first_layer.size(); ++g) {
-            first_layer[g] = (int)walk[g];
-        }
-    }
-
     plan.ok          = true;
     plan.n_cells     = n_cells;
     plan.first_layer = std::move(first_layer);
     plan.names       = names;
+    plan.cpu_only    = cpu_only;
 
     LLAMA_LOG_PLANNING("\n      ==> plan: pool %u cells, placement:\n", (unsigned)n_cells);
     for (size_t g = 0; g < plan.first_layer.size(); ++g) {
         const int a = plan.first_layer[g];
-        const int b = (g + 1 < plan.first_layer.size()) ? plan.first_layer[g + 1] : (int)N;
+        const int b = (g + 1 < plan.first_layer.size()) ? plan.first_layer[g + 1] : (int)plan.n_layer_all;
         LLAMA_LOG_PLANNING("        %s: layers %d..%d%s\n", plan.names[g].c_str(), a, b - 1,
                            (a >= b) ? " (empty)" : "");
     }
@@ -1742,7 +1758,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
         std::vector<uint64_t> p_wts(nd, 0), p_ssm(nd, 0), p_kv(nd, 0), p_mtp(nd, 0);
         for (size_t g = 0; g < nd; ++g) {
             const int a = plan.first_layer[g];
-            const int b = (g + 1 < nd) ? plan.first_layer[g + 1] : (int)N;
+            const int b = (g + 1 < nd) ? plan.first_layer[g + 1] : (int)plan.n_layer_all;
             for (int l = a; l < b; ++l) {
                 p_wts[g] += layer_costs[l].weights;
                 p_ssm[g] += layer_costs[l].ssm_state;
@@ -1759,7 +1775,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
     }
 
     // ---- Verification run: prove the plan works at runtime (opt-in) ----------
-    if (params->verify &&
+    if ((params->options & LLAMA_KV_FIT_VERIFY) &&
         !kvfit_verify_plan(path, mparams, cparams, measure_mtp,
                            plan.first_layer, n_cells)) {
         LLAMA_LOG_ERROR("kvfit: verification failed — this plan does not deploy, "
@@ -1824,49 +1840,149 @@ static kvfit_plan kvfit_get_plan(const char * path,
     return g_kvfit_cache.plan;   // copied out under the lock
 }
 
-LLAMA_API bool llama_kv_fit_auto_split(
-        const char * path_model,
-        llama_model_params * mparams,
-        llama_context_params * cparams,
-        int32_t * layer_bounds,
-        const struct llama_kv_fit_params * params,
-        int32_t * n_devices_planned) {
-    kvfit_plan plan = kvfit_get_plan(path_model, mparams, cparams, params);
-    if (!plan.ok || layer_bounds == nullptr) {
-        LLAMA_LOG_ERROR("kvfit: auto split failed or no layer_bounds buffer — "
-                        "the caller must not load this model as-is\n");
-        return false;
+namespace {
+
+// The single result of llama_kv_split() — a plain global owned by the library;
+// there are never two concurrent planning calls. layer_bounds stores the
+// planned placement; it is valid until the next call overwrites it.
+llama_kv_fit_result g_kvfit_result;
+std::vector<int>    g_kvfit_layer_bounds;
+
+// No-op log callback for the deployment-report window: those tables print raw
+// to stderr (no timestamps, no prefixes) and loader chatter from the peek load
+// must not interleave with them.
+static void kvfit_log_quiet(ggml_log_level, const char *, void *) {}
+
+struct kvfit_log_guard {
+    ggml_log_callback cb = nullptr;
+    void * ud = nullptr;
+    kvfit_log_guard()  { llama_log_get(&cb, &ud); llama_log_set(kvfit_log_quiet, nullptr); }
+    ~kvfit_log_guard() { llama_log_set(cb, ud); }
+};
+
+} // anonymous namespace
+
+// The deployment report (model header + per-layer table) — what the kv-split
+// tool used to print itself; printed before plan computation, like the tool
+// did. One metadata-only peek load: no_alloc keeps VRAM untouched.
+static void kvfit_print_deployment_report(const char * path_model,
+                                          const llama_context_params * cparams,
+                                          const struct llama_kv_fit_params * params) {
+    kvfit_log_guard log_quiet;
+
+    llama_model_params mp_info = llama_model_default_params();
+    mp_info.no_alloc  = true;
+    mp_info.load_mode = LLAMA_LOAD_MODE_NONE;
+    mp_info.load_mtp  = true;   // deployment shape; avoids "unused tensor" noise
+
+    llama_model * m_info = llama_model_load_from_file(path_model, mp_info);
+    if (!m_info) {
+        LLAMA_LOG_ERROR("kvfit: could not open %s for the model-info table\n", path_model);
+        return;   // the planning load below will report the real error
     }
 
-    // the plan's ranges ARE the loader's boundaries — write them verbatim,
-    // and report how many of them there are so the caller knows exactly
-    // which part of its buffer the plan occupies
-    const size_t nd = plan.first_layer.size();
-    for (size_t g = 0; g < nd; ++g) {
-        layer_bounds[g] = plan.first_layer[g];
-    }
-    if (n_devices_planned) {
-        *n_devices_planned = (int32_t)nd;
-    }
+    char kf[24], nb[24], nu[24], sm[24], rs[24];
+    snprintf(kf, sizeof(kf), "%.2f", 1.0 - params->vram_fraction);   // keep_free = 1 - vram_fraction
+    snprintf(nb, sizeof(nb), "%u", cparams->n_batch);
+    snprintf(nu, sizeof(nu), "%u", cparams->n_ubatch);
+    snprintf(sm, sizeof(sm), "%u", cparams->n_seq_max);
+    snprintf(rs, sizeof(rs), "%u", cparams->n_rs_seq);
+    struct mi_header_opts opts = { kf, nb, nu, sm, rs };
 
-    mparams->n_gpu_layers       = -1;   // all layers on GPUs (loader's standard idiom)
-    mparams->tensor_layer_bounds = layer_bounds;
-    mparams->tensor_split       = nullptr;   // the boundaries supersede ratio logic
-
-    LLAMA_LOG_PLANNING("kvfit: applied placement to mparams (pool %u cells) — "
-                       "reuse these params unchanged for the real load\n",
-                       (unsigned)plan.n_cells);
-    return true;
+    const bool flash_attn = cparams->flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    mi_model_info_t info = mi_model_info_new(path_model, m_info);
+    if (!info) {
+        LLAMA_LOG_ERROR("kvfit: could not open %s for the model-info table\n", path_model);
+        llama_model_free(m_info);
+        return;   // the planning load below will report the real error
+    }
+    if (!mi_print_header(stderr, info,
+                         (enum ggml_type)cparams->type_k, (enum ggml_type)cparams->type_v, &opts)
+        || !mi_print_layer_table(stderr, info,
+                                 (enum ggml_type)cparams->type_k, (enum ggml_type)cparams->type_v,
+                                 flash_attn)) {
+        LLAMA_LOG_WARN("kvfit: model-info table print failed for %s\n", path_model);
+    }
+    mi_model_info_free(info);
+    llama_model_free(m_info);
 }
 
-LLAMA_API int32_t llama_kv_fit_max_pool(
+LLAMA_API const struct llama_kv_fit_result * llama_kv_split(
         const char * path_model,
         llama_model_params * mparams,
         llama_context_params * cparams,
-        const struct llama_kv_fit_params * params) {
-    kvfit_plan plan = kvfit_get_plan(path_model, mparams, cparams, params);
-    if (!plan.ok) {
-        return 0;   // failure already reported by the plan computation
+        const struct llama_kv_fit_params * params,
+        int32_t target_cells) {
+    memset(&g_kvfit_result, 0, sizeof(g_kvfit_result));
+    g_kvfit_layer_bounds.clear();
+
+    if (!path_model || !mparams || !cparams || !params) {
+        snprintf(g_kvfit_result.error_msg, sizeof(g_kvfit_result.error_msg),
+                 "kv-split: missing arguments");
+        return &g_kvfit_result;
     }
-    return (int32_t)plan.n_cells;   // 256-aligned; below min_pool_cells is warned above
+
+    // the deployment report (model header + per-layer table), opt-in via options
+    if (params->options & LLAMA_KV_FIT_PRINT_TABLES) {
+        kvfit_print_deployment_report(path_model, cparams, params);
+    }
+
+    // 1. placement + capacity — ONE measurement run, computed independently of
+    //    target_cells (the split never depends on the supplied cache size):
+    kvfit_plan plan = kvfit_get_plan(path_model, mparams, cparams, params);
+
+    if (!plan.ok) {
+        // the planner already reported why nothing fits; carry a short note too
+        snprintf(g_kvfit_result.error_msg, sizeof(g_kvfit_result.error_msg),
+                 "kv-split: no viable deployment (see the reports above)");
+        return &g_kvfit_result;
+    }
+
+    // 2. THE single pool decision — the resource is never claimed twice:
+    uint32_t pool;
+    if (target_cells > 0) {
+        if ((uint32_t)target_cells > plan.n_cells) {
+            snprintf(g_kvfit_result.error_msg, sizeof(g_kvfit_result.error_msg),
+                     "kv-split: requested pool of %d cells does not fit — max viable is %u",
+                     target_cells, (unsigned)plan.n_cells);
+            return &g_kvfit_result;
+        }
+        pool = (uint32_t)target_cells;   // exactly what the user asked
+    } else {
+        pool = plan.n_cells;             // everything that fits
+        // ... but never more than the parallel sequences can use: threads x the
+        // model's native context size (auto-fit only — an explicit request is
+        // validated against physical capacity, not this usage cap):
+        if (plan.n_ctx_train > 0 && cparams->n_seq_max > 0) {
+            const uint64_t use_cap = ((uint64_t)cparams->n_seq_max * plan.n_ctx_train) / 256u * 256u;
+            if (use_cap < pool) {
+                LLAMA_LOG_PLANNING("kvfit: capping pool %u -> %llu cells "
+                                   "(%u sequences x %u native context)\n",
+                                   (unsigned)pool, (unsigned long long)use_cap,
+                                   (unsigned)cparams->n_seq_max, plan.n_ctx_train);
+                pool = (uint32_t)use_cap;
+            }
+        }
+    }
+
+    // 3. fill THE decided result. The planned placement is returned in
+    //    layer_bounds (library-owned, valid until the next call); the caller
+    //    applies it to its model params when the plan's split — not a user-set
+    //    one — is to be deployed:
+    //        mparams->n_gpu_layers       = -1;   // all layers on devices (loader idiom)
+    //        mparams->tensor_layer_bounds = result->layer_bounds;
+    //        mparams->tensor_split       = nullptr;   // the boundaries supersede ratio logic
+    // CPU-only deployments return no placement: everything trivially runs there.
+    if (!plan.cpu_only) {
+        g_kvfit_layer_bounds.assign(plan.first_layer.begin(), plan.first_layer.end());
+    }
+
+    g_kvfit_result.ok                = true;
+    g_kvfit_result.n_cells           = (int32_t)pool;
+    g_kvfit_result.n_devices_planned = plan.cpu_only ? 0u : (uint32_t)g_kvfit_layer_bounds.size();
+    g_kvfit_result.layer_bounds      = g_kvfit_layer_bounds.empty() ? nullptr : g_kvfit_layer_bounds.data();
+
+    LLAMA_LOG_PLANNING("kv-split: pool %d cells%s — apply layer_bounds to the real load's params\n",
+                       (int)pool, plan.cpu_only ? " (CPU-only deployment)" : "");
+    return &g_kvfit_result;
 }

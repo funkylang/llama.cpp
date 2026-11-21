@@ -7,7 +7,7 @@
 #include <llama-impl.h>
 #include <llama-model.h>
 #include <gguf.h>
-#include "../src/llama-ext.h"   // print_table() shared boxed-table printer
+#include "llama-ext.h"   // print_table() shared boxed-table printer
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>

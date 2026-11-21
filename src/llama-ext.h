@@ -206,7 +206,14 @@ extern "C" {
 // the version the caller requires.
 //
 
-#define LLAMA_KV_FIT_PARAMS_VERSION 4
+#define LLAMA_KV_FIT_PARAMS_VERSION 5
+
+// llama_kv_split() behavior options (bitmask): set by the caller from its own
+// command-line options; all off by default.
+#define LLAMA_KV_FIT_DEBUG          (1u << 0)   // planning internals (breakdown readbacks, rates, formulas)
+#define LLAMA_KV_FIT_VERIFY         (1u << 1)   // post-solve verification load (expensive; kv-split tool)
+#define LLAMA_KV_FIT_PRINT_TABLES   (1u << 2)   // print the deployment report: model header, per-layer table,
+                                                // cost breakdown and the plan placement block
 
 struct llama_kv_fit_params {
     double vram_fraction;                 // hard cap on device usage (default 0.97)
@@ -219,15 +226,9 @@ struct llama_kv_fit_params {
     // count; the planner uses it verbatim, never re-derives it. 0 = legacy:
     // derive n_seq_max * (1 + n_rs_seq) from the context params.
     uint32_t n_checkpoints;
-    // v3: run the post-solve verification load (planned split + planned pool
-    // size, incl. warmup decode) to prove the plan fits at runtime. Opt-in:
-    // expensive and for diagnostics — production startups leave it off.
-    bool verify;
-    // v4: print the planning internals (memory-breakdown readbacks,
-    // compute-buffer rate measurements, free VRAM after the measurement
-    // run, overhead-decomposition formulas). Off by default: what remains
-    // is the plan, its budgets and the cost tables.
-    bool debug;
+    // v5: behavior option bitmask (see LLAMA_KV_FIT_* flags above). Replaces
+    // the v3 verify / v4 debug booleans; same struct size as before.
+    uint32_t options;
     // FUTURE FIELDS: append here; initialize in llama_kv_fit_params_new()
 };
 
@@ -248,33 +249,37 @@ struct llama_kv_fit_extra {
     bool shares_model;
 };
 
-// Solve the optimal layer placement: measures with a provisional load (llama's
-// native free-VRAM auto-split), then runs the pool solver and applies its
-// placement verbatim: writes the per-device layer boundaries into layer_bounds
-// and points mparams->tensor_layer_bounds at it (plus n_gpu_layers = -1) —
-// llama's loader uses those boundaries directly, superseding its ratio-based
-// tensor_split logic. The caller's real load must reuse mparams unchanged.
-// layer_bounds: writable buffer of at least llama_max_devices() int32_t.
-// n_devices_planned: optional; receives how many of layer_bounds hold plan
-// boundaries (the caller learns exactly which part of its buffer to trust).
-// Returns false when no viable plan exists (no GPUs, model too large, ...).
-LLAMA_API bool llama_kv_fit_auto_split(
-        const char * path_model,
-        struct llama_model_params * mparams,
-        struct llama_context_params * cparams,
-        int32_t * layer_bounds,
-        const struct llama_kv_fit_params * params,
-        int32_t * n_devices_planned);
+// Unified KV split planning: ONE call computes the layer split AND decides the
+// KV pool size from a single measurement run (one model load, probe contexts at
+// 16K and 32K). The split is computed independently of any supplied cache size;
+// target_cells only caps what is allocated — the resource is never claimed twice.
+//   - target_cells = 0  : allocate everything that fits (auto-fit)
+//   - target_cells > 0  : allocate exactly that many; when the request does not
+//                         fit, result->ok == false and error_msg states what would
+//                         fit — there is no fallback to a smaller or CPU deployment.
+// The planned placement is returned in result->layer_bounds (per-device first-
+// layer boundaries, library-owned); it is NOT applied to mparams automatically —
+// the caller applies it when the plan's split is to be deployed:
+//     mparams->n_gpu_layers       = -1;
+//     mparams->tensor_layer_bounds = result->layer_bounds;
+//     mparams->tensor_split       = nullptr;   // the boundaries supersede ratio logic
+// On CPU-only deployments there is no placement (layer_bounds == NULL).
+// Returns a pointer to the library-owned result; there are never two concurrent
+// calls. result->ok == false => nothing may be deployed, see error_msg.
+struct llama_kv_fit_result {
+    bool ok;                        // true: plan computed, placement applied to mparams
+    int32_t n_cells;                // the decided pool size in cells (256-aligned)
+    uint32_t n_devices_planned;     // devices in the placement (0 on CPU-only deployments)
+    const int32_t * layer_bounds;   // per-device first-layer boundaries (library-owned)
+    char error_msg[512];            // why the deployment is not viable (when !ok)
+};
 
-// Solve the maximum unified KV cache pool size for the planned placement, in
-// cells (256-aligned). Reuses auto_split's measurement when the inputs match.
-// Returns 0 when no pool fits; a result below params->min_pool_cells is
-// reported as a non-viable deployment. cparams must have kv_unified set.
-LLAMA_API int32_t llama_kv_fit_max_pool(
+LLAMA_API const struct llama_kv_fit_result * llama_kv_split(
         const char * path_model,
         struct llama_model_params * mparams,
         struct llama_context_params * cparams,
-        const struct llama_kv_fit_params * params);
+        const struct llama_kv_fit_params * params,
+        int32_t target_cells);
 
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 

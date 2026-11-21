@@ -1,10 +1,11 @@
-// [FORK] KV-fit planner — end-to-end client of libllama's KV-fit planning API.
+// [FORK] KV-fit planner — end-to-end client of libllama's KV-split planning API.
 //
 // Pure C against the public interfaces, exactly what fllama will do at startup:
-//   1. llama_kv_fit_params_new()    — planning options (library-allocated)
-//   2. llama_kv_fit_auto_split()    — planned placement (tensor_layer_bounds)
-//   3. llama_kv_fit_max_pool()      — pool size (reuses step 2's measurement)
+//   1. llama_kv_fit_params_new()  — planning options (library-allocated)
+//   2. llama_kv_split()           — placement AND pool size in ONE call
 //
+// This tool is the deployment report itself: it sets LLAMA_KV_FIT_PRINT_TABLES
+// so the library prints the model header + per-layer table before planning.
 // With --verify the library additionally runs ONE verification load with the
 // computed plan (model at the planned split + context at the planned pool +
 // warmup decode) and proves it: per-layer placement readback against the plan,
@@ -14,7 +15,6 @@
 // Planning traces flow through the standard log callback at the PLANNING level.
 
 #include "llama.h"
-#include "model-info.h"
 #include "../../src/llama-ext.h"
 
 #include <stdint.h>
@@ -31,10 +31,6 @@ static void log_callback(enum ggml_log_level level, const char * text, void * us
     if (level == GGML_LOG_LEVEL_PLANNING || level >= GGML_LOG_LEVEL_WARN) {
         fputs(text, stderr);
     }
-}
-
-static void log_quiet(enum ggml_log_level level, const char * text, void * ud) {
-    (void)level; (void)text; (void)ud;
 }
 
 static int kv_type_from_str(const char * s) {
@@ -144,77 +140,39 @@ int main(int argc, char ** argv) {
     // will allocate (= n_seq_max x (live + rollback rows)). Pass it explicitly —
     // the planner uses it verbatim rather than re-deriving from context params.
     params->n_checkpoints = cparams.n_seq_max * (1u + cparams.n_rs_seq);
-    params->verify        = verify;   // post-solve verification load (opt-in)
-    params->debug         = debug;    // planning-internals output (opt-in)
+    // this tool is the deployment report: PRINT_TABLES prints the model header
+    // + per-layer table before planning; verify/debug stay caller-controlled.
+    params->options = LLAMA_KV_FIT_PRINT_TABLES
+                    | (verify ? LLAMA_KV_FIT_VERIFY : 0u)
+                    | (debug  ? LLAMA_KV_FIT_DEBUG  : 0u);
 
-    int32_t layer_bounds[16];   // llama_max_devices(); auto_split fills the used entries
-    memset(layer_bounds, 0, sizeof(layer_bounds));
-
-    // ---- 1+2: plan the placement ---------------------------------------------
+    // ---- plan placement AND pool in one call ---------------------------------
     fprintf(stderr, "\n== kv-fit clone: planning %s ==\n", g_path);
 
-    // model info (printed ONCE): header block + layer table. The load is
-    // temporary — it exists only to hand the hparams to the shared printer.
-    // Logging is suppressed for that load so loader chatter stays out of the
-    // info block.
-    {
-        // metadata-only: the layer table reads GGUF tensor info + hparams, never
-        // tensor data. no_alloc keeps VRAM untouched (a full load would burn it).
-        struct llama_model_params mp_info = llama_model_default_params();
-        mp_info.no_alloc  = true;
-        mp_info.load_mode = LLAMA_LOAD_MODE_NONE;
-        mp_info.load_mtp  = mparams.load_mtp;   // deployment shape; avoids "unused tensor" noise
-        llama_log_set(log_quiet, NULL);
-        struct llama_model * m_info = llama_model_load_from_file(g_path, mp_info);
-        llama_log_set(log_callback, NULL);   // restore for the real run below
+    const struct llama_kv_fit_result * result =
+        llama_kv_split(g_path, &mparams, &cparams, params, 0 /* maximize the pool */);
 
-        if (!m_info) {
-            fprintf(stderr, "error: model load for info failed\n");
-            return 1;
-        }
-        mi_model_info_t info = mi_model_info_new(g_path, m_info);
-        if (info) {
-            char kf[24], nb[24], nu[24], sm[24], rs[24];
-            snprintf(kf, sizeof(kf), "%.2f", keep_free);
-            snprintf(nb, sizeof(nb), "%u", cparams.n_batch);
-            snprintf(nu, sizeof(nu), "%u", cparams.n_ubatch);
-            snprintf(sm, sizeof(sm), "%u", cparams.n_seq_max);
-            snprintf(rs, sizeof(rs), "%u", cparams.n_rs_seq);
-            struct mi_header_opts opts = { kf, nb, nu, sm, rs };
-            mi_print_header(stderr, info, type_k, type_v, &opts);
-            mi_print_layer_table(stderr, info, type_k, type_v, flash_attn);
-            mi_model_info_free(info);
-        } else {
-            fprintf(stderr, "error: could not open %s for the info table\n", g_path);
-            llama_model_free(m_info);
-            return 1;
-        }
-        llama_model_free(m_info);
-    }
-
-    if (!llama_kv_fit_auto_split(g_path, &mparams, &cparams, layer_bounds, params, 0)) {
-        fprintf(stderr, "error: no viable plan — aborting (see reports above)\n");
+    if (!result || !result->ok) {
+        fprintf(stderr, "error: no viable deployment — %s\n",
+                result ? result->error_msg : "(no result)");
+        llama_kv_fit_params_free(params);
+        llama_backend_free();
         return 1;
     }
-
-    // ---- 3: pool size (reuses the measurement — one load, two answers) -------
-    const int32_t n_cells = llama_kv_fit_max_pool(g_path, &mparams, &cparams, params);
-    if (n_cells <= 0) {
-        fprintf(stderr, "error: no KV pool fits this plan — aborting\n");
-        return 1;
-    }
-    if (n_cells < (int32_t)params->min_pool_cells) {
+    if (result->n_cells < (int32_t)params->min_pool_cells) {
         fprintf(stderr, "error: planned pool %d cells is below the viability floor (%u) — aborting\n",
-                n_cells, params->min_pool_cells);
+                result->n_cells, params->min_pool_cells);
+        llama_kv_fit_params_free(params);
+        llama_backend_free();
         return 1;
     }
 
-    // Verification (load + context + warmup) lives in libllama now: it runs
-    // only when --verify was given (params->verify), inside auto_split.
+    // Verification (load + context + warmup) lives in libllama: it ran inside
+    // llama_kv_split when --verify was given (params->options).
     llama_kv_fit_params_free(params);
     llama_backend_free();
 
-    fprintf(stderr, "\nkv-fit clone: planning complete — pool %d cells%s\n", n_cells,
-            verify ? ", verification run passed" : "");
+    fprintf(stderr, "\nkv-fit clone: planning complete — pool %d cells%s\n",
+            result->n_cells, verify ? ", verification run passed" : "");
     return 0;
 }
