@@ -1,5 +1,5 @@
 // shared model header + layer table for the fork's sizing tools
-// (llama-gpu-split, llama-kv-fit-test).
+// (llama-gpu-split, llama-kv-fit).
 // ONE complete header per tool run (gpu-split label style), followed by the
 // boxed per-layer table — printed ONCE, never per load.
 #pragma once
@@ -18,8 +18,8 @@ typedef struct mi_model_info * mi_model_info_t;
 // deployment params printed into the unified header (NULL = omit the line).
 // values are pre-formatted strings.
 struct mi_header_opts {
-    const char * keep_free;   // "0.03"        (gpu-split, kv-fit-test)
-    const char * n_batch;     // "2048"        (kv-fit-test, deviation)
+    const char * keep_free;   // "0.03"        (gpu-split, kv-fit)
+    const char * n_batch;     // "2048"        (kv-fit)
     const char * n_ubatch;    // "512"
     const char * seq_max;     // "3"
     const char * rs_seq;      // "8"

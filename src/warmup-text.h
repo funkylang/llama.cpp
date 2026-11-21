@@ -1,8 +1,8 @@
 // [FORK] Hamlet, Act I (Public Domain, Project Gutenberg #1524 excerpt).
-// ~20K chars of original text used as the warmup prompt for llama-gpu-split:
-// real natural-language tokens with high diversity, so a MoE router exercises
-// many experts during warmup (repeated synthetic tokens would route to the
-// same experts only and leave most expert kernels unloaded).
+// ~20K chars of original text used as the warmup prompt for the kv-fit
+// verification load: real natural-language tokens with high diversity, so a MoE
+// router exercises many experts during warmup (repeated synthetic tokens would
+// route to the same experts only and leave most expert kernels unloaded).
 
 static const char * WARMUP_TEXT = R"HAMLET_END_7(
 ACT I

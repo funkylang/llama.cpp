@@ -6,10 +6,9 @@
 // device VRAM. All C++ lives here; callers speak the public C API in
 // llama-ext.h only.
 //
-// Measurement-based (algorithm verified on rocky2 via tools/gpu-split): one
-// REAL model load with llama_model's native free-VRAM auto-split as the
-// provisional placement, a measurement context at a common deployment size,
-// and a Hamlet warmup decode so every kernel the deployment will launch is
+// Measurement-based: one REAL model load with llama_model's native free-VRAM
+// auto-split as the provisional placement, a measurement context at a common
+// deployment size, and a Hamlet warmup decode so every kernel the deployment will launch is
 // uploaded to the devices — kernels only materialize on their first execution
 // (no preload/prewarm API exists on any backend). Readback of the actual
 // placement plus architecture-derived KV/SSM rates and a greedy bisection
@@ -35,7 +34,7 @@
 #include <string>
 #include <vector>
 
-#include "warmup-text.h"   // Hamlet excerpt (shared with tools/gpu-split)
+#include "warmup-text.h"   // Hamlet excerpt (warmup prompt for the verification load)
 
 // ============================================================================
 // Options struct (public API, ABI versioned — see llama-ext.h for the rules)

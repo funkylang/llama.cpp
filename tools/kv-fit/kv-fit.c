@@ -1,4 +1,4 @@
-// [FORK] gpu-split clone — end-to-end test of libllama's KV-fit planning API.
+// [FORK] KV-fit planner — end-to-end client of libllama's KV-fit planning API.
 //
 // Pure C against the public interfaces, exactly what fllama will do at startup:
 //   1. llama_kv_fit_params_new()    — planning options (library-allocated)
@@ -12,8 +12,6 @@
 // there is no verification run — planning only.
 //
 // Planning traces flow through the standard log callback at the PLANNING level.
-// Run next to tools/gpu-split with the same options on the same machine: the
-// planning numbers must match (that tool is the verified reference).
 
 #include "llama.h"
 #include "model-info.h"
@@ -53,10 +51,10 @@ static void usage(const char * prog) {
     fprintf(stderr,
         "usage: %s MODEL [options]\n"
         "\n"
-        "gpu-split clone: plans a deployment through libllama's KV-fit API and\n"
+        "KV-fit planner: plans a deployment through libllama's KV-fit API and\n"
         "validates the result by loading with it (see the file header).\n"
         "\n"
-        "options (mirroring tools/gpu-split):\n"
+        "options:\n"
         "  --keep-free F           reserve fraction of each GPU's VRAM   [0.03]\n"
         "  --parallel P            parallel streams (plans 9 SSM rows each)\n"
         "  --checkpoints N         SSM state rows, single stream          [1]\n"
@@ -102,7 +100,7 @@ int main(int argc, char ** argv) {
     }
     if (!g_path) { usage(argv[0]); return 1; }
 
-    // same deployment-shape rules as tools/gpu-split
+    // deployment-shape constraints
     if ((parallel_arg >= 0 && parallel_arg < 1) || (checkpoints_arg >= 0 && checkpoints_arg < 1)) {
         fprintf(stderr, "error: --parallel / --checkpoints must be >= 1\n");
         return 1;
