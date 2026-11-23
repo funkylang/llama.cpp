@@ -713,6 +713,14 @@ ggml_backend_reg_t ggml_backend_cpu_reg(void) {
         /* .context     = */ NULL,
     };
 
+    // [FORK] The shared CPU buffer type is defined in ggml-base with .device left
+    // NULL (upstream FIXME there); link it to this device here so that
+    // ggml_backend_buft_get_device() resolves and memory accounting can attribute
+    // compute buffers / weights to the CPU device.
+    if (!ggml_backend_cpu_buffer_type()->device) {
+        ggml_backend_cpu_buffer_type()->device = ggml_backend_cpu_reg_get_device(&ggml_backend_cpu_reg, 0);
+    }
+
     return &ggml_backend_cpu_reg;
 }
 

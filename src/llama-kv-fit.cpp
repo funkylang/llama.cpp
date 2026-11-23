@@ -920,9 +920,11 @@ static bool kvfit_verify_plan(const char * path,
 // Read llama_get_memory_breakdown(ctx) and return its .compute (temporary
 // compute-buffer bytes) per device, indexed by backend device order. This is
 // the graph-simulator's own account of the pool-sized compute buffers — the
-// ground truth our old kq_mask formula had to guess at. ..._Host bufts are
-// printed as their own rows but live in system RAM — they are NEVER folded
-// into a GPU rate (that contamination doubled the ROCm0 rate on rocky2).
+// ground truth our old kq_mask formula had to guess at. GPU-side host bufts
+// (..._Host pinned staging memory) are printed as their own rows but live in
+// system RAM — they are NEVER folded into a GPU rate (that contamination
+// doubled the ROCm0 rate on rocky2). The CPU backend's own buffers (also host
+// bufts) ARE charged to the CPU device: real RAM used by the deployment.
 static std::vector<uint64_t> kvfit_compute_by_device(const llama_context * ctx, const char * label, bool debug) {
     const size_t ndevs = ggml_backend_dev_count();
     std::vector<uint64_t> compute(ndevs, 0);
@@ -940,7 +942,8 @@ static std::vector<uint64_t> kvfit_compute_by_device(const llama_context * ctx, 
                             (unsigned long long)data.context,
                             (double)data.context / (1024.0 * 1024.0 * 1024.0));
                 }
-                if (!ggml_backend_buft_is_host(buft)) {   // host RAM never counts against GPU rates
+                const bool is_cpu_dev = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+                if (is_cpu_dev || !ggml_backend_buft_is_host(buft)) {
                     compute[i] += data.compute;
                 }
                 break;
@@ -1249,6 +1252,22 @@ static bool kvfit_measure(const char * path,
 
     kvfit_read_all_devices(r.scan_measure);
     r.usage = kvfit_compute_dev_usage(model);
+    // [FORK] CPU-only deployment: mmap'd weights live in the CPU_Mapped buft,
+    // which carries no device pointer — the readback attributes no layers to
+    // the CPU device. Every layer IS on it by construction, so synthesize that
+    // placement: the architecture-derived KV/SSM/MTP rates need the layer list.
+    if (!kvfit_gpus_present()) {
+        for (size_t i = 0; i < r.usage.size(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) continue;
+            if (!r.usage[i].layers.empty()) continue;
+            r.usage[i].first_layer = 0;
+            r.usage[i].last_layer  = (int)model->hparams.n_layer_all - 1;
+            for (uint32_t il = 0; il < model->hparams.n_layer_all; ++il) {
+                r.usage[i].layers.push_back(il);
+            }
+        }
+    }
     r.rates = kvfit_compute_rates(model, r.usage, cp.type_k, cp.type_v, cp.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED);
     r.n_ctx_measure = n_ctx_measure;   // the probe pool size for the decomposition (see kvfit_plan_compute)
 
@@ -1660,6 +1679,14 @@ static kvfit_plan kvfit_plan_compute(const char * path,
     }
 
     // ---- theoretical upper limit: the perfect-split ceiling ----------------------
+    // CPU-only deployment: the tensor readback cannot attribute mmap'd weights to
+    // the CPU device (CPU_Mapped buft carries no device pointer), so charge the
+    // GGUF metadata weight sum instead — a placement-independent logical cost.
+    if (cpu_only) {
+        total_weights = (int64_t)gguf.model_bytes;
+        LLAMA_LOG_PLANNING("      weights (CPU-only): from GGUF metadata = %llu bytes\n",
+                           (unsigned long long)gguf.model_bytes);
+    }
     const uint64_t ssm_state_total = (uint64_t)state_rows * ssm_per_row_total;
     const int64_t upper_num = total_budget - total_weights - (int64_t)ssm_state_total;
     LLAMA_LOG_PLANNING("\n      kv cache upper limit: (total budget(%lld) - tensors(%lld)"
