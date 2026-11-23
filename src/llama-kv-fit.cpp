@@ -1645,7 +1645,10 @@ static kvfit_plan kvfit_plan_compute(const char * path,
     }
 
     // ---- cost breakdown of the provisional split (before the bisection) -----------
-    {
+    // Multi-GPU only: with a single planning device there is one placement — no
+    // provisional layout exists to compare the plan against, so there is nothing
+    // provisional to show.
+    if (nd_gpus >= 2) {
         kvfit_print_provisional_split(meas.usage);   // where the measurement load actually placed them
         std::vector<uint64_t> ssm_states(nd_gpus, 0);
         for (size_t g = 0; g < nd_gpus; ++g) {
@@ -1749,10 +1752,11 @@ static kvfit_plan kvfit_plan_compute(const char * path,
                            (a >= b) ? " (empty)" : "");
     }
 
-    // ---- cost breakdown of the final plan ------------------------------------
-    // Recomputed from the solver's per-layer costs over the winning ranges;
+    // ---- cost breakdown of the plan ------------------------------------------
+    // Recomputed from the solver's per-layer costs over the chosen ranges;
     // the placement-independent terms (base-buffer, compute-buffer rates) are
-    // shared with the provisional table.
+    // shared with the provisional table when one exists (multi-GPU). For a
+    // single planning device this is the only table: that is the deployment.
     {
         const size_t nd = plan.first_layer.size();
         std::vector<uint64_t> p_wts(nd, 0), p_ssm(nd, 0), p_kv(nd, 0), p_mtp(nd, 0);
@@ -1769,7 +1773,8 @@ static kvfit_plan kvfit_plan_compute(const char * path,
         // the last GPU also takes the global tensors (norm + output / lm_head);
         // the budget ledger columns are placement-independent — same for both tables
         if (nd > 0) p_wts[nd - 1] += last_gpu_extra;
-        kvfit_print_cost_breakdown("cost breakdown [final plan]", plan.names, frees, d_kernels, d_base,
+        kvfit_print_cost_breakdown((nd_gpus >= 2) ? "cost breakdown [final plan]" : "cost breakdown [plan]",
+                                   plan.names, frees, d_kernels, d_base,
                                    reserves, budgets, p_wts, p_ssm,
                                    p_kv, p_mtp, buf_bpc, mtp_buf_bpc);
     }
