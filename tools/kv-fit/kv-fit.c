@@ -15,7 +15,7 @@
 // Planning traces flow through the standard log callback at the PLANNING level.
 
 #include "llama.h"
-#include "../../src/llama-ext.h"
+#include "../../src/llama-ext-c.h"
 
 #include <stdint.h>
 #include <stdio.h>

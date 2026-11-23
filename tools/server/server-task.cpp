@@ -1329,11 +1329,17 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
 }
 
 json server_task_result_cmpl_partial::to_json_oaicompat_asr() {
-    json event = json {
-        {"type", "transcript.text.delta"},
-        {"delta", content.text},
-    };
-    return event;
+    // only the parsed content is the transcript, e.g. the "language XXX" prefix of Qwen3-ASR is reasoning
+    json events = json::array();
+    for (const auto & diff : oaicompat_msg_diffs) {
+        if (!diff.content_delta.empty()) {
+            events.push_back({
+                {"type", "transcript.text.delta"},
+                {"delta", diff.content_delta},
+            });
+        }
+    }
+    return events;
 }
 
 json server_task_result_cmpl_partial::to_json_anthropic() {
@@ -1513,6 +1519,16 @@ json server_task_result_rerank::to_json() {
 //
 // server_task_result_tts
 //
+json server_task_result_realtime::to_json() {
+    return json {
+        {"text",          content.text},
+        {"n_samples",     audio.size()},
+        {"response_done", response_done},
+        {"cancelled",     cancelled},
+        {"n_decoded",     n_decoded},
+    };
+}
+
 json server_task_result_tts::to_json() {
     return json {
         {"sample_rate", sample_rate},
@@ -1720,342 +1736,4 @@ json server_task_result_get_lora::to_json() {
 
 json server_task_result_apply_lora::to_json() {
     return json {{ "success", true }};
-}
-
-//
-// server_prompt_cache
-//
-
-// Instrumentation: LLAMA_PROMPT_CACHE_INSTRUMENT (any non-empty value enables)
-// One multi-line message per cache operation — the header line, then one aligned row
-// per cache entry — built as a single string and emitted via one log call, so only
-// the header gets the log prefix (same pattern as log_checkpoint_delete).
-std::string server_prompt_cache::state_dump(const std::string & header) const {
-    // Every row carries the full indent so all addresses align under the header data,
-    // which starts after the log prefix (timestamp, level, "srv", function name).
-    const size_t row_indent = 45;
-    std::stringstream ss;
-    ss << header << "\n";
-    for (const auto & state : states) {
-        ss << std::string(row_indent, ' ')
-           << (const void*)&state << "  "
-           << std::setw(6) << std::right << state.prompt.n_tokens() << " tokens"
-           << "  "
-           << std::setw(6) << std::right
-           << static_cast<size_t>(state.size() / (1024.0 * 1024.0)) << " MiB"
-           << "  "
-           << std::setw(3) << std::right << state.prompt.checkpoints.size() << " snapshots\n";
-    }
-    return ss.str();
-}
-
-bool pc_instr_enabled() {
-    static const bool enabled = [] {
-        const char * v = getenv("LLAMA_PROMPT_CACHE_INSTRUMENT");
-        return v && v[0];
-    }();
-    return enabled;
-}
-
-size_t server_prompt_cache::size() const {
-    size_t res = 0;
-
-    for (const auto & state : states) {
-        res += state.size();
-    }
-
-    return res;
-}
-
-size_t server_prompt_cache::n_tokens() const {
-    size_t res = 0;
-
-    for (const auto & state : states) {
-        res += state.prompt.n_tokens();
-    }
-
-    return res;
-}
-
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
-    // first check if the current state is contained fully in the cache
-    for (auto it = states.begin(); it != states.end(); ++it) {
-        const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
-
-        if (cur_lcp_len == (int) prompt.tokens.size()) {
-            SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
-            return nullptr;
-        }
-    }
-
-    // calculate checkpoints size to see if it will fit with the prompt
-    size_t checkpoints_size = 0;
-    for (const auto & ckpt : prompt.checkpoints) {
-        checkpoints_size += ckpt.size();
-    }
-
-    const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
-
-    // skip over-limit entries to avoid disturbing the cache
-    if (limit_size > 0 && state_size_new > limit_size) {
-        SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
-                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
-        return nullptr;
-    }
-
-    // remove any cached prompts that are fully contained in the current prompt
-    for (auto it = states.begin(); it != states.end();) {
-        const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
-
-        if (len == (int) it->prompt.tokens.size()) {
-            SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
-            const void * addr = (const void*)&(*it);
-            const size_t tok = it->prompt.n_tokens();
-            it = states.erase(it);
-
-            if (pc_instr_enabled()) {
-                SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=obsolete remaining=%zu total=%.3f MiB\n",
-                        addr, tok, states.size(), size() / (1024.0 * 1024.0));
-            }
-        } else {
-            ++it;
-        }
-    }
-
-    if (limit_size > 0) {
-        // make room before allocating the new vectors to avoid breaching the limit
-        while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
-            const void * addr = (const void*)&states.front();
-            const size_t tok = states.front().prompt.n_tokens();
-            states.pop_front();
-
-            if (pc_instr_enabled()) {
-                SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=size-limit remaining=%zu total=%.3f MiB\n",
-                        addr, tok, states.size(), size() / (1024.0 * 1024.0));
-            }
-        }
-    }
-
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
-
-    // check if we can allocate enough memory for the new state
-    try {
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
-    } catch (const std::bad_alloc & e) {
-        SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
-
-        limit_size = std::max<size_t>(1, 0.4*size());
-
-        SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
-
-        update();
-
-        return nullptr;
-    }
-
-    states.push_back({
-        /*.prompt =*/ {
-            /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
-        },
-        /*.data   =*/ {
-            /*.main =*/ std::move(state_data_tgt),
-            /*.drft =*/ std::move(state_data_dft),
-        },
-    });
-
-    // Instrumentation: log creation
-    if (pc_instr_enabled()) {
-        std::ostringstream os;
-        os << "PCACHE_CREATE addr=" << (const void*)&states.back()
-           << " tok=" << states.back().prompt.n_tokens()
-           << " size=" << static_cast<size_t>(states.back().size() / (1024.0 * 1024.0))
-           << " MiB entries=" << states.size()
-           << " total=" << static_cast<size_t>(size() / (1024.0 * 1024.0)) << " MiB";
-        SRV_INF("%s", state_dump(os.str()).c_str());
-    }
-
-    return &states.back();
-}
-
-
-server_prompt_cache_state server_prompt_cache::extract_entry(std::list<server_prompt_cache_state>::iterator it) {
-    if (it == states.end()) {
-        return server_prompt_cache_state(); // empty state
-    }
-
-    // Instrumentation: log extraction
-    const void * addr = (const void*)&(*it);
-    const size_t tok = (size_t)it->prompt.n_tokens();
-    
-    if (pc_instr_enabled()) {
-        SRV_INF("PCACHE_EXTRACT addr=%p tok=%zu entries_before=%zu\n",
-                addr, tok, states.size());
-    }
-
-    // Extract the entry from the list and return it
-    server_prompt_cache_state extracted = std::move(*it);
-    states.erase(it);
-
-    return extracted;
-}
-
-void server_prompt_cache::append_entry(server_prompt_cache_state && state) {
-    if (state.prompt.n_tokens() == 0) {
-        return; // nothing to append
-    }
-
-    // Move the entry back into the list at the back (for LRU behavior)
-    states.push_back(std::move(state));
-
-    // Instrumentation: log re-insertion
-    if (pc_instr_enabled()) {
-        const void * addr = (const void*)&states.back();
-        const size_t tok = states.back().prompt.n_tokens();
-        SRV_INF("PCACHE_APPEND addr=%p tok=%zu entries_after=%zu\n",
-                addr, tok, states.size());
-    }
-}
-
-bool server_prompt_cache::restore_entry(server_prompt & prompt, server_prompt_cache_state & extracted,
-        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool is_move, int matched_len) {
-    if (extracted.prompt.n_tokens() == 0) {
-        return true; // nothing to restore
-    }
-
-    const void * addr = (const void*)&extracted;
-    const size_t tok = (size_t)extracted.prompt.n_tokens();
-
-    if (is_move) {
-        // The whole prompt is consumed: relocate the state into the slot, then clear it.
-        // The entry has already been extracted from states by extract_entry().
-
-        auto & data = extracted.data.main;
-        const size_t size = data.size();
-        const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
-        if (n != size) {
-            SRV_ERR("failed to restore state with size %zu\n", size);
-            return false;
-        }
-        data.clear();
-        data.shrink_to_fit();
-
-        if (!extracted.data.drft.empty()) {
-            GGML_ASSERT(ctx_dft);
-            auto & drft = extracted.data.drft;
-            const size_t dsize = drft.size();
-            const size_t dn = llama_state_seq_set_data_ext(ctx_dft, drft.data(), dsize, id_slot, 0);
-            if (dn != dsize) {
-                SRV_WRN("failed to restore draft state with size %zu\n", dsize);
-                return false;
-            }
-            drft.clear();
-            drft.shrink_to_fit();
-        }
-
-        prompt = std::move(extracted.prompt);
-    } else {
-        // Only a prefix is used as a new prompt: copy the state into the slot, keep extracted data for reuse.
-        // The entry will be re-appended to states by the caller via append_entry().
-
-        if (!extracted.data.main.empty()) {
-            const size_t size = extracted.data.main.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, extracted.data.main.data(), size, id_slot, 0);
-            if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
-                return false;
-            }
-        }
-
-        if (!extracted.data.drft.empty()) {
-            GGML_ASSERT(ctx_dft);
-            const size_t size = extracted.data.drft.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_dft, extracted.data.drft.data(), size, id_slot, 0);
-            if (n != size) {
-                SRV_WRN("failed to restore draft state with size %zu\n", size);
-                return false;
-            }
-        }
-
-        prompt = extracted.prompt.clone(); // COPY: original stays in the caller's local var, to be re-appended
-    }
-
-    // Instrumentation: log hit after restore, so counters reflect resulting cache state
-    if (pc_instr_enabled()) {
-        SRV_INF("PCACHE_HIT addr=%p tok=%zu matched=%d type=%s slot=%d entries=%zu total=%zu MiB\n",
-                addr, tok, matched_len, is_move ? "move" : "copy", id_slot, states.size(),
-                static_cast<size_t>(this->size() / (1024.0 * 1024.0)));
-
-        // For MOVE operations, the entry was consumed and erased from the cache; log the deletion after the hit
-        if (is_move) {
-            std::ostringstream os;
-            os << "PCACHE_DELETE addr=" << addr
-               << " tok=" << tok
-               << " reason=consumed"
-               << " remaining=" << states.size()
-               << " total=" << static_cast<size_t>(this->size() / (1024.0 * 1024.0)) << " MiB";
-            SRV_INF("%s", state_dump(os.str()).c_str());
-        }
-    }
-
-    return true;
-}
-
-void server_prompt_cache::update() {
-    if (limit_size > 0) {
-        while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
-            const void * addr = (const void*)&states.front();
-            const size_t tok = states.front().prompt.n_tokens();
-            states.pop_front();
-
-            if (pc_instr_enabled()) {
-                std::ostringstream os;
-                os << "PCACHE_DELETE addr=" << addr
-                   << " tok=" << tok
-                   << " reason=size-limit"
-                   << " remaining=" << states.size()
-                   << " total=" << static_cast<size_t>(size() / (1024.0 * 1024.0)) << " MiB";
-                SRV_INF("%s", state_dump(os.str()).c_str());
-            }
-        }
-    }
-
-    // average size per token
-    const float size_per_token = std::max<float>(1.0f, float(size()) / (std::max<size_t>(1, n_tokens())));
-
-    // dynamically increase the token limit if it can fit in the memory limit
-    const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
-
-    if (limit_tokens > 0) {
-        while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
-            const void * addr = (const void*)&states.front();
-            const size_t tok = states.front().prompt.n_tokens();
-            states.pop_front();
-
-            if (pc_instr_enabled()) {
-                std::ostringstream os;
-                os << "PCACHE_DELETE addr=" << addr
-                   << " tok=" << tok
-                   << " reason=token-limit"
-                   << " remaining=" << states.size()
-                   << " total=" << static_cast<size_t>(size() / (1024.0 * 1024.0)) << " MiB";
-                SRV_INF("%s", state_dump(os.str()).c_str());
-            }
-        }
-    }
-
-    SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
-            states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
-
-    for (const auto & state : states) {
-        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
-                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
-    }
 }
