@@ -2930,6 +2930,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FIT_CTX"));
     add_opt(common_arg(
+        { "--keep-free" }, "R",
+        string_format("keep a fraction of each device's memory free, e.g. 0.05 for 5%%; switches the fit procedure to the "
+                      "measured kv-split auto-sizing (unified KV pool + computed layer placement); 0 < R < 1"),
+        [](common_params & params, const std::string & value) {
+            float r = -1.0f;
+            try {
+                r = (float) std::stod(value);
+            } catch (const std::exception &) {
+                throw std::invalid_argument(string_format("error: invalid value for --keep-free: '%s'", value.c_str()));
+            }
+            if (r <= 0.0f || r >= 1.0f) {
+                throw std::invalid_argument(string_format("error: --keep-free must be in the range (0, 1), got %f", r));
+            }
+            params.keep_free_ratio = r;
+        }
+    ).set_env("LLAMA_ARG_KEEP_FREE"));
+    add_opt(common_arg(
         {"--check-tensors"},
         string_format("check model tensor data for invalid values (default: %s)", params.check_tensors ? "true" : "false"),
         [](common_params & params) {

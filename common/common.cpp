@@ -1268,6 +1268,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         params.tensor_split,
         params.tensor_buft_overrides.data(),
         params.fit_params_target.data(),
+        params.keep_free_ratio,
         params.fit_params_min_ctx,
         has_draft || spec_mtp ? &extra : nullptr,
         params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);

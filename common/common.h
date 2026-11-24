@@ -508,6 +508,10 @@ struct common_params {
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
 
+    // fraction of each device's memory to keep free when using the measured kv-split auto-sizing:
+    // negative = unset (standard fit procedure), 0 <= value < 1 = switch to kv-split with this ratio
+    float keep_free_ratio = -1.0f;
+
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
 
