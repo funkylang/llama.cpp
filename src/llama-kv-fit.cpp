@@ -17,7 +17,15 @@
 //
 // Logging: detailed traces use LLAMA_LOG_PLANNING (visible without all of
 // llama.cpp's debug logs); failures and conclusions use the standard levels.
-// The consumer decides visibility.
+// The consumer decides visibility. Deployment report blocks (model header,
+// layer table, cost breakdowns) leave as ONE indivisible unit each — see
+// kvfit_block_emit: into the caller's collection stream when one is set, or
+// as a single log record otherwise, so live-log consumers never get records
+// interleaving inside a block.
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   // open_memstream (block emission) — must precede includes
+#endif
 
 #include "llama-impl.h"   // LLAMA_LOG_* macros
 #include "llama-ext.h"    // public planning API declarations
@@ -65,12 +73,117 @@ LLAMA_API void llama_kv_fit_params_free(struct llama_kv_fit_params * p) {
 }
 
 // The deployment-report stream: caller-collected (params->report_stream — the
-// kv-fit tool assembles the whole report and writes it out atomically) or
-// stderr by default. Every deployment table goes through here, never to a raw
-// stream on its own, so the report stays one indivisible unit on the wire.
+// kv-fit tool assembles the whole report and writes it out atomically) or a
+// single log record by default.
 static FILE * kvfit_report(const struct llama_kv_fit_params * p) {
     return (p && p->report_stream) ? p->report_stream : stderr;
 }
+
+// ---- unified block emission -------------------------------------------------
+// Every report block (model header + layer table, cost breakdowns) leaves as
+// ONE indivisible unit: into the caller's collection stream when one is set
+// (the kv-fit tool assembles the full report, written atomically at exit), or
+// as a SINGLE log record otherwise — so consumers with live logs (the server,
+// fllama) can never have records interleave inside a block, no matter how
+// their transports buffer. Blocks start on a fresh line: the leading newline
+// is guaranteed here.
+static bool kvfit_block_emit(const struct llama_kv_fit_params * p, const char * text, size_t len) {
+    if (len == 0) return true;
+    FILE * rep = (p && p->report_stream) ? p->report_stream : nullptr;
+    if (rep) {
+        return fwrite(text, 1, len, rep) == len;
+    }
+    // log path: pad a leading newline when the block does not already start
+    // with one, then emit as one atomic record.
+    if (text[0] != '\n') {
+        std::string s("\n", 1);
+        s.append(text, len);
+        llama_log_internal(GGML_LOG_LEVEL_PLANNING, "%s", s.c_str());
+    } else {
+        llama_log_internal(GGML_LOG_LEVEL_PLANNING, "%s", text);
+    }
+    return true;
+}
+
+// Render helper: call render() with a temporary stream, then emit everything
+// written into it as one block.
+static bool kvfit_emit_block(const struct llama_kv_fit_params * p,
+                             void (*render)(FILE *, void *), void * ctx) {
+    char * buf = nullptr;
+    size_t len = 0;
+    FILE * tmp = open_memstream(&buf, &len);
+    if (!tmp) return false;
+    render(tmp, ctx);
+    fflush(tmp);                    // open_memstream updates pointers on flush
+    if (fclose(tmp) != 0) { free(buf); return false; }
+    bool ok = kvfit_block_emit(p, buf ? buf : "", len);
+    free(buf);
+    return ok;
+}
+
+namespace {
+// Context for the cost-breakdown render callback (kvfit_emit_block).
+struct kvfit_cb_ctx {
+    const char * title;
+    const std::vector<std::string> & names;
+    const std::vector<uint64_t> & free, & kernels, & base, & reserve, & budget;
+    const std::vector<uint64_t> & wts, & ssm_state;
+    const std::vector<uint64_t> & kv_bpc, & mtp_bpc, & buf_bpc, & mtp_buf_bpc;
+};
+
+// render() target for the breakdown: title + box into one stream. The table is
+// written by print_table as a single atomic block against the same stream.
+void kvfit_cb_render(FILE * out, void * vctx) {
+    const auto & c = *static_cast<kvfit_cb_ctx *>(vctx);
+    fprintf(out, "\n      %s\n", c.title);
+
+    // columns: split-budget ledger (independent of the placement), then the
+    // placement-dependent fixed costs, then the per-cell rates (buffers kept
+    // separate) and their sum
+    static const char * hdrs[12] = { "free", "kernels", "base-buffer", "reserve", "budget",
+                                     "tensors", "ssm-state", "kv/c", "mtp/c",
+                                     "buf/c", "mbuf/c", "total/c" };
+    const int n_rows = (int)c.names.size() + 1;   // one per GPU + TOTAL
+
+    std::vector<std::string> keys;
+    keys.reserve(n_rows);
+    for (const auto & n : c.names) keys.push_back(n);
+    keys.push_back("TOTAL");
+
+    std::vector<long> flat((size_t)n_rows * 12, 0);
+    const auto get = [](const std::vector<uint64_t> & v, size_t g) -> long {
+        return (g < v.size()) ? (long)v[g] : 0;
+    };
+    for (size_t g = 0; g < c.names.size(); ++g) {
+        const size_t o = g * 12;
+        flat[o + 0] = get(c.free, g);
+        flat[o + 1] = get(c.kernels, g);
+        flat[o + 2] = get(c.base, g);
+        flat[o + 3] = get(c.reserve, g);
+        flat[o + 4] = get(c.budget, g);
+        flat[o + 5] = get(c.wts, g);
+        flat[o + 6] = get(c.ssm_state, g);
+        flat[o + 7] = get(c.kv_bpc, g);
+        flat[o + 8] = get(c.mtp_bpc, g);
+        flat[o + 9] = get(c.buf_bpc, g);
+        flat[o + 10] = get(c.mtp_buf_bpc, g);
+        flat[o + 11] = flat[o + 7] + flat[o + 8] + flat[o + 9] + flat[o + 10];
+    }
+    // TOTAL row: column sums (total/c = sum of the four per-cell columns)
+    for (int col = 0; col < 12; ++col) {
+        long t = 0;
+        for (size_t g = 0; g < c.names.size(); ++g) t += flat[g * 12 + col];
+        flat[(size_t)(c.names.size()) * 12 + col] = t;
+    }
+
+    std::vector<const long *> row_ptrs(n_rows);
+    for (int r = 0; r < n_rows; ++r) row_ptrs[r] = flat.data() + (size_t)r * 12;
+    std::vector<const char *> keys_arr(n_rows);
+    for (int r = 0; r < n_rows; ++r) keys_arr[r] = keys[r].c_str();
+
+    print_table(out, n_rows, 12, hdrs, keys_arr.data(), "device", row_ptrs.data(), nullptr, true);
+}
+} // anonymous namespace
 
 // ============================================================================
 // Device scan
@@ -351,13 +464,13 @@ static std::vector<size_t> kvfit_greedy_walk(uint32_t n_blocks,
     return first;
 }
 
-// Print the per-GPU cost breakdown through print_table: the split-budget
-// ledger first (free - kernels - base-buffer - reserve = budget), then the
-// placement costs (tensors, SSM) and the per-cell rates with their sum.
-// Used for both the provisional split (before the bisection) and the final
-// plan — the caller supplies per-GPU arrays in its own placement.
-// Emitted on the caller's deployment-report stream (kvfit_report()).
-static void kvfit_print_cost_breakdown(FILE * report,
+// Print the per-GPU cost breakdown: the split-budget ledger first (free -
+// kernels - base-buffer - reserve = budget), then the placement costs
+// (tensors, SSM) and the per-cell rates with their sum. Used for both the
+// provisional split (before the bisection) and the final plan — the caller
+// supplies per-GPU arrays in its own placement. Title + box leave as ONE
+// indivisible block through kvfit_block_emit (collection stream or log).
+static bool kvfit_print_cost_breakdown(const struct llama_kv_fit_params * params,
                                        const char * title,
                                        const std::vector<std::string> & names,
                                        const std::vector<uint64_t> & free,
@@ -371,53 +484,9 @@ static void kvfit_print_cost_breakdown(FILE * report,
                                        const std::vector<uint64_t> & mtp_bpc,
                                        const std::vector<uint64_t> & buf_bpc,
                                        const std::vector<uint64_t> & mtp_buf_bpc) {
-    fprintf(report, "\n      %s\n", title);
-
-    // columns: split-budget ledger (independent of the placement), then the
-    // placement-dependent fixed costs, then the per-cell rates (buffers kept
-    // separate) and their sum
-    static const char * hdrs[12] = { "free", "kernels", "base-buffer", "reserve", "budget",
-                                     "tensors", "ssm-state", "kv/c", "mtp/c",
-                                     "buf/c", "mbuf/c", "total/c" };
-    const int n_rows = (int)names.size() + 1;   // one per GPU + TOTAL
-
-    std::vector<std::string> keys;
-    keys.reserve(n_rows);
-    for (const auto & n : names) keys.push_back(n);
-    keys.push_back("TOTAL");
-
-    std::vector<long> flat((size_t)n_rows * 12, 0);
-    const auto get = [](const std::vector<uint64_t> & v, size_t g) -> long {
-        return (g < v.size()) ? (long)v[g] : 0;
-    };
-    for (size_t g = 0; g < names.size(); ++g) {
-        const size_t o = g * 12;
-        flat[o + 0] = get(free, g);
-        flat[o + 1] = get(kernels, g);
-        flat[o + 2] = get(base, g);
-        flat[o + 3] = get(reserve, g);
-        flat[o + 4] = get(budget, g);
-        flat[o + 5] = get(wts, g);
-        flat[o + 6] = get(ssm_state, g);
-        flat[o + 7] = get(kv_bpc, g);
-        flat[o + 8] = get(mtp_bpc, g);
-        flat[o + 9] = get(buf_bpc, g);
-        flat[o + 10] = get(mtp_buf_bpc, g);
-        flat[o + 11] = flat[o + 7] + flat[o + 8] + flat[o + 9] + flat[o + 10];
-    }
-    // TOTAL row: column sums (total/c = sum of the four per-cell columns)
-    for (int c = 0; c < 12; ++c) {
-        long t = 0;
-        for (size_t g = 0; g < names.size(); ++g) t += flat[g * 12 + c];
-        flat[(size_t)(names.size()) * 12 + c] = t;
-    }
-
-    std::vector<const long *> row_ptrs(n_rows);
-    for (int r = 0; r < n_rows; ++r) row_ptrs[r] = flat.data() + (size_t)r * 12;
-    std::vector<const char *> keys_arr(n_rows);
-    for (int r = 0; r < n_rows; ++r) keys_arr[r] = keys[r].c_str();
-
-    print_table(report, n_rows, 12, hdrs, keys_arr.data(), "device", row_ptrs.data(), nullptr, true);
+    kvfit_cb_ctx ctx = { title, names, free, kernels, base, reserve, budget,
+                         wts, ssm_state, kv_bpc, mtp_bpc, buf_bpc, mtp_buf_bpc };
+    return kvfit_emit_block(params, kvfit_cb_render, &ctx);
 }
 
 // Try placing n 256-cell blocks with the candidate placement from the shared
@@ -438,8 +507,15 @@ static bool kvfit_try_place(uint32_t n_blocks,
                             uint64_t last_gpu_extra,
                             const std::vector<uint64_t> & buf_bpc) {
     const uint64_t cells = (uint64_t)n_blocks * 256;
-    LLAMA_LOG_PLANNING("\n        testing with n = %-5u blocks (%llu cells)\n",
-                       n_blocks, (unsigned long long)cells);
+
+    // The whole step as ONE log record: the solver pass is pure computation
+    // (microseconds), so splitting a step across records just scatters log
+    // stamps inside what is a single unit of work. Accumulate, emit once.
+    std::string rec;
+    { char b[128];
+      snprintf(b, sizeof b, "\n        testing with n = %-5u blocks (%llu cells)\n",
+               n_blocks, (unsigned long long)cells);
+      rec += b; }
 
     // prefix sums over layers: O(1) range queries for each cost component.
     const size_t nl = layers.size();
@@ -502,41 +578,48 @@ static bool kvfit_try_place(uint32_t n_blocks,
 
         const bool fits = (used <= budgets[g]);   // overflow-safe: all terms fit in uint64_t
 
-        LLAMA_LOG_PLANNING("          %s: layers = %s\n"
-                           "            tensors   = %llu\n"
-                           "            swa/ssm   = %llu\n"
-                           "            cache     = cells(%llu) × bpc(%llu) = %llu\n"
-                           "            mtp       = cells(%llu) × bpc(%llu) = %llu\n"
-                           "            buffers   = cells(%llu) × bpc(%llu) = %llu\n",
-                           names[g].c_str(), range.c_str(),
-                           (unsigned long long)wts, (unsigned long long)ssm,
-                           (unsigned long long)cells, (unsigned long long)kv_bpc,
-                           (unsigned long long)cache,
-                           (unsigned long long)cells, (unsigned long long)mtp_bpc,
-                           (unsigned long long)mtp,
-                           (unsigned long long)cells,
-                           (unsigned long long)((g < buf_bpc.size()) ? buf_bpc[g] : 0),
-                           (unsigned long long)buffers);
+        char b[1024];
+        snprintf(b, sizeof b, "          %s: layers = %s\n"
+                               "            tensors   = %llu\n"
+                               "            swa/ssm   = %llu\n"
+                               "            cache     = cells(%llu) × bpc(%llu) = %llu\n"
+                               "            mtp       = cells(%llu) × bpc(%llu) = %llu\n"
+                               "            buffers   = cells(%llu) × bpc(%llu) = %llu\n",
+                 names[g].c_str(), range.c_str(),
+                 (unsigned long long)wts, (unsigned long long)ssm,
+                 (unsigned long long)cells, (unsigned long long)kv_bpc,
+                 (unsigned long long)cache,
+                 (unsigned long long)cells, (unsigned long long)mtp_bpc,
+                 (unsigned long long)mtp,
+                 (unsigned long long)cells,
+                 (unsigned long long)((g < buf_bpc.size()) ? buf_bpc[g] : 0),
+                 (unsigned long long)buffers);
+        rec += b;
         if (fits) {
-            LLAMA_LOG_PLANNING("            used      = tensors(%llu) + swa/ssm(%llu) + cache(%llu) + mtp(%llu) + buffers(%llu) = %llu\n"
-                               "            not used  = budget(%llu) - used(%llu) = %llu\n",
-                               (unsigned long long)wts, (unsigned long long)ssm,
-                               (unsigned long long)cache, (unsigned long long)mtp,
-                               (unsigned long long)buffers, (unsigned long long)used,
-                               (unsigned long long)budgets[g], (unsigned long long)used,
-                               (unsigned long long)(budgets[g] - used));
+            snprintf(b, sizeof b, "            used      = tensors(%llu) + swa/ssm(%llu) + cache(%llu) + mtp(%llu) + buffers(%llu) = %llu\n"
+                                  "            not used  = budget(%llu) - used(%llu) = %llu\n",
+                     (unsigned long long)wts, (unsigned long long)ssm,
+                     (unsigned long long)cache, (unsigned long long)mtp,
+                     (unsigned long long)buffers, (unsigned long long)used,
+                     (unsigned long long)budgets[g], (unsigned long long)used,
+                     (unsigned long long)(budgets[g] - used));
         } else {
-            LLAMA_LOG_PLANNING("            used      = tensors(%llu) + swa/ssm(%llu) + cache(%llu) + mtp(%llu) + buffers(%llu) = %llu\n"
-                               "            over limit = used(%llu) - budget(%llu) = %llu\n",
-                               (unsigned long long)wts, (unsigned long long)ssm,
-                               (unsigned long long)cache, (unsigned long long)mtp,
-                               (unsigned long long)buffers, (unsigned long long)used,
-                               (unsigned long long)used, (unsigned long long)budgets[g],
-                               (unsigned long long)(used - budgets[g]));
+            snprintf(b, sizeof b, "            used      = tensors(%llu) + swa/ssm(%llu) + cache(%llu) + mtp(%llu) + buffers(%llu) = %llu\n"
+                                  "            over limit = used(%llu) - budget(%llu) = %llu\n",
+                     (unsigned long long)wts, (unsigned long long)ssm,
+                     (unsigned long long)cache, (unsigned long long)mtp,
+                     (unsigned long long)buffers, (unsigned long long)used,
+                     (unsigned long long)used, (unsigned long long)budgets[g],
+                     (unsigned long long)(used - budgets[g]));
         }
+        rec += b;
 
-        if (is_last) return fits;
+        if (is_last) {
+            LLAMA_LOG_PLANNING("%s", rec.c_str());   // the step as one record
+            return fits;
+        }
     }
+    LLAMA_LOG_PLANNING("%s", rec.c_str());   // the step as one record
     return true;   // all layers placed — candidate fits
 }
 
@@ -1684,7 +1767,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
         for (size_t g = 0; g < nd_gpus; ++g) {
             ssm_states[g] = d_ssm_bpr[g] * (uint64_t)state_rows;
         }
-        kvfit_print_cost_breakdown(kvfit_report(params), "cost breakdown [provisional split]", names, frees, d_kernels, d_base,
+        kvfit_print_cost_breakdown(params, "cost breakdown [provisional split]", names, frees, d_kernels, d_base,
                                    reserves, budgets, d_weights, ssm_states,
                                    d_kv_bpc, d_mtp_bpc, buf_bpc, mtp_buf_bpc);
     }
@@ -1811,7 +1894,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
         // the last GPU also takes the global tensors (norm + output / lm_head);
         // the budget ledger columns are placement-independent — same for both tables
         if (nd > 0) p_wts[nd - 1] += last_gpu_extra;
-        kvfit_print_cost_breakdown(kvfit_report(params), (nd_gpus >= 2) ? "cost breakdown [final plan]" : "cost breakdown [plan]",
+        kvfit_print_cost_breakdown(params, (nd_gpus >= 2) ? "cost breakdown [final plan]" : "cost breakdown [plan]",
                                    plan.names, frees, d_kernels, d_base,
                                    reserves, budgets, p_wts, p_ssm,
                                    p_kv, p_mtp, buf_bpc, mtp_buf_bpc);
@@ -1891,27 +1974,18 @@ namespace {
 llama_kv_fit_result g_kvfit_result;
 std::vector<int>    g_kvfit_layer_bounds;
 
-// No-op log callback for the deployment-report window: those tables print raw
-// to stderr (no timestamps, no prefixes) and loader chatter from the peek load
-// must not interleave with them.
-static void kvfit_log_quiet(ggml_log_level, const char *, void *) {}
-
-struct kvfit_log_guard {
-    ggml_log_callback cb = nullptr;
-    void * ud = nullptr;
-    kvfit_log_guard()  { llama_log_get(&cb, &ud); llama_log_set(kvfit_log_quiet, nullptr); }
-    ~kvfit_log_guard() { llama_log_set(cb, ud); }
-};
-
 } // anonymous namespace
 
 // The deployment report (model header + per-layer table) — what the kv-split
 // tool used to print itself; printed before plan computation, like the tool
 // did. One metadata-only peek load: no_alloc keeps VRAM untouched.
+// Header + table are rendered OFFLINE into one buffer and emitted as ONE
+// indivisible block (kvfit_block_emit) — nothing can interleave inside it.
 static void kvfit_print_deployment_report(const char * path_model,
                                           const llama_context_params * cparams,
                                           const struct llama_kv_fit_params * params) {
-    kvfit_log_guard log_quiet;
+    char * rep_buf = nullptr;
+    size_t rep_len = 0;
 
     llama_model_params mp_info = llama_model_default_params();
     mp_info.no_alloc  = true;
@@ -1934,21 +2008,31 @@ static void kvfit_print_deployment_report(const char * path_model,
 
     const bool flash_attn = cparams->flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     mi_model_info_t info = mi_model_info_new(path_model, m_info);
-    if (!info) {
+    if (info) {
+        FILE * tmp = open_memstream(&rep_buf, &rep_len);
+        if (tmp) {
+            if (!mi_print_header(tmp, info,
+                                 (enum ggml_type)cparams->type_k, (enum ggml_type)cparams->type_v, &opts)
+                || !mi_print_layer_table(tmp, info,
+                                         (enum ggml_type)cparams->type_k, (enum ggml_type)cparams->type_v,
+                                         flash_attn)) {
+                LLAMA_LOG_WARN("kvfit: model-info table print failed for %s\n", path_model);
+            }
+            fflush(tmp);
+            fclose(tmp);
+        } else {
+            LLAMA_LOG_ERROR("kvfit: report buffer allocation failed for %s\n", path_model);
+        }
+        mi_model_info_free(info);
+    } else {
         LLAMA_LOG_ERROR("kvfit: could not open %s for the model-info table\n", path_model);
-        llama_model_free(m_info);
-        return;   // the planning load below will report the real error
     }
-    FILE * rep = kvfit_report(params);
-    if (!mi_print_header(rep, info,
-                         (enum ggml_type)cparams->type_k, (enum ggml_type)cparams->type_v, &opts)
-        || !mi_print_layer_table(rep, info,
-                                 (enum ggml_type)cparams->type_k, (enum ggml_type)cparams->type_v,
-                                 flash_attn)) {
-        LLAMA_LOG_WARN("kvfit: model-info table print failed for %s\n", path_model);
-    }
-    mi_model_info_free(info);
     llama_model_free(m_info);
+
+    if (rep_buf) {
+        kvfit_block_emit(params, rep_buf, rep_len);
+        free(rep_buf);
+    }
 }
 
 LLAMA_API const struct llama_kv_fit_result * llama_kv_split(
