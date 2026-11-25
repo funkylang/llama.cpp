@@ -421,10 +421,6 @@ struct server_slot {
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
 
-    // this is for printing timings with slot progress, not part of metrics
-    int64_t t_print_last = 0;
-    int32_t n_gen_last = 0;
-
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -721,26 +717,6 @@ struct server_slot {
         }
 
         return stop_pos;
-    }
-
-    void print_timings_tg() {
-        if (stats.n_gen < 100) {
-            return;
-        }
-
-        const int64_t t_now = ggml_time_us();
-
-        if (t_now - t_print_last < 3*1000*1000) {
-            return;
-        }
-
-        const double n_gen_second     = stats.n_gen_tps();
-        const double n_gen_second_win = 1e6 / (t_now - t_print_last) * (stats.n_gen - n_gen_last);
-
-        t_print_last = t_now;
-        n_gen_last = stats.n_gen;
-
-        SLT_INF(*this, "n_gen = %6d, tg = %6.2f t/s, tg_3s = %6.2f t/s\n", (int) stats.n_gen, n_gen_second, n_gen_second_win);
     }
 
     void print_timings_pp() const {
@@ -3610,6 +3586,33 @@ private:
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
         }
 
+        // per-round log: tokens evaluated and their slot composition (fllama style)
+        if (batch.size() > 0) {
+            std::vector<bool> in_batch(slots.size(), false);
+            int n_slots_in_batch = 0;
+            for (const auto & t : batch.tokens) {
+                if (!in_batch[t.id_slot]) {
+                    in_batch[t.id_slot] = true;
+                    ++n_slots_in_batch;
+                }
+            }
+
+            int64_t n_queued = 0;
+            for (auto & slot : slots) {
+                if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+                    if (slot.task->type != SERVER_TASK_TYPE_TTS && slot.task->type != SERVER_TASK_TYPE_REALTIME) {
+                        n_queued += std::max(0, slot.task->n_tokens() - slot.prompt.n_tokens());
+                    }
+                }
+            }
+
+            if (n_queued > 0) {
+                SRV_INF("evaluating %d tokens in %d slot%s (%lld tokens queued)\n", batch.size(), n_slots_in_batch, n_slots_in_batch == 1 ? "" : "s", (long long) n_queued);
+            } else {
+                SRV_INF("evaluating %d tokens in %d slot%s\n", batch.size(), n_slots_in_batch, n_slots_in_batch == 1 ? "" : "s");
+            }
+        }
+
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
@@ -3946,14 +3949,52 @@ private:
             }
         });
 
-        // update the batch with the sampled/drafted tokens
-        iterate(generating, [&](server_slot & slot) {
-            slot.handle_last_sampled_token(batch);
-        });
-
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+
+        // big-prefill rule: if some slot's pending prefill alone fills the whole batch,
+        // dedicate this round to it (decode stalls one round). Never pick a slot whose
+        // prompt cannot fit one empty batch - it would block everything forever.
+        server_slot * big_prefill = nullptr;
+        iterate(slots, [&](server_slot & slot) {
+            if (slot.state != SLOT_STATE_STARTED && slot.state != SLOT_STATE_PROCESSING_PROMPT) {
+                return;
+            }
+
+            if (slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
+                return;
+            }
+
+            const int pending = slot.task->n_tokens() - slot.prompt.n_tokens();
+            if (pending < n_batch) {
+                return;
+            }
+
+            if (!slot.can_split()) {
+                const int32_t n_batch_max = llama_get_causal_attn(ctx_tgt) ? n_batch : std::min(n_batch, n_ubatch);
+                if (slot.task->n_tokens() > n_batch_max) {
+                    return; // will never fit one batch - cannot be dedicated
+                }
+            }
+
+            const int best    = big_prefill ? big_prefill->task->n_tokens() - big_prefill->prompt.n_tokens() : -1;
+            if (pending > best) {
+                big_prefill = &slot;
+            }
+        });
+
+        if (big_prefill) {
+            SLT_DBG(*big_prefill, "big prefill: %d tokens in queue (n_batch = %d), dedicating round\n",
+                    big_prefill->task->n_tokens() - big_prefill->prompt.n_tokens(), n_batch);
+        }
+
+        // update the batch with the sampled/drafted tokens; skipped on big-prefill rounds (decode stalls one round)
+        if (!big_prefill) {
+            iterate(generating, [&](server_slot & slot) {
+                slot.handle_last_sampled_token(batch);
+            });
+        }
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
@@ -4368,8 +4409,10 @@ private:
 
                     // TODO: do the same for all models, then remove process_mtmd_chunk()
                     if (use_mixed_batch() && !slot.can_split() && input_tokens.has_mtmd) {
-                        if (!add_prompt_mixed(slot)) {
-                            return;
+                        if (!big_prefill || big_prefill == &slot) {
+                            if (!add_prompt_mixed(slot)) {
+                                return;
+                            }
                         }
                     }
 
@@ -4423,8 +4466,9 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
-                    // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    // add prompt tokens for processing in the current batch;
+                    // on big-prefill rounds only the dedicated slot adds tokens
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch && (!big_prefill || big_prefill == &slot)) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4872,15 +4916,10 @@ private:
 
             common_sampler_accept(slot.smpl.get(), id, true);
 
-            // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
-            const int64_t t_now = ggml_time_us();
-
             slot.stats.n_gen += 1;
 
             if (slot.stats.n_gen == 1) {
                 slot.stats.update_prompt_last();
-                slot.t_print_last = t_now;
-                slot.n_gen_last = 0;
             }
 
             slot.stats.update_gen_last();
@@ -4902,8 +4941,6 @@ private:
 
                 return;
             }
-
-            slot.print_timings_tg();
         });
 
         // speculative decoding - main model sample and accept
@@ -5054,8 +5091,6 @@ private:
                     return;
                 }
             }
-
-            slot.print_timings_tg();
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
