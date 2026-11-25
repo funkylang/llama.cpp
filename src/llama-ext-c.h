@@ -28,7 +28,7 @@ extern "C" {
 // the version the caller requires.
 //
 
-#define LLAMA_KV_FIT_PARAMS_VERSION 5
+#define LLAMA_KV_FIT_PARAMS_VERSION 6
 
 // llama_kv_split() behavior options (bitmask): set by the caller from its own
 // command-line options; all off by default.
@@ -52,6 +52,15 @@ struct llama_kv_fit_params {
     // the v3 verify / v4 debug booleans; same struct size as before.
     uint32_t options;
     // FUTURE FIELDS: append here; initialize in llama_kv_fit_params_new()
+
+    // v6: deployment-report stream. The model header, per-layer table and cost-
+    // breakdown tables are written here INSTEAD of stderr so the caller owns the
+    // whole report as one unit (the kv-fit tool collects it in memory and emits
+    // it as a single atomic write). Planning LOG messages still flow through
+    // llama_log_set() — set this to funnel tables into the same stream. NULL =
+    // tables print straight to stderr (default, back-compat). Caller-owned; the
+    // library only writes to it and never closes or frees it.
+    FILE * report_stream;
 };
 
 // Allocates + initializes the options struct with library defaults. Terminates

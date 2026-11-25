@@ -4,32 +4,66 @@
 //   1. llama_kv_fit_params_new()  — planning options (library-allocated)
 //   2. llama_kv_split()           — placement AND pool size in ONE call
 //
-// This tool is the deployment report itself: it sets LLAMA_KV_FIT_PRINT_TABLES
-// so the library prints the model header + per-layer table before planning.
+// This tool IS the deployment report: it collects everything the run produces —
+// model header + per-layer table, planning logs, cost breakdowns, the plan —
+// into ONE memory stream (params->report_stream + the log callback share it),
+// and emits that stream as a single atomic write(2) at exit. Nothing else
+// touches fd 2 during the run, so the report can never be interleaved or split
+// by transport buffering, no matter how it is piped.
 // With --verify the library additionally runs ONE verification load with the
 // computed plan (model at the planned split + context at the planned pool +
 // warmup decode) and proves it: per-layer placement readback against the plan,
 // plus free VRAM after everything is loaded and warmed up. Without --verify
 // there is no verification run — planning only.
 //
-// Planning traces flow through the standard log callback at the PLANNING level.
+// Planning traces flow through the standard log callback at the PLANNING level;
+// both levels of report output (tables via report_stream, logs via the callback)
+// land in the same collected stream.
+
+#define _GNU_SOURCE   // open_memstream / close_memstream — must precede includes
 
 #include "llama.h"
 #include "../../src/llama-ext-c.h"
 
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static const char * g_path = NULL;
 
+// ---- the collected deployment report ----------------------------------------
+// One stream owns every byte of the run: the library's report_stream tables and
+// the tool's log-callback records both write into it. At exit the whole buffer
+// goes out as ONE write(2) — an indivisible unit on fd 2.
+static FILE   * g_report  = NULL;
+static char   * g_rep_buf = NULL;
+static size_t  g_rep_size = 0;
 
+// Every print in this tool funnels through here (the report stream, or stderr
+// as a fallback when the memstream could not be created).
+static FILE * out(void) { return g_report ? g_report : stderr; }
+
+static void flush_report(void) {
+    if (!g_report) return;
+    fflush(g_report);   // updates g_rep_buf / g_rep_size (open_memstream leaves them
+                        // indeterminate until the stream has been flushed at least once)
+    if (g_rep_buf && g_rep_size > 0) {
+        ssize_t n = write(STDERR_FILENO, g_rep_buf, g_rep_size);   // one atomic unit
+        (void)n;
+    }
+    fclose(g_report);   // frees the memstream buffer
+    g_report  = NULL;
+    g_rep_buf = NULL;
+    g_rep_size = 0;
+}
 
 static void log_callback(enum ggml_log_level level, const char * text, void * user_data) {
     (void)user_data;
     if (level == GGML_LOG_LEVEL_PLANNING || level >= GGML_LOG_LEVEL_WARN) {
-        fputs(text, stderr);
+        fputs(text, out());
     }
 }
 
@@ -39,12 +73,12 @@ static int kv_type_from_str(const char * s) {
     if (!strcmp(s, "f32"))  return GGML_TYPE_F32;
     if (!strcmp(s, "q8_0")) return GGML_TYPE_Q8_0;
     if (!strcmp(s, "q4_0")) return GGML_TYPE_Q4_0;
-    fprintf(stderr, "error: unknown cache type '%s' (f16|bf16|f32|q8_0|q4_0)\n", s);
+    fprintf(out(), "error: unknown cache type '%s' (f16|bf16|f32|q8_0|q4_0)\n", s);
     exit(1);
 }
 
 static void usage(const char * prog) {
-    fprintf(stderr,
+    fprintf(out(),
         "usage: %s MODEL [options]\n"
         "\n"
         "KV-fit planner: plans a deployment through libllama's KV-fit API and\n"
@@ -66,6 +100,10 @@ static void usage(const char * prog) {
 }
 
 int main(int argc, char ** argv) {
+    // The report collects from the very first byte: set up before anything prints.
+    g_report = open_memstream(&g_rep_buf, &g_rep_size);   // NULL -> out() falls back to stderr
+    atexit(flush_report);
+
     double keep_free = 0.03;
     int parallel_arg = -1, checkpoints_arg = -1;
     enum ggml_type type_k = GGML_TYPE_F16, type_v = GGML_TYPE_F16;
@@ -79,7 +117,7 @@ int main(int argc, char ** argv) {
         if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(argv[0]); return 0; }
         if (!strcmp(a, "--keep-free") || !strcmp(a, "--parallel") || !strcmp(a, "--checkpoints") ||
             !strcmp(a, "--cache-type-k") || !strcmp(a, "--cache-type-v") || !strcmp(a, "--ubatch-size")) {
-            if (++i >= argc) { fprintf(stderr, "error: '%s' requires a value\n", a); return 1; }
+            if (++i >= argc) { fprintf(out(), "error: '%s' requires a value\n", a); return 1; }
         }
         if      (!strcmp(a, "--keep-free"))    keep_free   = atof(argv[i]);
         else if (!strcmp(a, "--parallel"))     parallel_arg    = atoi(argv[i]);
@@ -92,21 +130,21 @@ int main(int argc, char ** argv) {
         else if (!strcmp(a, "--verify"))       verify          = true;
         else if (!strcmp(a, "--debug"))        debug           = true;
         else if (!g_path)                      g_path          = argv[i];
-        else { fprintf(stderr, "error: unexpected argument '%s'\n", a); return 1; }
+        else { fprintf(out(), "error: unexpected argument '%s'\n", a); return 1; }
     }
     if (!g_path) { usage(argv[0]); return 1; }
 
     // deployment-shape constraints
     if ((parallel_arg >= 0 && parallel_arg < 1) || (checkpoints_arg >= 0 && checkpoints_arg < 1)) {
-        fprintf(stderr, "error: --parallel / --checkpoints must be >= 1\n");
+        fprintf(out(), "error: --parallel / --checkpoints must be >= 1\n");
         return 1;
     }
     if (parallel_arg >= 0 && checkpoints_arg >= 0) {
-        fprintf(stderr, "error: --parallel and --checkpoints cannot be combined\n");
+        fprintf(out(), "error: --parallel and --checkpoints cannot be combined\n");
         return 1;
     }
     if (!(keep_free >= 0.0 && keep_free < 1.0)) {
-        fprintf(stderr, "error: --keep-free must be in [0, 1)\n");
+        fprintf(out(), "error: --keep-free must be in [0, 1)\n");
         return 1;
     }
 
@@ -141,26 +179,28 @@ int main(int argc, char ** argv) {
     // the planner uses it verbatim rather than re-deriving from context params.
     params->n_checkpoints = cparams.n_seq_max * (1u + cparams.n_rs_seq);
     // this tool is the deployment report: PRINT_TABLES prints the model header
-    // + per-layer table before planning; verify/debug stay caller-controlled.
+    // + per-layer table; verify/debug stay caller-controlled. The tables join
+    // the same collected stream as the planning logs (report_stream).
     params->options = LLAMA_KV_FIT_PRINT_TABLES
                     | (verify ? LLAMA_KV_FIT_VERIFY : 0u)
                     | (debug  ? LLAMA_KV_FIT_DEBUG  : 0u);
+    params->report_stream = g_report;   // NULL in the stderr fallback — old behavior
 
     // ---- plan placement AND pool in one call ---------------------------------
-    fprintf(stderr, "\n== kv-fit clone: planning %s ==\n", g_path);
+    fprintf(out(), "\n== kv-fit clone: planning %s ==\n", g_path);
 
     const struct llama_kv_fit_result * result =
         llama_kv_split(g_path, &mparams, &cparams, params, 0 /* maximize the pool */);
 
     if (!result || !result->ok) {
-        fprintf(stderr, "error: no viable deployment — %s\n",
+        fprintf(out(), "error: no viable deployment — %s\n",
                 result ? result->error_msg : "(no result)");
         llama_kv_fit_params_free(params);
         llama_backend_free();
         return 1;
     }
     if (result->n_cells < (int32_t)params->min_pool_cells) {
-        fprintf(stderr, "error: planned pool %d cells is below the viability floor (%u) — aborting\n",
+        fprintf(out(), "error: planned pool %d cells is below the viability floor (%u) — aborting\n",
                 result->n_cells, params->min_pool_cells);
         llama_kv_fit_params_free(params);
         llama_backend_free();
@@ -172,7 +212,7 @@ int main(int argc, char ** argv) {
     llama_kv_fit_params_free(params);
     llama_backend_free();
 
-    fprintf(stderr, "\nkv-fit clone: planning complete — pool %d cells%s\n",
+    fprintf(out(), "\nkv-fit clone: planning complete — pool %d cells%s\n",
             result->n_cells, verify ? ", verification run passed" : "");
     return 0;
 }

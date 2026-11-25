@@ -56,11 +56,20 @@ LLAMA_API struct llama_kv_fit_params * llama_kv_fit_params_new(uint32_t min_vers
     p->min_pool_cells = 32768;  // report deployments that cannot plan at least this many cells
     p->n_checkpoints  = 0;      // legacy: derive from context params when not set
     p->options        = 0;      // v5: all behavior options off by default
+    p->report_stream  = nullptr;   // v6: deployment tables go to stderr unless the caller collects them
     return p;
 }
 
 LLAMA_API void llama_kv_fit_params_free(struct llama_kv_fit_params * p) {
     delete p;
+}
+
+// The deployment-report stream: caller-collected (params->report_stream — the
+// kv-fit tool assembles the whole report and writes it out atomically) or
+// stderr by default. Every deployment table goes through here, never to a raw
+// stream on its own, so the report stays one indivisible unit on the wire.
+static FILE * kvfit_report(const struct llama_kv_fit_params * p) {
+    return (p && p->report_stream) ? p->report_stream : stderr;
 }
 
 // ============================================================================
@@ -347,9 +356,9 @@ static std::vector<size_t> kvfit_greedy_walk(uint32_t n_blocks,
 // placement costs (tensors, SSM) and the per-cell rates with their sum.
 // Used for both the provisional split (before the bisection) and the final
 // plan — the caller supplies per-GPU arrays in its own placement.
-// One stream write per line, straight to stderr (same convention as the
-// measurement breakdowns above — a log call would prefix every row).
-static void kvfit_print_cost_breakdown(const char * title,
+// Emitted on the caller's deployment-report stream (kvfit_report()).
+static void kvfit_print_cost_breakdown(FILE * report,
+                                       const char * title,
                                        const std::vector<std::string> & names,
                                        const std::vector<uint64_t> & free,
                                        const std::vector<uint64_t> & kernels,
@@ -362,7 +371,7 @@ static void kvfit_print_cost_breakdown(const char * title,
                                        const std::vector<uint64_t> & mtp_bpc,
                                        const std::vector<uint64_t> & buf_bpc,
                                        const std::vector<uint64_t> & mtp_buf_bpc) {
-    fprintf(stderr, "\n      %s\n", title);
+    fprintf(report, "\n      %s\n", title);
 
     // columns: split-budget ledger (independent of the placement), then the
     // placement-dependent fixed costs, then the per-cell rates (buffers kept
@@ -408,7 +417,7 @@ static void kvfit_print_cost_breakdown(const char * title,
     std::vector<const char *> keys_arr(n_rows);
     for (int r = 0; r < n_rows; ++r) keys_arr[r] = keys[r].c_str();
 
-    print_table(stderr, n_rows, 12, hdrs, keys_arr.data(), "device", row_ptrs.data(), nullptr, true);
+    print_table(report, n_rows, 12, hdrs, keys_arr.data(), "device", row_ptrs.data(), nullptr, true);
 }
 
 // Try placing n 256-cell blocks with the candidate placement from the shared
@@ -925,17 +934,17 @@ static bool kvfit_verify_plan(const char * path,
 // system RAM — they are NEVER folded into a GPU rate (that contamination
 // doubled the ROCm0 rate on rocky2). The CPU backend's own buffers (also host
 // bufts) ARE charged to the CPU device: real RAM used by the deployment.
-static std::vector<uint64_t> kvfit_compute_by_device(const llama_context * ctx, const char * label, bool debug) {
+static std::vector<uint64_t> kvfit_compute_by_device(const llama_context * ctx, const char * label, bool debug, FILE * report) {
     const size_t ndevs = ggml_backend_dev_count();
     std::vector<uint64_t> compute(ndevs, 0);
-    if (debug) fprintf(stderr, "  breakdown [%s] (from llama_get_memory_breakdown):\n", label);
+    if (debug) fprintf(report, "  breakdown [%s] (from llama_get_memory_breakdown):\n", label);
     for (auto & [buft, data] : llama_get_memory_breakdown(ctx)) {
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
         if (!dev) continue;
         for (size_t i = 0; i < ndevs; ++i) {
             if (ggml_backend_dev_get(i) == dev) {
                 if (debug) {
-                    fprintf(stderr, "    buft_name='%s'  compute=%llu (%.2f GiB)  context=%llu (%.2f GiB)\n",
+                    fprintf(report, "    buft_name='%s'  compute=%llu (%.2f GiB)  context=%llu (%.2f GiB)\n",
                             ggml_backend_buft_name(buft), 
                             (unsigned long long)data.compute, 
                             (double)data.compute / (1024.0 * 1024.0 * 1024.0),
@@ -987,6 +996,7 @@ static bool kvfit_measure(const char * path,
                           const llama_context_params * cparams,
                           bool measure_mtp,
                           bool debug,
+                          FILE * report,
                           kvfit_measure_result & r) {
     // raw-device scan is the caller's job (Guard 2 + budget denominators); it
     // prints once and its snapshot feeds the delta decomposition below.
@@ -1077,7 +1087,7 @@ static bool kvfit_measure(const char * path,
         const size_t ndevs = ggml_backend_dev_count();
         const uint32_t lo_cells  = n_ctx_measure;
         const uint32_t hi_cells  = 2u * lo_cells;
-        std::vector<uint64_t> compute_lo = kvfit_compute_by_device(ctx0, "main ctx, lo pool", debug);   // main ctx at lo
+        std::vector<uint64_t> compute_lo = kvfit_compute_by_device(ctx0, "main ctx, lo pool", debug, report);   // main ctx at lo
         
         // Create hi-pool context for rate measurement (keep alive for MTP measurement too)
         llama_context_params cp_hi = cp;
@@ -1092,7 +1102,7 @@ static bool kvfit_measure(const char * path,
         // Measure main context at hi pool
         std::vector<uint64_t> compute_hi;
         if (ctx_hi_main) {
-            compute_hi = kvfit_compute_by_device(ctx_hi_main, "main ctx, hi pool", debug);   // main ctx at hi
+            compute_hi = kvfit_compute_by_device(ctx_hi_main, "main ctx, hi pool", debug, report);   // main ctx at hi
         }
 
         // Calculate main rate from hi-lo difference
@@ -1128,12 +1138,12 @@ static bool kvfit_measure(const char * path,
             // Measure at lo pool
             ctx_mtp_lo = llama_init_from_model(model, cp_mtp_lo);
             if (ctx_mtp_lo) {
-                mtp_compute_lo = kvfit_compute_by_device(ctx_mtp_lo, "mtp ctx, lo pool", debug);
+                mtp_compute_lo = kvfit_compute_by_device(ctx_mtp_lo, "mtp ctx, lo pool", debug, report);
                 
                 // Measure at hi pool
                 ctx_mtp_hi = llama_init_from_model(model, cp_mtp_hi);
                 if (ctx_mtp_hi) {
-                    mtp_compute_hi = kvfit_compute_by_device(ctx_mtp_hi, "mtp ctx, hi pool", debug);
+                    mtp_compute_hi = kvfit_compute_by_device(ctx_mtp_hi, "mtp ctx, hi pool", debug, report);
                 } else {
                     LLAMA_LOG_WARN("kvfit: MTP context init at hi pool failed\n");
                 }
@@ -1238,7 +1248,7 @@ static bool kvfit_measure(const char * path,
                 // division (bytes / n_ctx) wrongly folds in the fixed base, so it
                 // is never used here as a fallback: a missing hi-lo measurement
                 // leaves the rate 0 rather than reporting an inflated value.
-                kvfit_compute_by_device(ctx_mtp, "mtp ctx", debug);
+                kvfit_compute_by_device(ctx_mtp, "mtp ctx", debug, report);
             }
         } else {
             LLAMA_LOG_WARN("kvfit: MTP draft context init failed — nextn KV pool NOT in the measured delta\n");
@@ -1450,7 +1460,8 @@ static kvfit_plan kvfit_plan_compute(const char * path,
 
     // ---- the measurement run ----------------------------------------------------
     kvfit_measure_result meas;
-    if (!kvfit_measure(path, mparams, cparams, measure_mtp, params->options & LLAMA_KV_FIT_DEBUG, meas)) {
+    if (!kvfit_measure(path, mparams, cparams, measure_mtp, params->options & LLAMA_KV_FIT_DEBUG,
+                                 kvfit_report(params), meas)) {
         return plan;   // kvfit_measure already reported
     }
     const bool mtp_measured = meas.mtp_measured;
@@ -1673,7 +1684,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
         for (size_t g = 0; g < nd_gpus; ++g) {
             ssm_states[g] = d_ssm_bpr[g] * (uint64_t)state_rows;
         }
-        kvfit_print_cost_breakdown("cost breakdown [provisional split]", names, frees, d_kernels, d_base,
+        kvfit_print_cost_breakdown(kvfit_report(params), "cost breakdown [provisional split]", names, frees, d_kernels, d_base,
                                    reserves, budgets, d_weights, ssm_states,
                                    d_kv_bpc, d_mtp_bpc, buf_bpc, mtp_buf_bpc);
     }
@@ -1800,7 +1811,7 @@ static kvfit_plan kvfit_plan_compute(const char * path,
         // the last GPU also takes the global tensors (norm + output / lm_head);
         // the budget ledger columns are placement-independent — same for both tables
         if (nd > 0) p_wts[nd - 1] += last_gpu_extra;
-        kvfit_print_cost_breakdown((nd_gpus >= 2) ? "cost breakdown [final plan]" : "cost breakdown [plan]",
+        kvfit_print_cost_breakdown(kvfit_report(params), (nd_gpus >= 2) ? "cost breakdown [final plan]" : "cost breakdown [plan]",
                                    plan.names, frees, d_kernels, d_base,
                                    reserves, budgets, p_wts, p_ssm,
                                    p_kv, p_mtp, buf_bpc, mtp_buf_bpc);
@@ -1928,9 +1939,10 @@ static void kvfit_print_deployment_report(const char * path_model,
         llama_model_free(m_info);
         return;   // the planning load below will report the real error
     }
-    if (!mi_print_header(stderr, info,
+    FILE * rep = kvfit_report(params);
+    if (!mi_print_header(rep, info,
                          (enum ggml_type)cparams->type_k, (enum ggml_type)cparams->type_v, &opts)
-        || !mi_print_layer_table(stderr, info,
+        || !mi_print_layer_table(rep, info,
                                  (enum ggml_type)cparams->type_k, (enum ggml_type)cparams->type_v,
                                  flash_attn)) {
         LLAMA_LOG_WARN("kvfit: model-info table print failed for %s\n", path_model);
