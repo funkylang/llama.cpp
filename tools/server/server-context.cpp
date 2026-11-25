@@ -381,17 +381,6 @@ struct server_slot {
         return true;
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::vector<common_adapter_lora_info> & lora_new) {
-        bool res = prompt_cache.load(prompt, tokens, lora_new, ctx_tgt, ctx_dft, id);
-
-        if (!res) {
-            SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
-            return false;
-        }
-
-        return true;
-    }
-
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
@@ -1463,9 +1452,6 @@ private:
         // the min position of a hybrid memory is the position of its recurrent state, not the start of the SWA window
         n_swa_reuse = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt) ? 0 : n_swa;
 
-        // Necessary similarity of prompt for slot selection
-        slot_sched.slot_prompt_similarity = params_base.slot_prompt_similarity;
-
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
 
         {
@@ -1829,15 +1815,31 @@ private:
     }
 
     // call only when the task is sure to launch on the slot
-    void update_prompt_cache(server_slot & slot, const server_task & task) {
+    void update_prompt_cache(server_slot & slot, int entry_index, bool is_move) {
         SRV_TRC("%s", "updating prompt cache\n");
 
         const int64_t t_start = ggml_time_us();
 
+        // IMPORTANT: if a cache entry won, extract it FIRST (before the save),
+        // so the alloc() inside prompt_save cannot evict the very entry we use.
+        server_prompt_cache_state extracted;
+        bool has_entry = false;
+
+        if (entry_index >= 0) {
+            extracted = prompt_cache->extract_entry((size_t) entry_index);
+            has_entry = !extracted.prompt.tokens.empty();
+        }
+
+        // unconditional save of the displaced state, so nothing recoverable is lost
         slot.prompt_save(*prompt_cache);
 
-        if (!slot.prompt_load(*prompt_cache, task.tokens, get_task_lora(task))) {
-            slot.prompt_clear();
+        if (has_entry) {
+            if (!prompt_cache->restore_entry(slot.prompt, extracted, slot.ctx_tgt, slot.ctx_dft, slot.id, is_move)) {
+                slot.prompt_clear();
+                prompt_cache->append_entry(std::move(extracted)); // not consumed: put it back
+            } else if (!is_move) {
+                prompt_cache->append_entry(std::move(extracted)); // COPY: the owner conversation stays restorable
+            }
         }
 
         prompt_cache->update();
@@ -2994,7 +2996,7 @@ private:
 
                     const int id_task = task.id;
 
-                    const auto plan = slot_sched.select(get_slot_infos(), task, get_task_lora(task));
+                    const auto plan = slot_sched.select(get_slot_infos(), task, get_task_lora(task), prompt_cache.get());
 
                     server_slot * slot = plan.id_slot == -1 ? nullptr : get_slot_by_id(plan.id_slot);
 
@@ -3030,7 +3032,7 @@ private:
 
                     // the task is not deferred past this point
                     if (plan.update_cache && prompt_cache) {
-                        update_prompt_cache(*slot, task);
+                        update_prompt_cache(*slot, plan.entry_index, plan.is_move);
                     }
 
                     if (task.is_parent()) {

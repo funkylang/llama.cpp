@@ -97,8 +97,14 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    // lora_new: the lora config of the new prompt, the states made with another config are skipped
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    // write the state of an extracted entry into a slot (MOVE: consumes it, COPY: caller keeps it)
+    bool restore_entry(server_prompt & prompt, server_prompt_cache_state & extracted, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool is_move);
+
+    // remove the entry at position idx from the cache; out of range yields an empty state
+    server_prompt_cache_state extract_entry(size_t idx);
+
+    // put an entry back at the end of the cache (LRU position); skips empty prompts
+    void append_entry(server_prompt_cache_state && state);
 
     void update();
 };
@@ -118,17 +124,22 @@ struct server_slot_plan {
     // -1 if no slot is available; a busy slot if the task asks for it by id, the caller defers the task
     int id_slot = -1;
 
-    // save the slot state to the prompt cache, then load the best match for the task
+    // save the slot state to the prompt cache, then restore the selected entry (if any)
     bool update_cache = false;
+
+    // index into prompt_cache->states of the selected cache entry, -1 when none
+    int entry_index = -1;
+
+    // MOVE: full match consumes the entry; COPY: partial match keeps it in the cache
+    bool is_move = false;
 };
 
 // decides only, the caller applies the plan
 struct server_slot_sched {
-    float slot_prompt_similarity = 0.0f;
-
     // idle slots that lose the least by being reused: empty slots first, then the least recently used ones
     std::vector<int> get_free_slots(const std::vector<server_slot_info> & slots, size_t n_slots_needed, int exclude_id_slot) const;
 
-    // lora: the lora config of the task
-    server_slot_plan select(const std::vector<server_slot_info> & slots, const server_task & task, const std::vector<common_adapter_lora_info> & lora) const;
+    // unified longest-LCP selection over idle slots and prompt-cache entries (improve/concept-cache-mgmt.txt)
+    server_slot_plan select(const std::vector<server_slot_info> & slots, const server_task & task,
+            const std::vector<common_adapter_lora_info> & lora, const server_prompt_cache * cache) const;
 };
