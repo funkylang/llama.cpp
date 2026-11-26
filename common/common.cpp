@@ -1281,6 +1281,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     common_fit_apply(params, mparams, cparams);
 
+    // fit may have computed the unified KV pool size: write it back to the base params so
+    // consumers that create further contexts from them (the MTP draft context via
+    // speculative) receive the shared pool instead of falling back to n_ctx_seq cells
+    params.n_kv_cache = cparams.n_kv_cache;
+
     llama_model * model = common_model_load(params.model.get_paths(), mparams);
     if (model == NULL) {
         return;
