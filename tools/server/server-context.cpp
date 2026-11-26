@@ -3673,19 +3673,26 @@ private:
             }
 
             int64_t n_queued = 0;
+            int n_slots_queued = 0;
             for (auto & slot : slots) {
                 if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) {
                     if (slot.task->type != SERVER_TASK_TYPE_TTS && slot.task->type != SERVER_TASK_TYPE_REALTIME) {
-                        n_queued += std::max(0, slot.task->n_tokens() - slot.prompt.n_tokens());
+                        const int64_t q = std::max(0, slot.task->n_tokens() - slot.prompt.n_tokens());
+                        n_queued += q;
+                        if (q > 0) {
+                            ++n_slots_queued;
+                        }
                     }
                 }
             }
 
+            char queue_info[80] = "";
             if (n_queued > 0) {
-                SRV_INF("evaluating %d tokens in %d slot%s (%lld tokens queued)\n", batch.size(), n_slots_in_batch, n_slots_in_batch == 1 ? "" : "s", (long long) n_queued);
-            } else {
-                SRV_INF("evaluating %d tokens in %d slot%s\n", batch.size(), n_slots_in_batch, n_slots_in_batch == 1 ? "" : "s");
+                snprintf(queue_info, sizeof(queue_info), " (%lld tokens queued in %d slot%s)",
+                         (long long) n_queued, n_slots_queued, n_slots_queued == 1 ? "" : "s");
             }
+            LOG_INF("srv  evaluating %d tokens in %d slot%s%s\n",
+                    batch.size(), n_slots_in_batch, n_slots_in_batch == 1 ? "" : "s", queue_info);
         }
 
         int32_t off_next = 0;
