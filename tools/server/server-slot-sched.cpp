@@ -492,12 +492,21 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
     };
 
     // scan live slots: an "all" match is an early winner; otherwise collect the best partial
+    // keyed slots are off-limits to tasks that do not own the key (id-less requests and
+    // keyed ones whose conversation is not live): they may only take them through the
+    // forced-LRU fallback below, which saves the displaced state first.
     candidate best;
     if (!early_winner) {
         for (const auto & slot : slots) {
             // skip the slot if it is not available
             if (slot.is_processing) {
                 SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing);
+                continue;
+            }
+
+            // a keyed slot belongs to its conversation; content matching never crosses that
+            if (!slot.prompt->cache_key.empty() && slot.prompt->cache_key != task.prompt_cache_key) {
+                SLT_TRC(slot, "%s", " - skipping, owned by another prompt_cache_key\n");
                 continue;
             }
 
@@ -556,6 +565,12 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
 
             // a prompt made with another lora config is cleared before the new one starts, so it counts as empty
             if (lora_should_clear_cache(st.prompt.lora, lora)) {
+                ++idx;
+                continue;
+            }
+
+            // owned state is never adopted by content matching: only its owner's key path does
+            if (!st.prompt.cache_key.empty() && st.prompt.cache_key != task.prompt_cache_key) {
                 ++idx;
                 continue;
             }
