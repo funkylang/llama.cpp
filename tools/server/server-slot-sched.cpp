@@ -115,6 +115,10 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         if (len == (int) it->prompt.tokens.size() && are_lora_equal(it->prompt.lora, prompt.lora)) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
+            if (pc_instr_enabled()) {
+                SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=obsolete\n",
+                        (const void*)&(*it), (size_t)it->prompt.n_tokens());
+            }
             it = states.erase(it);
         } else {
             ++it;
@@ -127,6 +131,10 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
+            if (pc_instr_enabled()) {
+                SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=size-limit\n",
+                        (const void*)&states.front(), (size_t)states.front().prompt.n_tokens());
+            }
             states.pop_front();
         }
     }
@@ -162,6 +170,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         },
     });
 
+    // Instrumentation: log creation
+    if (pc_instr_enabled()) {
+        SRV_INF("PCACHE_CREATE addr=%p tok=%zu\n",
+                (const void*)&states.back(), (size_t)states.back().prompt.n_tokens());
+    }
+
     return &states.back();
 }
 
@@ -193,9 +207,16 @@ void server_prompt_cache::append_entry(server_prompt_cache_state && state) {
 // COPY: only a prefix matches, the state is written in but the caller keeps
 //       the entry to re-append it (the owner conversation stays restorable).
 bool server_prompt_cache::restore_entry(server_prompt & prompt, server_prompt_cache_state & extracted,
-        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool is_move) {
+        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool is_move, int matched_len) {
     if (extracted.prompt.tokens.empty()) {
         return true; // nothing to restore
+    }
+
+    // Instrumentation: log hit
+    if (pc_instr_enabled()) {
+        SRV_INF("PCACHE_HIT addr=%p tok=%zu matched=%d type=%s slot=%d\n",
+                (const void*)&extracted, (size_t)extracted.prompt.n_tokens(), matched_len,
+                is_move ? "move" : "copy", id_slot);
     }
 
     auto restore_data = [&](common_state_data & data, llama_context * ctx, bool fatal) -> bool {
@@ -240,6 +261,10 @@ void server_prompt_cache::update() {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
+            if (pc_instr_enabled()) {
+                SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=size-limit\n",
+                        (const void*)&states.front(), (size_t)states.front().prompt.n_tokens());
+            }
             states.pop_front();
         }
     }
@@ -255,6 +280,10 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
+            if (pc_instr_enabled()) {
+                SRV_INF("PCACHE_DELETE addr=%p tok=%zu reason=token-limit\n",
+                        (const void*)&states.front(), (size_t)states.front().prompt.n_tokens());
+            }
             states.pop_front();
         }
     }
@@ -503,6 +532,7 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
             plan.update_cache = true;
             plan.entry_index = (int) cache_best.entry_idx;
             plan.is_move     = cache_best.is_all; // ALL: consume the entry, PART: keep it for the owner
+            plan.matched_len = (int) cache_best.lcp; // for PCACHE_HIT logging
         }
     } else if (ret != nullptr && !early_winner) {
         // Winner = a live slot with a PARTIAL match (not an ALL continuation):

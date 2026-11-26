@@ -1601,6 +1601,8 @@ private:
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
+        SRV_INF("%s", pc_instr_enabled() ? "prompt cache instrumentation: ENABLED\n" : "prompt cache instrumentation: disabled\n");
+
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
@@ -1791,7 +1793,7 @@ private:
     }
 
     // call only when the task is sure to launch on the slot
-    void update_prompt_cache(server_slot & slot, int entry_index, bool is_move) {
+    void update_prompt_cache(server_slot & slot, int entry_index, bool is_move, int matched_len) {
         SRV_TRC("%s", "updating prompt cache\n");
 
         const int64_t t_start = ggml_time_us();
@@ -1810,7 +1812,7 @@ private:
         slot.prompt_save(*prompt_cache);
 
         if (has_entry) {
-            if (!prompt_cache->restore_entry(slot.prompt, extracted, slot.ctx_tgt, slot.ctx_dft, slot.id, is_move)) {
+            if (!prompt_cache->restore_entry(slot.prompt, extracted, slot.ctx_tgt, slot.ctx_dft, slot.id, is_move, matched_len)) {
                 slot.prompt_clear();
                 prompt_cache->append_entry(std::move(extracted)); // not consumed: put it back
             } else if (!is_move) {
@@ -1842,6 +1844,21 @@ private:
 
             if (slot.prompt.n_tokens() > 0) {
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
+
+                // diagnostic: is the purged state recoverable from the prompt cache?
+                bool recoverable = false;
+                if (pc_instr_enabled() && prompt_cache) {
+                    for (const auto & st : prompt_cache->states) {
+                        if (!st.data.main.empty() &&
+                            st.prompt.tokens.get_common_prefix(slot.prompt.tokens) == slot.prompt.tokens.size()) {
+                            recoverable = true;
+                            break;
+                        }
+                    }
+
+                    SLT_INF(slot, "PCACHE_EVICT source=kv-pressure prompt=%zu recoverable=%s\n",
+                            (size_t) slot.prompt.tokens.size(), recoverable ? "yes" : "NO");
+                }
 
                 slot.prompt_clear();
 
@@ -2638,6 +2655,49 @@ private:
     }
 
 
+    // instrumentation (LLAMA_PROMPT_CACHE_INSTRUMENT): single message per eviction —
+    // header line, then all checkpoint positions as a right-aligned grid (8 columns),
+    // evicted entry marked with *, rows indented to align under the numbers.
+    // Grid only shown for capacity-based evictions (reason contains "too-many" or "spacing");
+    // other reasons (e.g. "invalidated") just log the header without the table.
+    void log_checkpoint_delete(const server_slot & slot, int del_id_task, int64_t del_n_tokens,
+                               const std::string & reason) const {
+        // check if this is a capacity-based eviction that warrants showing the grid
+        bool show_grid = (reason.find("too-many") != std::string::npos) ||
+                         (reason.find("spacing") != std::string::npos);
+
+        std::string msg = "CKPT_DELETE id_task=" + std::to_string(del_id_task)
+                        + " tok=" + std::to_string(del_n_tokens) + " reason=" + reason;
+
+        if (!show_grid) {
+            // no grid for non-capacity evictions
+            SLT_INF(slot, "%s\n", msg.c_str());
+            return;
+        }
+
+        size_t width = 0;
+        for (const auto & ckpt : slot.prompt.checkpoints) {
+            width = std::max(width, std::to_string(ckpt->n_tokens).size());
+        }
+        width = std::max(width, std::to_string(del_n_tokens).size());
+
+        const int n_cols = 8;
+        msg += "\n";
+        const size_t row_indent = msg.size() - 1 + 11; // spaces before the first number of each grid row (+11 for alignment)
+        size_t pos = 0;
+        for (const auto & ckpt : slot.prompt.checkpoints) {
+            if (pos % n_cols == 0) {
+                msg += pos == 0 ? "" : "\n";
+                msg.append(row_indent, ' ');
+            }
+            const bool marked = (ckpt->id_task == del_id_task) && (ckpt->n_tokens == del_n_tokens);
+            const std::string tok_str = std::to_string(ckpt->n_tokens);
+            msg += " " + std::string(width - tok_str.size(), ' ') + tok_str + (marked ? "*" : "");
+            pos++;
+        }
+        SLT_INF(slot, "%s\n", msg.c_str());
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
@@ -2668,6 +2728,11 @@ private:
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if ((*it)->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", (*it)->n_tokens);
+
+                    if (pc_instr_enabled()) {
+                        log_checkpoint_delete(slot, (*it)->id_task, (*it)->n_tokens, "superseded");
+                    }
+
                     it = slot.prompt.checkpoints.erase(it);
                 } else {
                     ++it;
@@ -2698,6 +2763,11 @@ private:
             SLT_TRC(slot, "erasing context checkpoint with minimal neighbour gap sum (n_tokens = %" PRId64 ", gap_left + gap_right = %" PRId64 ", size = %.3f MiB)\n",
                     (*best_it)->n_tokens, best_dist, (float) (*best_it)->size() / 1024 / 1024);
 
+            if (pc_instr_enabled()) {
+                log_checkpoint_delete(slot, (*best_it)->id_task, (*best_it)->n_tokens,
+                        "too-many (" + std::to_string(slot.prompt.checkpoints.size()) + ")");
+            }
+
             slot.prompt.checkpoints.erase(best_it);
         }
 
@@ -2721,6 +2791,11 @@ private:
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+
+        if (pc_instr_enabled()) {
+            SLT_INF(slot, "CKPT_CREATE id_task=%d tok=%" PRId64 " total=%zu\n",
+                    cur.id_task, cur.n_tokens, slot.prompt.checkpoints.size());
+        }
 
     }
 
@@ -3008,7 +3083,7 @@ private:
 
                     // the task is not deferred past this point
                     if (plan.update_cache && prompt_cache) {
-                        update_prompt_cache(*slot, plan.entry_index, plan.is_move);
+                        update_prompt_cache(*slot, plan.entry_index, plan.is_move, plan.matched_len);
                     }
 
                     if (task.is_parent()) {
@@ -4286,6 +4361,10 @@ private:
                                         common_speculative_set_state(spec.get(), slot.id, cur.data_spec);
 
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, reuse.n_past, (float) cur.size() / 1024 / 1024);
+
+                                        if (pc_instr_enabled()) {
+                                            SLT_INF(slot, "CKPT_USE id_task=%d tok=%" PRId64 "\n", cur.id_task, cur.n_tokens);
+                                        }
                                     }
                                 }
 
@@ -4305,6 +4384,9 @@ private:
                                     if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
 
+                                        if (pc_instr_enabled()) {
+                                            log_checkpoint_delete(slot, cur.id_task, cur.n_tokens, "invalidated");
+                                        }
 
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {

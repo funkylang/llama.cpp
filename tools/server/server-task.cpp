@@ -14,6 +14,14 @@
 #include <iomanip>
 #include <sstream>
 
+bool pc_instr_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("LLAMA_PROMPT_CACHE_INSTRUMENT");
+        return v && v[0];
+    }();
+    return enabled;
+}
+
 //
 // task_params
 //

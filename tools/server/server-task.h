@@ -689,6 +689,9 @@ struct server_task_result_apply_lora : server_task_result {
     virtual json to_json() override;
 };
 
+// Instrumentation: LLAMA_PROMPT_CACHE_INSTRUMENT (any non-empty value enables)
+bool pc_instr_enabled();
+
 // used exclusively by router mode
 struct server_task_result_router : server_task_result {
     json data;

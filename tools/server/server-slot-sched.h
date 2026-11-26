@@ -98,7 +98,8 @@ struct server_prompt_cache {
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     // write the state of an extracted entry into a slot (MOVE: consumes it, COPY: caller keeps it)
-    bool restore_entry(server_prompt & prompt, server_prompt_cache_state & extracted, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool is_move);
+    // matched_len: LCP of incoming prompt vs this entry, for PCACHE_HIT logging only
+    bool restore_entry(server_prompt & prompt, server_prompt_cache_state & extracted, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool is_move, int matched_len);
 
     // remove the entry at position idx from the cache; out of range yields an empty state
     server_prompt_cache_state extract_entry(size_t idx);
@@ -132,6 +133,9 @@ struct server_slot_plan {
 
     // MOVE: full match consumes the entry; COPY: partial match keeps it in the cache
     bool is_move = false;
+
+    // LCP of the incoming prompt vs the selected cache entry, for PCACHE_HIT logging only; -1 when none
+    int matched_len = -1;
 };
 
 // decides only, the caller applies the plan
