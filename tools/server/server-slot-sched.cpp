@@ -163,6 +163,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ prompt.checkpoints,
             /*.lora        =*/ prompt.lora,
+            /*.cache_key   =*/ prompt.cache_key,
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
@@ -344,6 +345,11 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
     //
     // Slot pinning: task.id_slot != -1 selects that exact slot.
     // A busy pinned slot is returned untouched so the caller defers the task.
+    //
+    // prompt_cache_key routing (improve/concept-prompt-cache-key-impl.txt):
+    // a task carrying a key always routes to its conversation's state - a live
+    // owner slot first (busy -> defer), then a matching prompt-cache entry, so
+    // identity beats the content-based LCP selection below.
 
     struct candidate {
         const server_slot_info * slot = nullptr;      // live-slot candidate
@@ -377,8 +383,82 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
         }
     }
 
-    // cache prompts only for the tasks whose state a later task can reuse
-    const bool use_cache = !task.is_stateless() && (cache != nullptr);
+    // cache prompts only for the tasks whose state a later task can reuse;
+    // cache_prompt = false marks one-shot queries, neither read nor written
+    const bool use_cache = !task.is_stateless() && (cache != nullptr) && task.params.cache_prompt;
+
+    // route by prompt_cache_key before the LCP scan: a task carrying a key must reach its own conversation
+    bool   key_matched_slot = false;             // an owner slot was found live, ret points at it
+    const server_prompt_cache_state * key_state = nullptr; // owner state waiting in the prompt cache
+    size_t key_entry        = 0;                 // its index for extract_entry()
+
+    if (!task.prompt_cache_key.empty() && task.id_slot == -1) {
+        // a child slot is tagged with the key too, but keeps no tokens of its own:
+        // only a keyed slot that holds state can be the owner, an empty one merely
+        // reserves the conversation a home when nothing else exists anymore
+        const server_slot_info * key_slot_empty = nullptr;
+
+        for (const auto & slot : slots) {
+            if (slot.prompt->cache_key != task.prompt_cache_key) {
+                continue;
+            }
+
+            // a busy owner is returned untouched, the caller defers the task to it
+            if (slot.is_processing) {
+                return { slot.id, false };
+            }
+
+            if (slot.prompt->n_tokens() > 0) {
+                SLT_INF(slot, "selected slot by prompt_cache_key, n_tokens = %d\n", (int) slot.prompt->n_tokens());
+
+                if (pc_instr_enabled()) {
+                    SRV_INF("PCACHE_KEY slot=%d key=%s\n", slot.id, task.prompt_cache_key.c_str());
+                }
+
+                ret              = &slot;
+                key_matched_slot = true;
+                break;
+            }
+
+            if (!key_slot_empty) {
+                key_slot_empty = &slot;
+            }
+        }
+
+        // no live owner: its state may wait in the prompt cache from an earlier eviction
+        if (!key_matched_slot && use_cache) {
+            size_t idx = 0;
+            for (const auto & st : cache->states) {
+                if (!st.data.main.empty() && st.prompt.cache_key == task.prompt_cache_key) {
+                    key_state = &st;
+                    key_entry = idx;
+                    break;
+                }
+                ++idx;
+            }
+        }
+
+        // nothing to restore either: an empty tagged slot at least reserves the conversation a home
+        if (!key_matched_slot && key_state == nullptr && key_slot_empty != nullptr) {
+            SLT_INF(*key_slot_empty, "%s", "selected empty slot by prompt_cache_key\n");
+
+            if (pc_instr_enabled()) {
+                SRV_INF("PCACHE_KEY slot=%d key=%s\n", key_slot_empty->id, task.prompt_cache_key.c_str());
+            }
+
+            ret              = key_slot_empty;
+            key_matched_slot = true;
+        }
+
+        if (key_state != nullptr) {
+            SRV_INF(" - prompt cache entry %p owns key '%s', n_tokens = %d\n",
+                    (const void *) key_state, task.prompt_cache_key.c_str(), (int) key_state->prompt.n_tokens());
+
+            if (pc_instr_enabled()) {
+                SRV_INF("PCACHE_KEYRESTORE addr=%p key=%s\n", (const void *) key_state, task.prompt_cache_key.c_str());
+            }
+        }
+    }
 
     auto classify_prompt = [](const server_prompt & p, size_t lcp, bool & qualified, bool & is_all) {
         if (!p.checkpoints.empty()) {
@@ -466,7 +546,7 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
     // entry_beats_slots flips ret once some entry out-ranks all slots.
     candidate cache_best;
     bool entry_beats_slots = false;
-    if (use_cache && !early_winner && task.id_slot == -1) {
+    if (use_cache && !early_winner && task.id_slot == -1 && key_state == nullptr) {
         size_t idx = 0;
         for (const auto & st : cache->states) {
             if (st.data.main.empty()) {
@@ -514,6 +594,18 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
         if (entry_beats_slots) {
             ret = nullptr; // winner is a cache entry, not a live slot
         }
+    } else if (use_cache && key_state != nullptr) {
+        // the owner's key entry wins outright: identity beats content; it is restored
+        // even when no longer matching (the agent was reset, its state is reclaimed)
+        candidate c;
+        c.entry_idx = key_entry;
+        c.is_entry  = true;
+        c.qualified = true;
+        c.is_all    = true; // the owner's state moves to the slot, returning keyed after displacement
+        c.lcp       = key_state->prompt.tokens.get_common_prefix(task.tokens);
+        cache_best  = c;
+
+        ret = nullptr; // winner is the entry, not a live slot
     }
 
     server_slot_plan plan;

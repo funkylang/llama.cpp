@@ -173,6 +173,11 @@ struct server_task {
     int id_target = -1;
     int id_slot   = -1;
 
+    // OpenAI prompt_cache_key: stable per-conversation identifier (usually a UUID)
+    // that routes this task to the slot holding its conversation state.
+    // Child tasks inherit it: they share the parent's conversation.
+    std::string prompt_cache_key;
+
     // used by parallel sampling (multiple completions from same prompt)
     int id_parent  = -1;
     // temporary store of child tasks for scheduling
@@ -327,6 +332,9 @@ struct server_task {
         copy.type      = type;
         copy.tokens    = tokens.clone();
         copy.id_slot   = -1; // child tasks cannot specify slot
+
+        // children of one request share the parent's conversation, so they keep its key
+        copy.prompt_cache_key = prompt_cache_key;
 
         // use different sampling seed for each child
         // note: https://github.com/ggml-org/llama.cpp/pull/18700#discussion_r2675115723

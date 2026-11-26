@@ -28,6 +28,10 @@ struct server_prompt {
     // TODO: slot files do not store it
     std::vector<common_adapter_lora_info> lora;
 
+    // OpenAI prompt_cache_key of the conversation that owns this state.
+    // Empty for tasks without a key. Follows the state to the prompt cache and back, like lora.
+    std::string cache_key;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
@@ -42,6 +46,7 @@ struct server_prompt {
             tokens.clone(),
             checkpoints,
             lora,
+            cache_key,
         };
     }
 

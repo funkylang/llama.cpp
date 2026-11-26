@@ -666,8 +666,9 @@ struct server_slot {
             state = SLOT_STATE_IDLE;
 
             // do not keep context of the child slots - the parent's context is enough
-            // nor of the stateless slots - no task ever reuses it
-            if (task->is_child() || task->is_stateless() || audio_stream || task->type == SERVER_TASK_TYPE_REALTIME) {
+            // nor of the stateless or non-cacheable slots - no task ever reuses them
+            if (task->is_child() || task->is_stateless() || audio_stream ||
+                task->type == SERVER_TASK_TYPE_REALTIME || !task->params.cache_prompt) {
                 prompt_clear();
             }
 
@@ -2042,6 +2043,10 @@ private:
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+
+        // record the conversation owner: prompt_cache_key routing matches follow-up
+        // requests against this tag, and it travels with the state into the prompt cache
+        slot.prompt.cache_key = slot.task->prompt_cache_key;
 
         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
             slot.state = SLOT_STATE_PROCESSING_PROMPT;
@@ -5485,6 +5490,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.apply_chat_session(chat_session);
 
             task.id_slot = json_value(data, "id_slot", -1);
+            task.prompt_cache_key = json_value(data, "prompt_cache_key", std::string());
+
+            // observability: which conversation key arrived with this request
+            SRV_INF("request %d: prompt_cache_key = %s\n",
+                    task.id, task.prompt_cache_key.empty() ? "(no id)" : task.prompt_cache_key.c_str());
             sse_ping_interval = task.params.sse_ping_interval;
 
             // OAI-compat
