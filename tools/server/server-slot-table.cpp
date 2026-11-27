@@ -174,7 +174,7 @@ bool server_slot_table::wait_release(const std::string & key, bool any, int64_t 
     return woken;
 }
 
-void server_slot_table::request_stop(int task_id) {
+bool server_slot_table::request_stop(int task_id) {
     GGML_ASSERT(task_id >= 0);
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -182,12 +182,27 @@ void server_slot_table::request_stop(int task_id) {
         if (rows_[i].task_id == task_id && rows_[i].status != ROW_IDLE) {
             rows_[i].status = ROW_STOP;
             SRV_INF("slot_table: row %zu -> STOP (task %d close signal)\n", i, task_id);
-            return;
+            return true;
         }
     }
 
     // Task already finished or never bound - nothing to stop.
     SRV_DBG("slot_table: request_stop(%d): no matching row\n", task_id);
+    return false;
+}
+
+void server_slot_table::begin_decode(int id_row, int task_id, const std::string & key) {
+    GGML_ASSERT((size_t)id_row < rows_.size());
+    GGML_ASSERT(task_id >= 0);
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto & r = rows_[id_row];
+    if (r.status != ROW_IDLE) {
+        SRV_WRN("slot_table: DIVERGENCE begin_decode(row %d, task %d): expected IDLE, got status=%d\n",
+                id_row, task_id, (int) r.status);
+    }
+    r.status           = ROW_DECODE;
+    r.task_id          = task_id;
+    r.prompt_cache_key = key; // reservation follows the launch ("" for unkeyed)
 }
 
 bool server_slot_table::is_stopped(int id_row) {
@@ -202,8 +217,10 @@ void server_slot_table::finish_or_stop(int id_row) {
 
     auto & r = rows_[id_row];
     if (r.status == ROW_IDLE) {
-        // Only the decode loop may return a row to IDLE; double release is a bug.
-        GGML_ABORT("server_slot_table::finish_or_stop(%d): row already idle", id_row);
+        // Only a live transition may return a row to IDLE; double release or a
+        // release without a launch is a caller bug we want to see, not crash on.
+        SRV_WRN("slot_table: DIVERGENCE finish_or_stop(row %d): row already idle\n", id_row);
+        return;
     }
 
     r.task_id  = -1;
@@ -248,43 +265,4 @@ int server_slot_table::evict_smallest_running(size_t n_cells_needed) {
     (void)n_cells_needed;
     SRV_WRN("slot_table: evict_smallest_running(%zu) not implemented (Phase 3)\n", n_cells_needed);
     return -1;
-}
-
-// Phase 0 shadow observation: same transitions, divergences logged instead of fatal.
-void server_slot_table::shadow_launch(int id_row, int task_id, const std::string & key) {
-    GGML_ASSERT((size_t)id_row < rows_.size());
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto & r = rows_[id_row];
-    if (r.status != ROW_IDLE) {
-        SRV_WRN("slot_table: DIVERGENCE shadow_launch(row %d, task %d): expected IDLE, got status=%d\n",
-                id_row, task_id, (int) r.status);
-    }
-    r.status           = ROW_DECODE;
-    r.task_id          = task_id;
-    r.prompt_cache_key = key;
-}
-
-void server_slot_table::shadow_release(int id_row) {
-    GGML_ASSERT((size_t)id_row < rows_.size());
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto & r = rows_[id_row];
-    if (r.status == ROW_IDLE) {
-        SRV_WRN("slot_table: DIVERGENCE shadow_release(row %d): row already idle\n", id_row);
-        return;
-    }
-    r.task_id  = -1;
-    r.status   = ROW_IDLE; // prompt_cache_key kept: reservation
-}
-
-void server_slot_table::shadow_stop(int task_id) {
-    // CANCEL tasks may reference tasks that were never launched (dropped while
-    // queued); "no matching row" is normal there, so only log at debug level.
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (size_t i = 0; i < rows_.size(); i++) {
-        if (rows_[i].task_id == task_id && rows_[i].status != ROW_IDLE) {
-            rows_[i].status = ROW_STOP;
-            return;
-        }
-    }
-    SRV_DBG("slot_table: shadow_stop(%d): no matching row (never launched?)\n", task_id);
 }

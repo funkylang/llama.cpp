@@ -664,11 +664,12 @@ struct server_slot {
         if (is_processing()) {
             GGML_ASSERT(task);
 
-            // Phase 0 shadow observation: mirror the transition into the slot table.
-            // Note: prompt_cache_key may not yet match task->prompt_cache_key here
-            // for child/edge paths; shadow_release keeps whatever key is stored.
+            // return the row to IDLE in the slot table, keeping its KV under
+            // the conversation key (reservation); prompt_cache_key may not yet
+            // match task->prompt_cache_key on child/edge paths, so the table
+            // keeps whatever key begin_decode() recorded.
             if (slot_table) {
-                slot_table->shadow_release(id);
+                slot_table->finish_or_stop(id);
             }
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
@@ -1068,6 +1069,27 @@ public:
         metrics.reset_bucket();
     }
 
+    // Apply the Phase 1 close routing to a response reader (see create_response).
+    // A closed connection marks its tasks STOP in the slot table; the decode loop
+    // honors STOP rows at the next cycle boundary. Tasks the table does not track
+    // (still queued / never launched) fall back to the legacy CANCEL task, which
+    // also cleans up their queue entries. No-op when disabled via
+    // LLAMA_SERVER_TABLE_STOP=0 or before the table is built.
+    void apply_task_cancel_routing(server_response_reader & reader) {
+        if (!table_stop_enabled || !slot_table) {
+            return;
+        }
+
+        reader.on_task_cancelled = [this](int id_task) {
+            if (!slot_table->request_stop(id_task)) {
+                server_task task(SERVER_TASK_TYPE_CANCEL);
+                task.id        = queue_tasks.get_new_id();
+                task.id_target = id_task;
+                queue_tasks.post(std::move(task), true);
+            }
+        };
+    }
+
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
@@ -1109,6 +1131,8 @@ private:
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
 
+    bool table_stop_enabled = true; // env: LLAMA_SERVER_TABLE_STOP=0 -> legacy CANCEL close path
+
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
@@ -1125,7 +1149,7 @@ private:
 
     server_slot_sched slot_sched;
 
-    // Phase 0 shadow observation: mirrors the slot lifecycle (see release/launch hooks)
+    // slot coordination table: row lifecycle tracking + close->STOP routing (Phase 1)
     std::unique_ptr<server_slot_table> slot_table;
 
     std::string model_name; // name of the loaded model, to be used by API
@@ -1561,8 +1585,10 @@ private:
             slot.reset();
         }
 
-        // Phase 0 shadow observation: build the slot table and bind each row to its
-        // server_slot. Mirrors lifecycle transitions only; nothing routes through it yet.
+        // build the slot table and bind each row to its server_slot. Phase 1:
+        // lifecycle tracking + close->STOP routing are live; admission still
+        // goes through select() (Phase 2). Set LLAMA_SERVER_TABLE_STOP=0 to
+        // force the legacy CANCEL-task close path (full rollback).
         slot_table = std::make_unique<server_slot_table>(slots.size());
         for (size_t i = 0; i < slots.size(); i++) {
             slots[i].slot_table = slot_table.get();
@@ -1576,6 +1602,14 @@ private:
             if (trace) {
                 SRV_WRN("LLAMA_TRACE = %d\n", trace);
             }
+        }
+
+        {
+            const char * env_stop = getenv("LLAMA_SERVER_TABLE_STOP");
+            table_stop_enabled = !(env_stop && atoi(env_stop) == 0);
+            SRV_INF("%s", table_stop_enabled
+                ? "slot_table stop routing: enabled\n"
+                : "slot_table stop routing: disabled (legacy CANCEL path)\n");
         }
 
         {
@@ -2071,9 +2105,10 @@ private:
         // requests against this tag, and it travels with the state into the prompt cache
         slot.prompt.cache_key = slot.task->prompt_cache_key;
 
-        // Phase 0 shadow observation: mirror the launch into the slot table.
+        // record the task in the slot table: the row now owns its KV state
+        // under the conversation key until the next release or takeover.
         if (slot.slot_table) {
-            slot.slot_table->shadow_launch(slot.id, slot.task->id, slot.task->prompt_cache_key);
+            slot.slot_table->begin_decode(slot.id, slot.task->id, slot.task->prompt_cache_key);
         }
 
         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
@@ -3149,9 +3184,10 @@ private:
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
-                    // Phase 0 shadow observation: the close path posts these; mirror them.
+                    // legacy close path (realtime, fallbacks): mark the row STOP
+                    // and release its slot; the slot's release returns it to IDLE.
                     if (slot_table) {
-                        slot_table->shadow_stop(task.id_target);
+                        slot_table->request_stop(task.id_target);
                     }
 
                     // release slot linked with the task id
@@ -3622,6 +3658,18 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        // Phase 1: honor STOP rows marked by closed connections. The slot's
+        // last decode cycle is already done, so release it now; its KV stays
+        // under the conversation key as a reservation (release() does that).
+        if (slot_table) {
+            for (auto & slot : slots) {
+                if (slot.is_processing() && slot_table->is_stopped(slot.id)) {
+                    SLT_INF(slot, "%s", "releasing stopped slot (connection closed)\n");
+                    slot.release();
+                }
+            }
+        }
 
         // check if all slots are idle
         // a realtime slot waiting for audio has no work, the next audio control task wakes the loop
@@ -5213,7 +5261,9 @@ private:
     }
 
     server_response_reader get_response_reader() {
-        return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
+        auto reader = server_response_reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
+        apply_task_cancel_routing(reader);
+        return reader;
     }
 
     //
@@ -5740,7 +5790,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 }
 
 std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass_sleep) {
-    return std::make_unique<server_res_generator>(queue_tasks, queue_results, params.sleep_idle_seconds, bypass_sleep);
+    auto res = std::make_unique<server_res_generator>(queue_tasks, queue_results, params.sleep_idle_seconds, bypass_sleep);
+
+    // Phase 1: route connection close through the slot table (see impl).
+    ctx_server.apply_task_cancel_routing(res->rd);
+
+    return res;
 }
 
 server_routes::server_routes(const common_params & params, server_context & ctx_server)

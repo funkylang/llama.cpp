@@ -132,25 +132,36 @@ public:
     // ------------------------------------------------------------------
 
     // The connection carrying task_id closed: mark its row STOP so the decode
-    // loop releases it after the current cycle. No-op when the task already
-    // finished. Child tasks (n_cmpl batches, realtime) must all be covered by
-    // their parent's close: pass the whole family.
-    void request_stop(int task_id);
+    // loop releases it after the current cycle. Returns false when no row is
+    // tracking the task (already finished, or still queued - never launched),
+    // so callers can fall back to the legacy CANCEL-task cleanup path. Child
+    // tasks (n_cmpl batches, realtime) must all be covered by their parent's
+    // close: pass the whole family.
+    bool request_stop(int task_id);
 
     // ------------------------------------------------------------------
     // decode scheduler (main loop only)
     // ------------------------------------------------------------------
 
+    // A task started on this row (launch path, one call per launched task).
+    // Marks the row DECODE with its owner + conversation key. On an already
+    // busy row it logs a DIVERGENCE warning instead of overwriting — that is
+    // a scheduling bug in the caller, not in the table.
+    void begin_decode(int id_row, int task_id, const std::string & key);
+
     // Called once per active slot in each decode cycle, with the slot's row id:
     // true when that row was marked STOP by a connection close. The decode loop
-    // finishes its current llama_process() cycle for it, then calls
-    // finish_or_stop(). Never cuts an in-flight llama_process() short.
+    // finishes its current llama_process() cycle for it, then releases the
+    // slot (whose release path calls finish_or_stop). Never cuts an in-flight
+    // llama_process() short.
     bool is_stopped(int id_row);
 
-    // A decode cycle on this row is done; its task finished or was stopped.
+    // A task on this row is done: finished normally or released after STOP.
     // Transitions the row back to IDLE preserving KV under its key
-    // (reservation) and wakes matching waiters. The server_slot release path
-    // (prompt save etc.) still runs in the decode loop as today.
+    // (reservation) and wakes matching waiters. Called from the slot release
+    // path; the heavy prompt-cache save etc. runs in the decode loop as today,
+    // never while holding the table mutex. A call on an already-idle row logs
+    // a DIVERGENCE warning (release without a launch is a caller bug).
     void finish_or_stop(int id_row);
 
     // ------------------------------------------------------------------
@@ -178,15 +189,12 @@ public:
     int evict_smallest_running(size_t n_cells_needed);
 
     // ------------------------------------------------------------------
-    // shadow observation (Phase 0)
+    // lifecycle observation
     // ------------------------------------------------------------------
 
-    // Mirror the transitions the real system performs, without taking effect
-    // on scheduling: same row state changes under the mutex, but divergences
-    // (e.g. launching on a busy row, releasing an idle row) are LOGGED, not
-    // fatal. Verifies the table model matches reality before Phase 1 routes
-    // live traffic through the real API.
-    void shadow_launch(int id_row, int task_id, const std::string & key);
-    void shadow_release(int id_row);
-    void shadow_stop(int task_id);
+    // begin_decode() / finish_or_stop() above are called on every live
+    // transition and maintain row state that the admission + stop paths rely
+    // on. Any state they find inconsistent (launch on a busy row, release of
+    // an idle row) is logged as a DIVERGENCE warning instead of crashing:
+    // those cases are caller bugs we want to see in the log, not take down.
 };

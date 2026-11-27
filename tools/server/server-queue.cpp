@@ -610,17 +610,20 @@ void server_response_reader::stop() {
     if (has_next() && !cancelled) {
         // if tasks is not finished yet, cancel them
         cancelled = true;
-        std::vector<server_task> cancel_tasks;
-        cancel_tasks.reserve(id_tasks.size());
         for (const auto & id_task : id_tasks) {
             SRV_WRN("cancel task, id_task = %d\n", id_task);
-            server_task task(SERVER_TASK_TYPE_CANCEL);
-            task.id_target = id_task;
             queue_results.remove_waiting_task_id(id_task);
-            cancel_tasks.push_back(std::move(task));
+            if (on_task_cancelled) {
+                // routed through the slot table; the decode loop honors the STOP rows
+                on_task_cancelled(id_task);
+            } else {
+                server_task task(SERVER_TASK_TYPE_CANCEL);
+                task.id        = queue_tasks.get_new_id();
+                task.id_target = id_task;
+                // push to beginning of the queue, so it has highest priority
+                queue_tasks.post(std::move(task), true);
+            }
         }
-        // push to beginning of the queue, so it has highest priority
-        queue_tasks.post(std::move(cancel_tasks), true);
     } else {
         SRV_DBG("%s", "all tasks already finished, no need to cancel\n");
     }
