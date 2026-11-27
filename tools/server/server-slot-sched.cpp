@@ -708,9 +708,10 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
         }
 
         if (busy_best.lcp > winner_lcp) {
-            SLT_INF(*busy_best.slot, "row %d as grace wait: match=%zu beats winner lcp=%zu - defer task until its STOP\n",
+            SLT_INF(*busy_best.slot, "row %d as grace wait: match=%zu beats winner lcp=%zu - park task until its STOP\n",
                     busy_best.slot->id, busy_best.lcp, winner_lcp);
-            plan.wait_row = busy_best.slot->id;
+            plan.wait_row          = busy_best.slot->id;
+            plan.wait_row_is_stopped = busy_best.slot->is_stopped;
         }
     }
 

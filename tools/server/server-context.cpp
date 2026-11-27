@@ -1845,7 +1845,10 @@ private:
     std::vector<server_slot_info> get_slot_infos() const {
         std::vector<server_slot_info> res;
         for (const server_slot & slot : slots) {
-            res.push_back({ slot.id, slot.task.get(), slot.is_processing(), slot.t_last_used, &slot.prompt });
+            const bool stopped = slot_table ? slot_table->is_stopped(slot.id) : false;
+            // close detected for this row: its release is imminent, so a new
+            // same-conversation request may park on it and take over warm KV
+            res.push_back({ slot.id, slot.task.get(), slot.is_processing(), stopped, slot.t_last_used, &slot.prompt });
         }
         return res;
     }
@@ -3118,9 +3121,21 @@ private:
                     auto plan = slot_sched.select(get_slot_infos(), task, get_task_lora(task), prompt_cache.get());
 
                     //
-                    // grace wait: the best content match is a row still decoding. We park on it
-                    // for a short window - the steering close for such a row arrives within
-                    // milliseconds of this request and its STOP handover reuses the warm KV.
+                    // grace wait: the best content match is a row still decoding. A steering close
+                    // for such a row arrives within milliseconds of this request and its STOP
+                    // handover reuses the warm KV - so park there with a short bounded window.
+                    //
+                    // WHERE the task waits while parked matters:
+                    //  - keyless: post it back to the main queue, where the loop re-offers it on
+                    //    every pass (a few ms later) and the 100ms deadline below can expire. The
+                    //    deferred queue must NOT be used here - it is only drained when a slot
+                    //    releases, which would hold this task hostage for the entire duration of
+                    //    an unrelated long generation (the 2026-11-27 concurrency regression).
+                    //    And keyless tasks only park on rows whose close already arrived (STOP):
+                    //    a healthy busy row means its conversation is running fine, so launching
+                    //    now on the fallback slot preserves concurrency.
+                    //  - keyed: defer it - its owner's release is exactly what should wake it
+                    //    (pop_deferred_task matches id_slot), no spinning needed in between.
                     // A second concurrent request on the same row is a client-side duplicate:
                     // reject it instead of queueing it indefinitely.
                     //
@@ -3133,11 +3148,12 @@ private:
                         // their own fields only - no identity, no rejection.
                         const bool keyed = !task.prompt_cache_key.empty();
 
-                        if (task.grace_row != plan.wait_row) {
+                        if (!keyed && !plan.wait_row_is_stopped) {
+                            SRV_DBG("row %d busy but not stopped - keyless task launches on its fallback slot, id_task = %d\n",
+                                    plan.wait_row, id_task);
+                        } else if (task.grace_row != plan.wait_row) {
                             // first interest in this row (or moved): leave the old seat, if any,
-                            // and park here with a fresh window. A keyed request whose owner is
-                            // busy must live on that row; a keyless one parks only when its best
-                            // match beats everything attachable (select already decided that).
+                            // and park here with a fresh window
                             if (task.grace_row >= 0 && keyed) {
                                 slot_table->release_waiter(task.grace_row, task.id);
                             }
@@ -3148,29 +3164,38 @@ private:
                                 send_error(task, "another request for this conversation is already queued - client error", ERROR_TYPE_INVALID_REQUEST);
                                 break; // drop the task
                             }
-                            SRV_DBG("grace wait on row %d (keyed=%d), defer task, id_task = %d\n", plan.wait_row, keyed ? 1 : 0, id_task);
-                            queue_tasks.defer(std::move(task));
+                            if (keyed) {
+                                // wake only when the owner row releases: pin it there
+                                task.id_slot = plan.wait_row;
+                                SRV_DBG("grace wait on row %d (keyed), defer task, id_task = %d\n", plan.wait_row, id_task);
+                                queue_tasks.defer(std::move(task));
+                            } else {
+                                SRV_DBG("grace wait on row %d (stopped), re-post task, id_task = %d\n", plan.wait_row, id_task);
+                                queue_tasks.post(std::move(task));
+                            }
                             break;
                         } else if (now >= task.grace_until_ms) {
-                            // same row, window over: give up the seat and fall through to the
-                            // plan's fallback (a keyed request re-parks instead, see below)
+                            // same row, window over: a keyed request re-parks on its owner (the
+                            // only thing that can free it), a keyless one takes the fallback
                             if (keyed) {
                                 slot_table->release_waiter(task.grace_row, task.id);
                                 if (!slot_table->reserve_waiter(plan.wait_row, task.id)) {
                                     send_error(task, "another request for this conversation is already queued - client error", ERROR_TYPE_INVALID_REQUEST);
                                     break; // drop the task
                                 }
-                            }
-                            SRV_DBG("grace wait on row %d expired%s, id_task = %d\n",
-                                    plan.wait_row, keyed ? ", keyed task re-parked" : ", taking fallback", id_task);
-                            if (keyed) {
+                                SRV_DBG("grace wait on row %d expired, keyed task re-parked, id_task = %d\n", plan.wait_row, id_task);
+                                task.id_slot = plan.wait_row;
                                 queue_tasks.defer(std::move(task));
                                 break;
                             }
+                            SRV_DBG("grace wait on row %d expired, taking fallback, id_task = %d\n", plan.wait_row, id_task);
+                            task.grace_row      = -1;
+                            task.grace_until_ms = -1;
                         } else {
-                            // still inside the window on the same row: keep waiting
-                            SRV_DBG("grace wait active on row %d, defer task, id_task = %d\n", plan.wait_row, id_task);
-                            queue_tasks.defer(std::move(task));
+                            // still inside the window on the same row: keep waiting (keyless only;
+                            // keyed tasks wait in the deferred queue and cannot reach this branch)
+                            SRV_DBG("grace wait active on row %d, re-post task, id_task = %d\n", plan.wait_row, id_task);
+                            queue_tasks.post(std::move(task));
                             break;
                         }
                     }
