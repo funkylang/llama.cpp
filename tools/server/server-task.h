@@ -173,6 +173,11 @@ struct server_task {
     int id_target = -1;
     int id_slot   = -1;
 
+    // grace wait on a busy row (decode loop scheduling): the row whose STOP we are
+    // waiting for, and its deadline in ggml_time_ms(); -1 when not waiting.
+    int      grace_row      = -1;
+    int64_t  grace_until_ms = -1;
+
     // OpenAI prompt_cache_key: stable per-conversation identifier (usually a UUID)
     // that routes this task to the slot holding its conversation state.
     // Child tasks inherit it: they share the parent's conversation.

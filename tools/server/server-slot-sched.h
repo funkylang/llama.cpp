@@ -141,6 +141,13 @@ struct server_slot_plan {
 
     // LCP of the incoming prompt vs the selected cache entry, for PCACHE_HIT logging only; -1 when none
     int matched_len = -1;
+
+    // its best content match is a row whose task is still decoding: defer this
+    // task on that row for a short grace window (close/STOP usually arrives
+    // within milliseconds of a new same-conversation request). -1 when none.
+    // The caller owns the 100ms deadline; after it expires, re-select with
+    // busy rows excluded and take the next best candidate.
+    int wait_row = -1;
 };
 
 // decides only, the caller applies the plan

@@ -49,6 +49,8 @@ private:
         status_t      status = ROW_IDLE;
         std::string   prompt_cache_key; // empty when unkeyed; kept when IDLE (reservation)
         int           task_id  = -1;    // owner of the row while DECODE/STOP; join key for close -> STOP
+        int           waiter_id = -1;   // a deferred task queued on this busy row (grace wait);
+                                        // cleared by finish_or_stop or when it launches / gives up
         server_slot * slot     = nullptr;
 
         bool is_busy() const { return status != ROW_IDLE; }
@@ -138,6 +140,17 @@ public:
     // tasks (n_cmpl batches, realtime) must all be covered by their parent's
     // close: pass the whole family.
     bool request_stop(int task_id);
+
+    // Grace waiting on a busy row (decode loop only). A task whose best match
+    // is this row's current (still decoding) task parks here: at most ONE
+    // waiter per row. false when another waiter already holds the seat, so
+    // the caller rejects the request as a client-side duplicate instead of
+    // queueing it indefinitely.
+    bool reserve_waiter(int id_row, int task_id);
+
+    // Called when a grace waiter leaves its seat: launched on the row, or
+    // gave up after the grace window expired (task still owns it).
+    void release_waiter(int id_row, int task_id);
 
     // ------------------------------------------------------------------
     // decode scheduler (main loop only)

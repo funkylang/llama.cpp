@@ -191,12 +191,37 @@ bool server_slot_table::request_stop(int task_id) {
     return false;
 }
 
+bool server_slot_table::reserve_waiter(int id_row, int task_id) {
+    GGML_ASSERT((size_t)id_row < rows_.size());
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto & r = rows_[id_row];
+    if (r.waiter_id >= 0) {
+        SRV_WRN("slot_table: row %d already has waiter %d - rejecting duplicate wait (task %d)\n",
+                id_row, r.waiter_id, task_id);
+        return false;
+    }
+    r.waiter_id = task_id;
+    SRV_INF("slot_table: row %d waiter set to task %d (grace wait)\n", id_row, task_id);
+    return true;
+}
+
+void server_slot_table::release_waiter(int id_row, int task_id) {
+    GGML_ASSERT((size_t)id_row < rows_.size());
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (rows_[id_row].waiter_id == task_id) {
+        SRV_DBG("slot_table: row %d waiter released (task %d)\n", id_row, task_id);
+        rows_[id_row].waiter_id = -1;
+    }
+}
+
 void server_slot_table::begin_decode(int id_row, int task_id, const std::string & key) {
     GGML_ASSERT((size_t)id_row < rows_.size());
     GGML_ASSERT(task_id >= 0);
     std::lock_guard<std::mutex> lock(mutex_);
     auto & r = rows_[id_row];
     if (r.status != ROW_IDLE) {
+        // a launch on a non-IDLE row skips the release sweep's teardown of the
+        // previous task - that is a scheduling bug we want to see, not crash on
         SRV_WRN("slot_table: DIVERGENCE begin_decode(row %d, task %d): expected IDLE, got status=%d\n",
                 id_row, task_id, (int) r.status);
     }
@@ -225,6 +250,9 @@ void server_slot_table::finish_or_stop(int id_row) {
 
     r.task_id  = -1;
     r.status   = ROW_IDLE; // prompt_cache_key kept: reservation
+    // the parked grace waiter (if any) is woken by pop_deferred_task on
+    // release and re-selects; its seat here is stale either way
+    r.waiter_id = -1;
     SRV_DBG("slot_table: row %d -> IDLE%s\n", id_row, r.has_key() ? " (reservation kept)" : "");
 
     cv_release_.notify_all();

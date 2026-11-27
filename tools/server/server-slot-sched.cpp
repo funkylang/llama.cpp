@@ -374,7 +374,9 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
         }
 
         if (ret) {
-            // a busy slot is returned untouched, the caller defers the task
+            // a busy slot is returned untouched, the caller defers the task; this includes
+            // STOP rows (close detected, not yet released): their release sweep runs first
+            // and leaves warm KV for a same-conversation attach on the next pass.
             if (ret->is_processing) {
                 return { ret->id, false };
             }
@@ -403,9 +405,14 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
                 continue;
             }
 
-            // a busy owner is returned untouched, the caller defers the task to it
+            // a busy owner (including a STOP row awaiting its release sweep): the caller
+            // parks this task on that row; the owner's close/release takes it over with
+            // warm KV. Direct launch is left to the sweep, which does the old task's teardown.
             if (slot.is_processing) {
-                return { slot.id, false };
+                server_slot_plan p;
+                p.id_slot  = slot.id;
+                p.wait_row = slot.id;
+                return p;
             }
 
             if (slot.prompt->n_tokens() > 0) {
@@ -491,20 +498,19 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
         return (c.lcp == best.lcp) && !c.is_entry && best.is_entry;
     };
 
-    // scan live slots: an "all" match is an early winner; otherwise collect the best partial
+    // scan live slots: an "all" match is an early winner; otherwise collect the best partial.
+    // stopped rows are attachable like idle ones (their close already arrived).
     // keyed slots are off-limits to tasks that do not own the key (id-less requests and
     // keyed ones whose conversation is not live): they may only take them through the
     // forced-LRU fallback below, which saves the displaced state first.
     candidate best;
+    // best match among rows still decoding: a grace-wait target when it out-ranks
+    // every attachable candidate (the steering close usually arrives right after)
+    candidate busy_best;
     if (!early_winner) {
         for (const auto & slot : slots) {
-            // skip the slot if it is not available
-            if (slot.is_processing) {
-                SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing);
-                continue;
-            }
-
-            // a keyed slot belongs to its conversation; content matching never crosses that
+            // the key rule applies to every row, stopped ones included: one
+            // conversation's state is never adopted by another task
             if (!slot.prompt->cache_key.empty() && slot.prompt->cache_key != task.prompt_cache_key) {
                 SLT_TRC(slot, "%s", " - skipping, owned by another prompt_cache_key\n");
                 continue;
@@ -527,6 +533,23 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
             const size_t lcp_len = tokens.get_common_prefix(task.tokens);
             bool qualified, is_all;
             classify_prompt(*slot.prompt, lcp_len, qualified, is_all);
+
+            // a still-busy row (DECODE or STOP-awaiting-release) is not launchable yet,
+            // but remember it when it is this task's best content match: the caller may
+            // wait briefly - a steering close usually lands within milliseconds, and the
+            // row releases with warm KV for exactly this task.
+            if (slot.is_processing) {
+                candidate cb;
+                cb.slot      = &slot;
+                cb.lcp       = lcp_len;
+                cb.qualified = qualified;
+                if (consider_better(cb, busy_best)) {
+                    busy_best = std::move(cb);
+                }
+                SLT_TRC(slot, " - decoding, match=%zu [%s] (grace candidate)\n",
+                        lcp_len, is_all ? "ALL" : (qualified ? "PART" : "-"));
+                continue;
+            }
 
             SLT_TRC(slot, " - checking LCP: prompt=%zu, cached=%zu, match=%zu [%s]\n",
                     task.tokens.size(), tokens.size(), lcp_len, is_all ? "ALL" : (qualified ? "PART" : "-"));
@@ -669,6 +692,26 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
     } else {
         // early winner: an ALL match or a pinned slot, the state continues in place
         plan.id_slot = ret->id;
+    }
+
+    // Grace-wait decision (the decode-loop caller owns the 100ms deadline): park on
+    // a still-decoding row when it is strictly better than what we were about to take.
+    // The steering close for such a row usually arrives within milliseconds of this
+    // request; waiting 100ms then re-selecting costs little and saves the re-prefill.
+    // Early winners never wait: their slot is attachable right now.
+    if (!early_winner && plan.id_slot != -1 && busy_best.qualified) {
+        size_t winner_lcp = 0; // forced-LRU/empty fallback: nothing reusable yet
+        if (ret != nullptr && best.slot == ret) {
+            winner_lcp = best.lcp; // PART live match
+        } else if (ret == nullptr && cache_best.qualified) {
+            winner_lcp = cache_best.lcp; // prompt-cache entry won the scan
+        }
+
+        if (busy_best.lcp > winner_lcp) {
+            SLT_INF(*busy_best.slot, "row %d as grace wait: match=%zu beats winner lcp=%zu - defer task until its STOP\n",
+                    busy_best.slot->id, busy_best.lcp, winner_lcp);
+            plan.wait_row = busy_best.slot->id;
+        }
     }
 
     return plan;
