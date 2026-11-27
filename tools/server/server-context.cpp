@@ -3818,10 +3818,12 @@ private:
         if (batch.size() > 0) {
             std::vector<bool> in_batch(slots.size(), false);
             int n_slots_in_batch = 0;
+            int single_slot_id   = -1;
             for (const auto & t : batch.tokens) {
                 if (!in_batch[t.id_slot]) {
                     in_batch[t.id_slot] = true;
                     ++n_slots_in_batch;
+                    single_slot_id     = t.id_slot;
                 }
             }
 
@@ -3844,8 +3846,13 @@ private:
                 snprintf(queue_info, sizeof(queue_info), " (%lld tokens queued in %d slot%s)",
                          (long long) n_queued, n_slots_queued, n_slots_queued == 1 ? "" : "s");
             }
-            LOG_INF("srv  evaluating %d tokens in %d slot%s%s\n",
-                    batch.size(), n_slots_in_batch, n_slots_in_batch == 1 ? "" : "s", queue_info);
+            char slot_desc[32];
+            if (n_slots_in_batch == 1) {
+                snprintf(slot_desc, sizeof(slot_desc), "slot #%d", single_slot_id);
+            } else {
+                snprintf(slot_desc, sizeof(slot_desc), "%d slots", n_slots_in_batch);
+            }
+            LOG_INF("srv  evaluating %d tokens in %s%s\n", batch.size(), slot_desc, queue_info);
         }
 
         int32_t off_next = 0;
