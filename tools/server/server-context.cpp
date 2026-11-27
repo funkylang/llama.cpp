@@ -11,6 +11,7 @@
 #include "server-realtime.h"
 #include "server-schema.h"
 #include "server-slot-sched.h"
+#include "server-slot-table.h"
 #include "server-stream.h"
 
 #include "build-info.h"
@@ -421,6 +422,10 @@ struct server_slot {
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
 
+    // Phase 0 shadow observation (concepts/slot-table-impl-plan.txt): mirrors
+    // the slot lifecycle into the table for divergence checking only.
+    server_slot_table * slot_table = nullptr;
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -658,6 +663,13 @@ struct server_slot {
     void release() {
         if (is_processing()) {
             GGML_ASSERT(task);
+
+            // Phase 0 shadow observation: mirror the transition into the slot table.
+            // Note: prompt_cache_key may not yet match task->prompt_cache_key here
+            // for child/edge paths; shadow_release keeps whatever key is stored.
+            if (slot_table) {
+                slot_table->shadow_release(id);
+            }
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
@@ -1113,6 +1125,9 @@ private:
 
     server_slot_sched slot_sched;
 
+    // Phase 0 shadow observation: mirrors the slot lifecycle (see release/launch hooks)
+    std::unique_ptr<server_slot_table> slot_table;
+
     std::string model_name; // name of the loaded model, to be used by API
     std::set<std::string> model_aliases; // additional names for the model
     std::set<std::string> model_tags;    // informational tags
@@ -1544,6 +1559,14 @@ private:
             };
 
             slot.reset();
+        }
+
+        // Phase 0 shadow observation: build the slot table and bind each row to its
+        // server_slot. Mirrors lifecycle transitions only; nothing routes through it yet.
+        slot_table = std::make_unique<server_slot_table>(slots.size());
+        for (size_t i = 0; i < slots.size(); i++) {
+            slots[i].slot_table = slot_table.get();
+            slot_table->bind_row((int) i, &slots[i]);
         }
 
         {
@@ -2047,6 +2070,11 @@ private:
         // record the conversation owner: prompt_cache_key routing matches follow-up
         // requests against this tag, and it travels with the state into the prompt cache
         slot.prompt.cache_key = slot.task->prompt_cache_key;
+
+        // Phase 0 shadow observation: mirror the launch into the slot table.
+        if (slot.slot_table) {
+            slot.slot_table->shadow_launch(slot.id, slot.task->id, slot.task->prompt_cache_key);
+        }
 
         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
             slot.state = SLOT_STATE_PROCESSING_PROMPT;
@@ -3121,6 +3149,11 @@ private:
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
+                    // Phase 0 shadow observation: the close path posts these; mirror them.
+                    if (slot_table) {
+                        slot_table->shadow_stop(task.id_target);
+                    }
+
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {

@@ -176,4 +176,17 @@ public:
     // never trigger this; only a starved incumbent does. Evicted rows hold
     // absolute priority on reschedule. Returns -1 when nothing is evictable.
     int evict_smallest_running(size_t n_cells_needed);
+
+    // ------------------------------------------------------------------
+    // shadow observation (Phase 0)
+    // ------------------------------------------------------------------
+
+    // Mirror the transitions the real system performs, without taking effect
+    // on scheduling: same row state changes under the mutex, but divergences
+    // (e.g. launching on a busy row, releasing an idle row) are LOGGED, not
+    // fatal. Verifies the table model matches reality before Phase 1 routes
+    // live traffic through the real API.
+    void shadow_launch(int id_row, int task_id, const std::string & key);
+    void shadow_release(int id_row);
+    void shadow_stop(int task_id);
 };
