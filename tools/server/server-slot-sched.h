@@ -121,7 +121,6 @@ struct server_slot_info {
     const server_task * task = nullptr; // only for logging
 
     bool is_processing = false;
-    bool is_stopped = false; // close detected; the release sweep will take it back to IDLE soon
     int64_t t_last_used = -1;
 
     const server_prompt * prompt = nullptr;
@@ -143,16 +142,12 @@ struct server_slot_plan {
     // LCP of the incoming prompt vs the selected cache entry, for PCACHE_HIT logging only; -1 when none
     int matched_len = -1;
 
-    // its best content match is a row whose task is still decoding: park this
-    // task on that row for a short grace window (the steering close usually
-    // arrives within milliseconds of the request; when the row releases, the
-    // retry attaches to the warm state). -1 when none.
-    // The caller owns the deadline; after it expires, take the plan's fallback.
+    // its best content match is a row whose task is still decoding: defer this
+    // task on that row for a short grace window (close/STOP usually arrives
+    // within milliseconds of a new same-conversation request). -1 when none.
+    // The caller owns the 100ms deadline; after it expires, re-select with
+    // busy rows excluded and take the next best candidate.
     int wait_row = -1;
-
-    // true when wait_row was already marked STOP (close detected) at select()
-    // time - observational info for logs: its release is imminent then.
-    bool wait_row_is_stopped = false;
 };
 
 // decides only, the caller applies the plan

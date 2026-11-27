@@ -112,20 +112,6 @@ void server_queue::pop_deferred_task(int id_slot) {
     condition_tasks.notify_one();
 }
 
-void server_queue::pop_expired_deferred(int64_t now_ms) {
-    std::unique_lock<std::mutex> lock(mutex_tasks);
-    for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end();) {
-        // grace_until_ms < 0: not a grace waiter - only slot releases wake those
-        if (it->grace_until_ms >= 0 && now_ms >= it->grace_until_ms) {
-            QUE_DBG("pop expired deferred task, id_task = %d\n", it->id);
-            queue_tasks.emplace_front(std::move(*it));
-            it      = queue_tasks_deferred.erase(it);
-            continue;
-        }
-        ++it;
-    }
-}
-
 void server_queue::wait_until_no_sleep() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     if (sleeping) {
