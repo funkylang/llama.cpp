@@ -66,6 +66,11 @@ public:
     // prioritize tasks that use the specified slot (otherwise, pop the first deferred task)
     void pop_deferred_task(int id_slot);
 
+    // Grace-park deadline promotion: deferred tasks whose grace_until_ms has passed
+    // are moved back to the main queue so they get re-selected on the next worker pass.
+    // Called from the decode loop once per update_slots() cycle (main thread).
+    void pop_expired_deferred(int64_t now_ms);
+
     // if sleeping, request exiting sleep state and wait until it is done
     // returns immediately if not sleeping
     // the server then stays awake until the caller calls release_inflight()

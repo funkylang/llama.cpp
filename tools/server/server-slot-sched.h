@@ -144,13 +144,14 @@ struct server_slot_plan {
     int matched_len = -1;
 
     // its best content match is a row whose task is still decoding: park this
-    // task on that row for a short grace window (close/STOP usually arrives
-    // within milliseconds of a new same-conversation request). -1 when none.
+    // task on that row for a short grace window (the steering close usually
+    // arrives within milliseconds of the request; when the row releases, the
+    // retry attaches to the warm state). -1 when none.
     // The caller owns the deadline; after it expires, take the plan's fallback.
     int wait_row = -1;
 
     // true when wait_row was already marked STOP (close detected) at select()
-    // time: its release is imminent, parking on it is safe for keyless tasks.
+    // time - observational info for logs: its release is imminent then.
     bool wait_row_is_stopped = false;
 };
 
