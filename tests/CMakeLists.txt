@@ -403,6 +403,10 @@ llama_build_and_test(test-mtmd-c-api.c  LABEL behavior  LINK mtmd)
 
 llama_build_and_test(test-mtmd-impl.cpp  LABEL behavior  LINK mtmd llama-common)
 
+# server slot table (scheduling coordination) - unit test without llama dependency
+llama_build_and_test(test-slot-table.cpp  LABEL "main behavior"  LINK server-context llama-common)
+target_include_directories(test-slot-table PRIVATE ${CMAKE_SOURCE_DIR}/tools/server)
+
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)
 if (TARGET cpp-httplib)
