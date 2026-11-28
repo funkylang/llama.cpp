@@ -705,6 +705,10 @@ struct server_task_result_apply_lora : server_task_result {
 // Instrumentation: LLAMA_PROMPT_CACHE_INSTRUMENT (any non-empty value enables)
 bool pc_instr_enabled();
 
+// Prompt-processing progress log ("prompt processing, N/M tokens, ..."):
+// disabled by default (noisy for large prompts); LLAMA_SERVER_PROMPT_PROGRESS=<v> enables it.
+bool pp_progress_enabled();
+
 // used exclusively by router mode
 struct server_task_result_router : server_task_result {
     json data;

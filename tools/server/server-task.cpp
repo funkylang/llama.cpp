@@ -22,6 +22,14 @@ bool pc_instr_enabled() {
     return enabled;
 }
 
+bool pp_progress_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("LLAMA_SERVER_PROMPT_PROGRESS");
+        return v && v[0];
+    }();
+    return enabled;
+}
+
 //
 // task_params
 //

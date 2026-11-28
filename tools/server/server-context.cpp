@@ -734,6 +734,10 @@ struct server_slot {
     }
 
     void print_timings_pp() const {
+        if (!pp_progress_enabled()) {
+            return;
+        }
+
         const double t_prompt_total = stats.t_prompt_ms();
 
         // no wall-clock throttle: every n_print_interval boundary must show up (fork 2026-11-08);
