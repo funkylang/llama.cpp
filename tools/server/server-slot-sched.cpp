@@ -338,10 +338,12 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
 
     // Unified LCP-based candidate selection (improve/concept-cache-mgmt.txt).
     // Candidates: idle live slots AND prompt-cache entries.
-    //   qualified : the match covers at least one of the candidate's checkpoints
-    //   all       : the match covers the candidate's last checkpoint
-    // An "all" match on a live slot is an early winner (no cache scan needed).
-    // Otherwise the longest LCP wins; ties prefer the live slot.
+    //   qualified : the match covers at least one of the candidate's checkpoints ("partial")
+    //   all       : the match covers the candidate's last checkpoint ("full")
+    // STRICT RULE (2026-11-28): only an "all" match attaches to a live slot
+    // (early winner, no cache scan needed). A "partial" live match never takes over the
+    // row: it is ranked only to order candidates against the prompt-cache entries.
+    // Among prompt-cache candidates the longest LCP wins; ties prefer the live slot.
     //
     // Slot pinning: task.id_slot != -1 selects that exact slot.
     // A busy pinned slot is returned untouched so the caller defers the task.
@@ -535,19 +537,26 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
             classify_prompt(*slot.prompt, lcp_len, qualified, is_all);
 
             // a still-busy row (DECODE or STOP-awaiting-release) is not launchable yet,
-            // but remember it when it is this task's best content match: the caller may
-            // wait briefly - a steering close usually lands within milliseconds, and the
-            // row releases with warm KV for exactly this task.
+            // but remember it when it is this task's own conversation (ALL match): the
+            // caller may wait briefly - a steering close usually lands within
+            // milliseconds, and the row releases with warm KV for exactly this task.
+            // Under the strict rule a PARTIAL match can never attach to that row, so it
+            // is not a parking target either (parking would end in an attach).
             if (slot.is_processing) {
+                if (!is_all) {
+                    SLT_TRC(slot, " - decoding, match=%zu [%s] (no parking: not this conversation)\n",
+                            lcp_len, qualified ? "PART" : "-");
+                    continue;
+                }
+
                 candidate cb;
                 cb.slot      = &slot;
                 cb.lcp       = lcp_len;
-                cb.qualified = qualified;
+                cb.qualified = true; // is_all
                 if (consider_better(cb, busy_best)) {
                     busy_best = std::move(cb);
                 }
-                SLT_TRC(slot, " - decoding, match=%zu [%s] (grace candidate)\n",
-                        lcp_len, is_all ? "ALL" : (qualified ? "PART" : "-"));
+                SLT_TRC(slot, " - decoding, match=%zu [ALL] (grace candidate)\n", lcp_len);
                 continue;
             }
 
@@ -562,13 +571,15 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
                 break;
             }
 
+            // STRICT RULE (2026-11-28): a partial match NEVER takes over this row - the
+            // state belongs to its owner. Rank it anyway: it orders the prompt-cache
+            // entries below and is the future prefix-sharing source.
             candidate c;
             c.slot      = &slot;
             c.lcp       = lcp_len;
             c.qualified = qualified;
             if (consider_better(c, best)) {
-                best = std::move(c);
-                ret  = &slot;
+                best = std::move(c); // ranking only: a live partial never becomes ret
             }
         }
     }
@@ -664,16 +675,6 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
             plan.is_move     = cache_best.is_all; // ALL: consume the entry, PART: keep it for the owner
             plan.matched_len = (int) cache_best.lcp; // for PCACHE_HIT logging
         }
-    } else if (ret != nullptr && !early_winner) {
-        // Winner = a live slot with a PARTIAL match (not an ALL continuation):
-        // its existing state is displaced, so save it to keep the conversation restorable.
-        if (best.slot == ret && best.qualified) {
-            SLT_INF(*ret, "selected slot %d (PART): prompt=%zu, slot=%zu, match=%zu\n",
-                    ret->id, task.tokens.size(), ret->prompt->tokens.size(), best.lcp);
-        }
-
-        plan.id_slot      = ret->id;
-        plan.update_cache = use_cache;
     } else if (ret == nullptr) {
         // Nothing matched: take the least recently used idle slot and reuse it fresh,
         // saving its displaced state first so nothing recoverable is lost.

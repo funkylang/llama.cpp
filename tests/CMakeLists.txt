@@ -407,6 +407,10 @@ llama_build_and_test(test-mtmd-impl.cpp  LABEL behavior  LINK mtmd llama-common)
 llama_build_and_test(test-slot-table.cpp  LABEL "main behavior"  LINK server-context llama-common)
 target_include_directories(test-slot-table PRIVATE ${CMAKE_SOURCE_DIR}/tools/server)
 
+# strict select() rules - partial never steals a live row (2026-11-28)
+llama_build_and_test(test-select-rules.cpp  LABEL "main behavior"  LINK server-context llama-common)
+target_include_directories(test-select-rules PRIVATE ${CMAKE_SOURCE_DIR}/tools/server)
+
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)
 if (TARGET cpp-httplib)

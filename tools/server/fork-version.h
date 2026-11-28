@@ -4,4 +4,4 @@
 // updated on every fork commit with the ACTUAL current time at update (strict ordering);
 // printed as the first startup message of llama-server so the running build can be identified
 
-static const char * FORK_VERSION = "2026-11-28 10:54:38 server: name the slot in single-slot evaluate log rounds";
+static const char * FORK_VERSION = "2026-11-28 12:41:00 server: strict select() - partial match never steals a live row";
