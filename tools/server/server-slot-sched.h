@@ -142,6 +142,13 @@ struct server_slot_plan {
     // LCP of the incoming prompt vs the selected cache entry, for PCACHE_HIT logging only; -1 when none
     int matched_len = -1;
 
+    // prefix sharing (2026-11-28 Phase 2): restore this live row's checkpoint into the
+    // fresh slot before its prompt is processed - the owner row keeps it untouched.
+    // null when no sharing applies; shared_ptr so the state survives even if the
+    // source row truncates or releases before launch.
+    std::shared_ptr<const common_prompt_checkpoint> share_ckpt;
+    int share_from = -1;
+
     // its best content match is a row whose task is still decoding: defer this
     // task on that row for a short grace window (close/STOP usually arrives
     // within milliseconds of a new same-conversation request). -1 when none.

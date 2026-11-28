@@ -52,6 +52,7 @@ static std::shared_ptr<common_prompt_checkpoint> make_ckpt(int64_t n_tokens) {
     c->n_tokens = n_tokens;
     c->pos_min  = 0;
     c->pos_max  = n_tokens - 1;
+    c->data_tgt.push_back(0); // non-empty: saved state present (qualifies for sharing)
     return c;
 }
 
@@ -156,6 +157,57 @@ static void test_entry_partial_still_restores() {
     chk(plan.is_move == false, "S6 partial entry match is a COPY (owner stays restorable)");
 }
 
+// S7: a fresh conversation on the LRU fallback shares the warm row's best prefix checkpoint
+static void test_lru_fallback_shares_prefix() {
+    fixture fx;
+
+    auto plan = server_slot_sched().select(fx.slots, make_task(foreign_prompt()), {}, &fx.cache);
+
+    chk(plan.id_slot == 1, "S7 partial takes the empty slot, not the warm row");
+    chk(plan.share_from == 0, "S7 shares from the warm row");
+    chk(plan.share_ckpt != nullptr && plan.share_ckpt->n_tokens == 40, "S7 shared range = best checkpoint within the prefix (40)");
+}
+
+// S8: a prompt-cache entry win suppresses sharing - the entry restore carries its own state
+static void test_entry_win_no_share() {
+    fixture fx;
+
+    server_prompt_cache_state st;
+    st.prompt.tokens = server_tokens(llama_tokens(range(1, 160)), false);
+    for (int64_t n : {40, 80, 120, 160}) {
+        st.prompt.checkpoints.push_back(make_ckpt(n));
+    }
+    st.data.main.push_back(0); // non-empty: a live entry
+    fx.cache.states.push_back(std::move(st));
+
+    auto plan = server_slot_sched().select(fx.slots, make_task(foreign_prompt()), {}, &fx.cache);
+
+    chk(plan.entry_index == 0, "S8 the cache entry still wins");
+    chk(plan.share_ckpt == nullptr, "S8 no sharing when an entry restore wins");
+    chk(plan.share_from == -1, "S8 share source cleared");
+}
+
+// S9: an ALL match attaches - no sharing (the state is already there)
+static void test_all_match_no_share() {
+    fixture fx;
+
+    auto plan = server_slot_sched().select(fx.slots, make_task(range(1, 160)), {}, &fx.cache);
+
+    chk(plan.id_slot == 0, "S9 all match attaches to the warm row");
+    chk(plan.share_ckpt == nullptr, "S9 no sharing for an attach");
+}
+
+// S10: the LRU victim is itself the share source - no self-restore (its KV is already in place)
+static void test_no_self_share() {
+    fixture fx;
+    fx.slots.resize(1); // only the warm row exists: it is both the prefix holder and the LRU victim
+
+    auto plan = server_slot_sched().select(fx.slots, make_task(foreign_prompt()), {}, &fx.cache);
+
+    chk(plan.id_slot == 0, "S10 the partial row is taken by forced LRU");
+    chk(plan.share_ckpt == nullptr, "S10 no self-share when victim and source are the same row");
+}
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     std::cout << "test-select-rules: starting\n";
@@ -166,6 +218,10 @@ int main() {
     test_partial_no_parking();
     test_all_parks();
     test_entry_partial_still_restores();
+    test_lru_fallback_shares_prefix();
+    test_entry_win_no_share();
+    test_all_match_no_share();
+    test_no_self_share();
 
     if (chk.failed == 0) {
         std::cout << "test-select-rules: all OK\n";

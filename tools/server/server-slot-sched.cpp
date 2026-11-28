@@ -380,7 +380,9 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
             // STOP rows (close detected, not yet released): their release sweep runs first
             // and leaves warm KV for a same-conversation attach on the next pass.
             if (ret->is_processing) {
-                return { ret->id, false };
+                server_slot_plan p;
+                p.id_slot = ret->id;
+                return p;
             }
 
             SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
@@ -659,6 +661,47 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
 
     server_slot_plan plan;
 
+    //
+    // PREFIX SHARING (2026-11-28 Phase 2): when a fresh conversation starts on a
+    // slot that already holds none of its state, restore the best matching live row's
+    // checkpoint into it instead of recomputing the shared prefix. The source row is
+    // read-only: its cells, checkpoints and ownership stay untouched, so both conversations
+    // keep their own home (the stealing pattern dies by construction).
+    //
+    // A candidate checkpoint must cover [0, ckpt.n_tokens) of this task's prompt:
+    // pos_min == 0 keeps the restore a true prefix for every layer type; on hybrid
+    // models the checkpoint state carries the recurrent/SSM state at that position,
+    // which a live-range seq_cp could not express (it only holds each sequence's tail).
+    //
+    auto apply_share = [&](const server_slot_info & src, size_t lcp) -> bool {
+        if (lcp == 0) {
+            return false;
+        }
+        for (const auto & ck : src.prompt->checkpoints) {
+            const auto & c = *ck;
+            if (static_cast<size_t>(c.n_tokens) > lcp) {
+                continue; // further ahead than the shared prefix
+            }
+            if (c.pos_min != 0 || c.data_tgt.empty()) {
+                continue; // not a full-prefix state / nothing saved
+            }
+            if (!plan.share_ckpt || c.n_tokens > plan.share_ckpt->n_tokens) {
+                plan.share_ckpt = ck;
+                plan.share_from = src.id;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    for (const auto & slot : slots) {
+        if (!slot.prompt->tokens.empty() &&
+            !lora_should_clear_cache(slot.prompt->lora, lora)) {
+            const size_t lcp = slot.prompt->tokens.get_common_prefix(task.tokens);
+            apply_share(slot, lcp);
+        }
+    }
+
     // handle the winner and prepare the plan:
     if (ret == nullptr && use_cache && cache_best.qualified) {
         // Winner = a prompt-cache entry: the caller finds a free slot, saves its
@@ -674,6 +717,8 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
             plan.entry_index = (int) cache_best.entry_idx;
             plan.is_move     = cache_best.is_all; // ALL: consume the entry, PART: keep it for the owner
             plan.matched_len = (int) cache_best.lcp; // for PCACHE_HIT logging
+            plan.share_ckpt = nullptr; // the restored entry already carries its own state
+            plan.share_from = -1;
         }
     } else if (ret == nullptr) {
         // Nothing matched: take the least recently used idle slot and reuse it fresh,
@@ -689,10 +734,23 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
 
             plan.id_slot      = ret->id;
             plan.update_cache = use_cache && !ret->prompt->tokens.empty();
+
+            // a new conversation lands here: share the best live prefix checkpoint into it.
+            // if the victim row is the source itself, its KV is already in place - no restore needed.
+            if (plan.share_from == ret->id) {
+                plan.share_ckpt = nullptr;
+                plan.share_from = -1;
+            }
         }
     } else {
         // early winner: an ALL match or a pinned slot, the state continues in place
         plan.id_slot = ret->id;
+
+        if (ret->prompt->n_tokens() > 0) {
+            // this conversation's state is already here - sharing would double-restore it
+            plan.share_ckpt = nullptr;
+            plan.share_from = -1;
+        }
     }
 
     // Grace-wait decision (the decode-loop caller owns the 100ms deadline): park on

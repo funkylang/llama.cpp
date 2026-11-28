@@ -3225,6 +3225,54 @@ private:
                         update_prompt_cache(*slot, plan.entry_index, plan.is_move, plan.matched_len);
                     }
 
+                    // PREFIX SHARING (2026-11-28 Phase 2): the plan picked a live row's
+                    // checkpoint to restore into this fresh slot - apply it before the
+                    // prompt is processed so the existing n_past logic picks up where it ends.
+                    // The source row is untouched: reading its shared_ptr state changes nothing.
+                    if (plan.share_ckpt && !task.is_parent() && !task.tokens.has_mtmd
+                            && task.params.n_cache_reuse == 0) {
+                        const char * env_share = std::getenv("LLAMA_SERVER_PREFIX_SHARE");
+                        const bool share_enabled = env_share != nullptr && env_share[0] != '\0' && env_share[0] != '0';
+
+                        if (share_enabled) {
+                            const auto & ck = *plan.share_ckpt;
+
+                            bool ok = true;
+                            if (!ck.data_tgt.empty()) {
+                                const size_t n = llama_state_seq_set_data_ext(slot->ctx_tgt,
+                                        ck.data_tgt.data(), ck.data_tgt.size(), slot->id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                                ok = (n == ck.data_tgt.size());
+                                if (!ok) {
+                                    SLT_ERR(*slot, "failed to restore shared prefix state with size %zu\n", ck.data_tgt.size());
+                                }
+                            }
+                            if (ok && slot->ctx_dft != nullptr && !ck.data_dft.empty()) {
+                                const size_t n = llama_state_seq_set_data_ext(slot->ctx_dft,
+                                        ck.data_dft.data(), ck.data_dft.size(), slot->id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                                ok = (n == ck.data_dft.size());
+                                if (!ok) {
+                                    SLT_WRN(*slot, "failed to restore shared draft prefix state with size %zu\n", ck.data_dft.size());
+                                }
+                            }
+                            if (ok && spec.get() != nullptr && !ck.data_spec.empty()) {
+                                common_speculative_set_state(spec.get(), slot->id, ck.data_spec);
+                            }
+
+                            if (ok) {
+                                // seed the prompt with the shared prefix: n_past below becomes
+                                // share_len and only [share_len, |prompt|) is decoded
+                                const auto & all = task.tokens.get_tokens();
+                                llama_tokens prefix(all.begin(), all.begin() + ck.n_tokens);
+                                slot->prompt.tokens = server_tokens(prefix, false);
+
+                                SLT_INF(*slot, "shared prefix from row %d: %" PRId64 " tokens (task %d)\n", plan.share_from, ck.n_tokens, id_task);
+                                if (pc_instr_enabled()) {
+                                    SLT_INF(*slot, "SHARE_USE slot=%d src=%d tok=%" PRId64 "\n", slot->id, plan.share_from, ck.n_tokens);
+                                }
+                            }
+                        }
+                    }
+
                     if (task.is_parent()) {
                         if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
