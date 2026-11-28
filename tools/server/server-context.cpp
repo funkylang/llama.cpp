@@ -36,6 +36,7 @@
 #include <utility>
 #include <fstream>
 
+
 // fix problem with std::min and std::max
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -1140,6 +1141,10 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+
+    // sticky big-prefill: keep dedicating rounds to the same slot until its
+    // prompt is fully processed, enabling prefix sharing between concurrent starts.
+    server_slot * sticky_prefill = nullptr;
 
     server_metrics metrics;
 
@@ -4251,32 +4256,51 @@ private:
         // dedicate this round to it (decode stalls one round). Never pick a slot whose
         // prompt cannot fit one empty batch - it would block everything forever.
         server_slot * big_prefill = nullptr;
-        iterate(slots, [&](server_slot & slot) {
-            if (slot.state != SLOT_STATE_STARTED && slot.state != SLOT_STATE_PROCESSING_PROMPT) {
-                return;
-            }
 
-            if (slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
-                return;
+        // check if sticky_prefill is still active
+        if (sticky_prefill) {
+            const auto & s = *sticky_prefill;
+            // continue with the same slot if it's still in prefill state and has tokens to process
+            if ((s.state == SLOT_STATE_STARTED || s.state == SLOT_STATE_PROCESSING_PROMPT) &&
+                s.task->n_tokens() > s.prompt.n_tokens()) {
+                big_prefill = sticky_prefill;
+            } else {
+                // sticky slot is done, clear it
+                sticky_prefill = nullptr;
             }
+        }
 
-            const int pending = slot.task->n_tokens() - slot.prompt.n_tokens();
-            if (pending < n_batch) {
-                return;
-            }
-
-            if (!slot.can_split()) {
-                const int32_t n_batch_max = llama_get_causal_attn(ctx_tgt) ? n_batch : std::min(n_batch, n_ubatch);
-                if (slot.task->n_tokens() > n_batch_max) {
-                    return; // will never fit one batch - cannot be dedicated
+        if (!big_prefill) {
+            iterate(slots, [&](server_slot & slot) {
+                if (slot.state != SLOT_STATE_STARTED && slot.state != SLOT_STATE_PROCESSING_PROMPT) {
+                    return;
                 }
-            }
 
-            const int best    = big_prefill ? big_prefill->task->n_tokens() - big_prefill->prompt.n_tokens() : -1;
-            if (pending > best) {
-                big_prefill = &slot;
-            }
-        });
+                if (slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
+                    return;
+                }
+
+                const int pending = slot.task->n_tokens() - slot.prompt.n_tokens();
+                if (pending < n_batch) {
+                    return;
+                }
+
+                if (!slot.can_split()) {
+                    const int32_t n_batch_max = llama_get_causal_attn(ctx_tgt) ? n_batch : std::min(n_batch, n_ubatch);
+                    if (slot.task->n_tokens() > n_batch_max) {
+                        return; // will never fit one batch - cannot be dedicated
+                    }
+                }
+
+                const int best    = big_prefill ? big_prefill->task->n_tokens() - big_prefill->prompt.n_tokens() : -1;
+                if (pending > best) {
+                    big_prefill = &slot;
+                }
+            });
+
+            // remember the chosen slot for next round
+            sticky_prefill = big_prefill;
+        }
 
         if (big_prefill) {
             SLT_DBG(*big_prefill, "big prefill: %d tokens in queue (n_batch = %d), dedicating round\n",
@@ -4338,6 +4362,104 @@ private:
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
+
+                        // RECHECK for shared prefix at prefill start (2026-11-28): scan other
+                        // live slots' checkpoints now that sequential prefill has given them a chance
+                        // to save their state. This catches the case where both tasks were planned
+                        // simultaneously before either had saved any checkpoints.
+                        {
+                            const char * env_share = std::getenv("LLAMA_SERVER_PREFIX_SHARE");
+                            const bool share_enabled = env_share != nullptr && env_share[0] != '\0' && env_share[0] != '0';
+
+                            if (share_enabled &&
+                                !slot.task->is_parent() &&
+                                !slot.task->tokens.has_mtmd &&
+                                slot.task->params.n_cache_reuse == 0 &&
+                                slot.prompt.tokens.empty()) {
+
+                                // Find the best matching checkpoint from other slots
+                                std::shared_ptr<const common_prompt_checkpoint> best_ckpt = nullptr;
+                                int best_from_id = -1;
+                                size_t best_len = 0;
+
+                                for (auto & other : slots) {
+                                    if (&other == &slot || other.id == slot.id) {
+                                        continue;
+                                    }
+
+                                    if (other.prompt.tokens.empty()) {
+                                        continue;
+                                    }
+
+                                    // Compute the common prefix length between this task and the other slot's prompt
+                                    const size_t lcp = other.prompt.tokens.get_common_prefix(slot.task->tokens);
+                                    if (lcp == 0) {
+                                        continue;
+                                    }
+
+                                    // Find the largest checkpoint on the other slot that fits within this common prefix
+                                    for (const auto & ck : other.prompt.checkpoints) {
+                                        const auto & c = *ck;
+                                        if (static_cast<size_t>(c.n_tokens) > lcp) {
+                                            continue; // too far ahead
+                                        }
+                                        if (c.pos_min != 0 || c.data_tgt.empty()) {
+                                            continue; // not a valid full-prefix state
+                                        }
+
+                                        if (!best_ckpt || c.n_tokens > best_ckpt->n_tokens) {
+                                            best_ckpt = ck;
+                                            best_from_id = other.id;
+                                            best_len = c.n_tokens;
+                                        }
+                                    }
+                                }
+
+                                // If we found a good shared checkpoint, restore it
+                                if (best_ckpt && best_len > 0) {
+                                    bool ok = true;
+
+                                    const auto & ck = *best_ckpt;
+
+                                    if (!ck.data_tgt.empty()) {
+                                        const size_t n = llama_state_seq_set_data_ext(ctx_tgt,
+                                                ck.data_tgt.data(), ck.data_tgt.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                                        ok = (n == ck.data_tgt.size());
+                                        if (!ok) {
+                                            SLT_ERR(slot, "failed to restore shared prefix state with size %zu\n", ck.data_tgt.size());
+                                        }
+                                    }
+
+                                    if (ok && ctx_dft != nullptr && !ck.data_dft.empty()) {
+                                        const size_t n = llama_state_seq_set_data_ext(ctx_dft,
+                                                ck.data_dft.data(), ck.data_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                                        ok = (n == ck.data_dft.size());
+                                        if (!ok) {
+                                            SLT_WRN(slot, "failed to restore shared draft prefix state with size %zu\n", ck.data_dft.size());
+                                        }
+                                    }
+
+                                    if (ok && spec.get() != nullptr && !ck.data_spec.empty()) {
+                                        common_speculative_set_state(spec.get(), slot.id, ck.data_spec);
+                                    }
+
+                                    if (ok) {
+                                        // Seed the prompt with the shared prefix tokens
+                                        const auto & all = slot.task->tokens.get_tokens();
+                                        llama_tokens prefix(all.begin(), all.begin() + best_len);
+                                        slot.prompt.tokens = server_tokens(prefix, false);
+
+                                        SLT_INF(slot, "RECHECK: shared prefix from row %d: %" PRId64 " tokens (task %d)\n",
+                                                best_from_id, best_len, slot.task->id);
+
+                                        if (pc_instr_enabled()) {
+                                            SLT_INF(slot, "SHARE_USE_RECHECK slot=%d src=%d tok=%" PRId64 "\n",
+                                                    slot.id, best_from_id, best_len);
+                                        }
+                                    }
+                                }
+                            }
+                        }
 
                         // print prompt tokens (for debugging)
                         /*if (1) {
